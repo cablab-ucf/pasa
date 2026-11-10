@@ -333,6 +333,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "sync"))]
     pub(crate) fn keys(&self) -> &[Secret] {
         &self.keys
     }

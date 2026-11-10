@@ -128,6 +128,27 @@ fn edit(old: &[u8]) -> Result<Secret> {
     Ok(new?)
 }
 
+/// `git` in `v/`, where the user made that a repository: its output.
+fn git(a: &[&str]) -> Option<Vec<u8>> {
+    let v = home().join("v");
+    let mut c = Command::new("git");
+    c.arg("-C").arg(&v).args(a).env("GIT_TERMINAL_PROMPT", "0");
+    let o = v.join(".git").exists().then(|| c.stderr(Stdio::null()).output());
+    o?.ok().filter(|o| o.status.success()).map(|o| o.stdout)
+}
+
+/// Commit what `v/` gained, and push if that has somewhere to go. A file
+/// gone from `v/` is never committed as gone: `ls` says so instead.
+fn record() {
+    let me =
+        ["user.name=pasa", "user.email=pasa@localhost", "commit.gpgsign=false"];
+    let me = me.iter().flat_map(|c| ["-c", c]);
+    git(&["add", "--ignore-removal", "."]);
+    if git(&me.chain(["commit", "-qm", "."]).collect::<Vec<_>>()).is_some() {
+        git(&["push", "-q"]);
+    }
+}
+
 fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let a: Vec<&str> = a.iter().map(String::as_str).collect();
@@ -148,6 +169,15 @@ fn main() -> Result<()> {
                 0 => {}
                 n => eprintln!(
                     "{n} versions no store key opens: damaged, or another store's"
+                ),
+            }
+            match git(&["ls-files", "-d"])
+                .map_or(0, |d| d.split(|b| *b == b'\n').count() - 1)
+            {
+                0 => {}
+                n => eprintln!(
+                    "{n} versions gone from v/: git -C {} checkout . brings them back",
+                    home().join("v").display()
                 ),
             }
             return Ok(());
@@ -275,6 +305,7 @@ fn main() -> Result<()> {
         }
         _ => bail!("{USAGE}"),
     }
+    record();
     #[cfg(feature = "sync")]
     if home().join("peers").exists() {
         sync(&["sync", "--news"])?;
@@ -289,6 +320,9 @@ fn report_all(r: Vec<(String, Result<usize>)>) {
 
 #[cfg(feature = "sync")]
 fn report(who: &str, r: Result<usize>) {
+    if matches!(r, Ok(1..)) {
+        record();
+    }
     match r {
         Ok(n) => eprintln!("{who}: {n} new"),
         Err(e) => eprintln!("{who}: {e:#}"),
