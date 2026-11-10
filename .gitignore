@@ -1,0 +1,11 @@
+target/
+**/*.rs.bk
+.DS_Store
+*.swp
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/.idea/
+/android/app/src/main/jniLibs/
+/android/.kotlin/

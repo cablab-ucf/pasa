@@ -1,0 +1,6 @@
+[submodule "android/irpair"]
+	path = android/irpair
+	url = https://github.com/cab-ucf/irpair
+[submodule "android/irpush"]
+	path = android/irpush
+	url = https://github.com/cab-ucf/irpush

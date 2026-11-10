@@ -1,0 +1,12 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A simple padlock glyph centered in the adaptive-icon safe zone. -->
+    <group android:scaleX="1.0" android:scaleY="1.0" android:pivotX="54" android:pivotY="54">
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M54,30c-8.3,0 -15,6.7 -15,15v6h-3c-2.2,0 -4,1.8 -4,4v22c0,2.2 1.8,4 4,4h36c2.2,0 4,-1.8 4,-4V55c0,-2.2 -1.8,-4 -4,-4h-3v-6C69,36.7 62.3,30 54,30zM54,38c3.9,0 7,3.1 7,7v6H47v-6C47,41.1 50.1,38 54,38zM54,62c2.2,0 4,1.8 4,4c0,1.5 -0.8,2.8 -2,3.4V74c0,1.1 -0.9,2 -2,2s-2,-0.9 -2,-2v-4.6c-1.2,-0.7 -2,-2 -2,-3.4C50,63.8 51.8,62 54,62z" />
+    </group>
+</vector>

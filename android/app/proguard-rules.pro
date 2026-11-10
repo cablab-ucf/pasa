@@ -1,0 +1,3 @@
+-keep class com.apasa.Native { *; }
+-dontwarn org.slf4j.**
+-dontwarn javax.annotation.**

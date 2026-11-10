@@ -1,0 +1,39 @@
+[package]
+name = "pasa"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.97"
+description = "A tiny password store: sealed versions, synced by union"
+
+[workspace]
+members = ["kdbx2pasa", "apasa-jni"]
+
+[features]
+default = ["sync"]
+sync = ["dep:irnet", "dep:irpair", "dep:irpush", "dep:iroh", "dep:tokio", "dep:qrcode"]
+
+[dependencies]
+anyhow = "1"
+argon2 = { version = "0.6", features = ["zeroize"] }
+age = "0.11"
+age-core = "0.11"
+getrandom = "0.4"
+humantime = "2"
+rpassword = "7"
+sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
+totp-lite = "2"
+data-encoding = "2"
+zeroize = "1"
+irnet = { git = "https://github.com/cab-ucf/irnet", rev = "32a79274df3fa5e2826e18d52f27cab2a0848b44", optional = true }
+irpush = { git = "https://github.com/cab-ucf/irpush", rev = "551e860311d551eb73faaaf8a21abdbe1fa57fea", optional = true }
+irpair = { git = "https://github.com/cab-ucf/irpair", rev = "58096f7a4bfb4e5b5a62e9a3920eb365d1bfdcf0", optional = true }
+iroh = { version = "1.4", default-features = false, optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
+qrcode = { version = "0.14", default-features = false, optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

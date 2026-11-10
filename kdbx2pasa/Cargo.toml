@@ -1,0 +1,13 @@
+[package]
+name = "kdbx2pasa"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A KeePass database as a tar of pass-style entries: | pasa load"
+
+[dependencies]
+anyhow = "1"
+keepass = { version = "0.17", features = ["serialization"] }
+serde_json = "1"
+rpassword = "7"
+tar = { version = "0.4", default-features = false }

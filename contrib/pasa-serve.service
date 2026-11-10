@@ -1,0 +1,21 @@
+# pasa serve, seeing only age files, its endpoint key and the pairings'
+# transport keys: nothing that opens a version. First:
+#   mkdir -p ~/.pasa/v ~/.pasa/give ~/.pasa/take
+#   cp contrib/pasa-serve.service ~/.config/systemd/user/
+#   systemctl --user enable --now pasa-serve
+[Unit]
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/pasa serve
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=%h/.pasa/v %h/.pasa/take %h/.pasa/peers
+BindReadOnlyPaths=%h/.pasa/give %h/.pasa/node -%h/.pasa/id -%h/.pasa/mailbox %h/.cargo/bin/pasa
+
+[Install]
+WantedBy=default.target
