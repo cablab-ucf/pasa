@@ -1,6 +1,6 @@
-[submodule "android/irpair"]
-	path = android/irpair
-	url = https://github.com/cab-ucf/irpair
-[submodule "android/irpush"]
-	path = android/irpush
-	url = https://github.com/cab-ucf/irpush
+[submodule "android/pairir"]
+	path = android/pairir
+	url = https://github.com/cablab-ucf/pairir
+[submodule "android/pushir"]
+	path = android/pushir
+	url = https://github.com/cablab-ucf/pushir

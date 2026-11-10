@@ -133,12 +133,12 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apasa-jni"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
- "irpush",
  "jni 0.22.4",
  "pasa",
+ "pushir",
  "tokio",
  "zeroize",
 ]
@@ -201,6 +201,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
 dependencies = [
  "aws-lc-sys",
+ "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -1705,14 +1706,19 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "irnet"
-version = "0.2.0"
-source = "git+https://github.com/cab-ucf/irnet?rev=32a79274df3fa5e2826e18d52f27cab2a0848b44#32a79274df3fa5e2826e18d52f27cab2a0848b44"
+version = "0.4.0"
+source = "git+https://github.com/cablab-ucf/irnet?rev=845dcb4f5145ecf06dc15e22fbc6f2c3d4484c81#845dcb4f5145ecf06dc15e22fbc6f2c3d4484c81"
 dependencies = [
  "anyhow",
+ "chacha20poly1305 0.11.0",
+ "hmac 0.13.0",
  "hpke",
  "iroh",
+ "n0-future",
  "noq-proto",
  "rustls",
+ "sha2 0.11.1",
+ "tracing",
 ]
 
 [[package]]
@@ -1880,42 +1886,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "irpair"
-version = "0.2.0"
-source = "git+https://github.com/cab-ucf/irpair?rev=58096f7a4bfb4e5b5a62e9a3920eb365d1bfdcf0#58096f7a4bfb4e5b5a62e9a3920eb365d1bfdcf0"
-dependencies = [
- "anyhow",
- "argon2",
- "chacha20poly1305 0.11.0",
- "data-encoding",
- "getrandom 0.4.3",
- "iroh",
- "rand_chacha 0.10.0",
- "sha2 0.11.1",
- "tokio",
- "x-wing",
- "zeroize",
-]
-
-[[package]]
-name = "irpush"
-version = "0.2.0"
-source = "git+https://github.com/cab-ucf/irpush?rev=551e860311d551eb73faaaf8a21abdbe1fa57fea#551e860311d551eb73faaaf8a21abdbe1fa57fea"
-dependencies = [
- "anyhow",
- "data-encoding",
- "futures-util",
- "irnet",
- "iroh-base",
- "iroh-dns",
- "iroh-relay",
- "jni 0.22.4",
- "rand 0.10.3",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2018,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "kdbx2pasa"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "keepass",
@@ -2714,6 +2684,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
+name = "pairir"
+version = "0.3.0"
+source = "git+https://github.com/cablab-ucf/pairir?rev=83193d50abb6e96435eb4486ff4213f065c6bffd#83193d50abb6e96435eb4486ff4213f065c6bffd"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "chacha20 0.10.2",
+ "chacha20poly1305 0.11.0",
+ "curve25519-dalek 5.0.0",
+ "data-encoding",
+ "getrandom 0.4.3",
+ "iroh",
+ "sha2 0.11.1",
+ "tokio",
+ "x-wing",
+ "zeroize",
+]
+
+[[package]]
 name = "papaya"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2754,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "pasa"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "age",
  "age-core",
@@ -2765,8 +2754,8 @@ dependencies = [
  "humantime",
  "irnet",
  "iroh",
- "irpair",
- "irpush",
+ "pairir",
+ "pushir",
  "qrcode",
  "rpassword",
  "sha2 0.11.1",
@@ -3024,6 +3013,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "pushir"
+version = "0.3.0"
+source = "git+https://github.com/cablab-ucf/pushir?rev=6a4ad4856141c717948acbd558063f773f674d07#6a4ad4856141c717948acbd558063f773f674d07"
+dependencies = [
+ "anyhow",
+ "aws-lc-rs",
+ "data-encoding",
+ "futures-util",
+ "iroh-base",
+ "iroh-dns",
+ "iroh-relay",
+ "jni 0.22.4",
+ "noq-proto",
+ "rustls",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "qrcode"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3061,7 +3069,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
 dependencies = [
  "libc",
- "rand_chacha 0.3.1",
+ "rand_chacha",
  "rand_core 0.6.4",
 ]
 
@@ -3084,16 +3092,6 @@ checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
 dependencies = [
  "ppv-lite86",
  "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
-dependencies = [
- "ppv-lite86",
- "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -3193,7 +3191,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -3359,7 +3357,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -4318,6 +4316,12 @@ dependencies = [
  "crypto-common 0.2.2",
  "ctutils",
 ]
+
+[[package]]
+name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"

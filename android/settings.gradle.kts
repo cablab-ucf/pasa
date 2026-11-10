@@ -6,6 +6,6 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "apasa"
-include(":app", ":irpair", ":irpush")
-project(":irpair").projectDir = file("irpair/android/irpair") // submodule: QR codes
-project(":irpush").projectDir = file("irpush/android/irpush") // submodule: one push connection
+include(":app", ":pairir", ":pushir")
+project(":pairir").projectDir = file("qr") // the pairir submodule's QR codes, built by qr/
+project(":pushir").projectDir = file("pushir/android/pushir") // submodule: one push connection

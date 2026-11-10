@@ -13,10 +13,10 @@ android {
         applicationId = "com.apasa"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.2.0"
-        // irpush: apps signed by the same key share one connection.
-        manifestPlaceholders["irpushGroup"] = "center.cxn"
+        versionCode = 11
+        versionName = "0.3.0"
+        // pushir: apps signed by the same key share one connection.
+        manifestPlaceholders["pushirGroup"] = "center.cxn"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     buildTypes {
@@ -54,6 +54,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.yubico.yubikit:android:2.7.0")
     implementation("com.yubico.yubikit:yubiotp:2.7.0")
-    implementation(project(":irpair"))
-    implementation(project(":irpush"))
+    implementation(project(":pairir"))
+    implementation(project(":pushir"))
 }

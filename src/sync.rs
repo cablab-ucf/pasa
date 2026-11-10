@@ -1,7 +1,8 @@
 //! Devices swap the versions each lacks. Nothing here opens a version:
 //! `serve` holds pairing keys (transport only), endpoint ids and age files.
 //! Dialers use throwaway endpoints; `serve` admits whoever proves a
-//! pairing's key (irnet::psk: HPKE over X-Wing inside TLS 1.3).
+//! pairing's key (irnet::psk: HPKE over X-Wing inside TLS 1.3). A wake is
+//! an empty message to a peer's pushir lane: it says sync, nothing more.
 //!
 //! After a rotation the new store keys travel as an age file to a
 //! hand-over key each pairing shares, kept only in the devices' sealed
@@ -14,29 +15,21 @@ use irnet::psk::{Rx, Tx};
 use iroh::{
     EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr,
 };
-use irpush::Slot;
+use pushir::Lane;
 use std::{collections::HashSet, fs, path::Path, time::Duration};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-const ALPN: &[u8] = b"pasa/3";
+const ALPN: &[u8] = b"pasa/4";
 
 /// A pairing: its transport key, the peer's endpoint if it serves, its
-/// irpush mailbox and slot if it listens, its device id once it said.
+/// pushir lane if it listens, its device id once it said.
 pub struct Peer {
     pub name: String,
     pub psk: [u8; 32],
     pub id: Option<PublicKey>,
-    pub mailbox: Option<(PublicKey, Slot)>,
+    pub lane: Option<Lane>,
     pub device: Option<String>,
-}
-
-fn mailbox(b: &[u8]) -> Option<(PublicKey, Slot)> {
-    (b.len() == 48).then_some(())?;
-    Some((
-        PublicKey::from_bytes(b[..32].try_into().ok()?).ok()?,
-        b[32..].try_into().ok()?,
-    ))
 }
 
 pub fn peers(dir: &Path) -> Vec<Peer> {
@@ -46,21 +39,16 @@ pub fn peers(dir: &Path) -> Vec<Peer> {
         let psk =
             HEXLOWER.decode(w.next()?.as_bytes()).ok()?.try_into().ok()?;
         let id = w.next()?.parse().ok();
-        let m = HEXLOWER
-            .decode(w.next()?.as_bytes())
-            .ok()
-            .and_then(|b| mailbox(&b));
+        let lane = w.next()?.parse().ok();
         let device = Some(w.next()?).filter(|d| *d != "-").map(String::from);
-        Some(Peer { psk, id, mailbox: m, device, name: w.next()?.into() })
+        Some(Peer { psk, id, lane, device, name: w.next()?.into() })
     };
     f.lines().filter_map(peer).collect()
 }
 
 fn save(dir: &Path, ps: &[Peer]) -> Result<()> {
     let line = |p: &Peer| {
-        let m = p.mailbox.map_or("-".into(), |(k, s)| {
-            HEXLOWER.encode(&[k.as_bytes(), &s[..]].concat())
-        });
+        let m = p.lane.as_ref().map_or("-".into(), Lane::to_string);
         let id = p.id.map_or("-".into(), |k| k.to_string());
         let dev = p.device.as_deref().unwrap_or("-");
         format!("{} {id} {m} {dev} {}\n", HEXLOWER.encode(&p.psk), p.name)
@@ -186,42 +174,38 @@ fn key(dir: &Path, file: &str) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&b))
 }
 
-/// This device's irpush slot for pasa, made once.
-pub fn slot(dir: &Path) -> Result<Slot> {
-    let p = dir.join("slot");
-    if !p.exists() {
-        write(&p, &rand::<16>())?;
-    }
-    fs::read(p)?.try_into().ok().context("bad slot")
+/// This device's pushir lane secret for pasa, made once: peers alone get
+/// it, and what is sealed under it says only "sync".
+pub fn lane(dir: &Path) -> Result<pushir::Key> {
+    pushir::kept(&dir.join("lane"))
 }
 
-/// Where peers wake us: the mailbox irpush gave this device.
+/// Where peers wake us: our lane on the mailbox pushir gave this device.
 pub fn set_mailbox(dir: &Path, id: PublicKey) -> Result<()> {
-    write(&dir.join("mailbox"), &[id.as_bytes(), &slot(dir)?[..]].concat())
+    let l = Lane { relay: pushir::relay()?, id, secret: lane(dir)? };
+    write(&dir.join("mailbox"), l.to_string().as_bytes())
 }
 
-/// Whether `m` is a wake from a peer, sealed in the last five minutes.
-pub fn is_wake(dir: &Path, m: &[u8]) -> bool {
-    let now = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
-    let t = peers(dir).iter().find_map(|p| open(&p.psk, m));
-    let t = t.and_then(|t| Some(u64::from_be_bytes(t[..].try_into().ok()?)));
-    t.is_some_and(|t| t + 300 > now)
+/// `$PASA_RELAY`, or the lab's. One that does not parse is an error, not
+/// the lab's after all.
+fn relay() -> Result<RelayUrl> {
+    match std::env::var("PASA_RELAY") {
+        Ok(r) => r
+            .parse()
+            .ok()
+            .with_context(|| format!("PASA_RELAY: {r} is no relay's url")),
+        Err(_) => Ok(irnet::relays().swap_remove(0)),
+    }
 }
 
-/// `$PASA_RELAY`, or the lab's.
-fn relay() -> RelayUrl {
-    let r = std::env::var("PASA_RELAY").ok().and_then(|r| r.parse().ok());
-    r.unwrap_or_else(|| irnet::relays().swap_remove(0))
-}
-
-fn ep() -> iroh::endpoint::Builder {
-    irnet::endpoint().relay_mode(RelayMode::custom([relay()]))
+fn ep() -> Result<iroh::endpoint::Builder> {
+    Ok(irnet::endpoint().relay_mode(RelayMode::custom([relay()?])))
 }
 
 /// What a swap learnt of the peer, and how many versions it took.
-type Swapped = (Option<(PublicKey, Slot)>, Option<String>, usize);
+type Swapped = (Option<Lane>, Option<String>, usize);
 
-/// Swap mailboxes, device ids and hand-overs, then the versions each lacks.
+/// Swap lanes, device ids and hand-overs, then the versions each lacks.
 async fn swap(
     dir: &Path,
     peer: &str,
@@ -231,7 +215,8 @@ async fn swap(
     tx.send(&fs::read(dir.join("mailbox")).unwrap_or_default()).await?;
     tx.send(device(dir)?.as_bytes()).await?;
     tx.send(&fs::read(dir.join("give").join(peer)).unwrap_or_default()).await?;
-    let theirs = mailbox(&rx.recv(48).await?);
+    let theirs = String::from_utf8(rx.recv(1024).await?).ok();
+    let theirs = theirs.and_then(|l| l.parse().ok());
     let dev =
         String::from_utf8(rx.recv(32).await?).ok().filter(|d| d.len() == 32);
     let keys = rx.recv(64 << 10).await?;
@@ -285,55 +270,71 @@ async fn swap(
 fn learnt(
     dir: &Path,
     name: &str,
-    mailbox: Option<Option<(PublicKey, Slot)>>,
+    lane: Option<Option<Lane>>,
     dev: Option<String>,
 ) {
     let mut ps = peers(dir);
     let Some(p) = ps.iter_mut().find(|p| p.name == name) else { return };
-    let before = (p.mailbox, p.device.clone());
-    p.mailbox = mailbox.unwrap_or(p.mailbox);
+    let before = (p.lane.clone(), p.device.clone());
+    p.lane = lane.unwrap_or(p.lane.take());
     p.device = dev.or(p.device.take());
-    if before != (p.mailbox, p.device.clone()) {
+    if before != (p.lane.clone(), p.device.clone()) {
         let _ = save(dir, &ps);
     }
 }
 
-/// Wake every listening peer but `except`: the time, sealed to its key.
+/// Wake every listening peer but `except`, all at once: an empty message
+/// to its lane. A wake lost or repeated costs a sync at most.
 async fn wake(dir: &Path, except: &str) {
-    let now = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_secs();
-    for p in peers(dir).into_iter().filter(|p| p.name != except) {
-        if let (Some((id, slot)), Ok(w)) =
-            (p.mailbox, seal(&p.psk, &now.to_be_bytes()))
-        {
-            let _ = irpush::send(&irpush::relay(), id, slot, &w).await;
-        }
-    }
+    let ps = peers(dir);
+    let lanes =
+        ps.iter().filter(|p| p.name != except).filter_map(|p| p.lane.as_ref());
+    let mut all: tokio::task::JoinSet<_> = lanes
+        .cloned()
+        .map(|l| async move { pushir::send(&l, b"").await })
+        .collect();
+    while all.join_next().await.is_some() {}
 }
 
-/// Sync with every peer that serves; with `news` (a change here), then
-/// wake those that listen.
+/// Sync with every peer that serves, all at once (one that is away costs
+/// its 30 s once, not once each); with `news` (a change here), then wake
+/// those that listen.
 pub async fn sync(
     dir: &Path,
     news: bool,
 ) -> Result<Vec<(String, Result<usize>)>> {
-    let ep = ep().alpns(vec![ALPN.into()]).bind().await?;
-    let mut out = vec![];
+    let (ep, relay) = (ep()?.alpns(vec![ALPN.into()]).bind().await?, relay()?);
+    let mut all = tokio::task::JoinSet::new();
     for p in peers(dir) {
         let Some(id) = p.id else { continue };
-        let go = async {
-            let at =
-                EndpointAddr::from_parts(id, [TransportAddr::Relay(relay())]);
-            let c = ep.connect(at, ALPN).await?;
-            let (tx, rx) = irnet::psk::dial(&c, &p.psk).await?;
-            let r = swap(dir, &p.name, tx, rx).await;
-            c.close(0u32.into(), b"");
-            let (_, dev, n) = r?;
-            learnt(dir, &p.name, None, dev);
-            Ok(n)
-        };
-        let r = timeout(Duration::from_secs(30), go).await;
-        out.push((p.name, r.unwrap_or_else(|_| Err(anyhow!("no answer")))));
+        let (ep, relay, dir) = (ep.clone(), relay.clone(), dir.to_path_buf());
+        all.spawn(async move {
+            let go = async {
+                let at =
+                    EndpointAddr::from_parts(id, [TransportAddr::Relay(relay)]);
+                let c = ep.connect(at, ALPN).await?;
+                let (tx, rx) = irnet::psk::dial(&c, &p.psk).await?;
+                let r = swap(&dir, &p.name, tx, rx).await;
+                c.close(0u32.into(), b"");
+                r
+            };
+            let r = timeout(Duration::from_secs(30), go).await;
+            (p.name, r.unwrap_or_else(|_| Err(anyhow!("no answer"))))
+        });
     }
+    // What each swap learnt is kept one at a time: `peers` is one file.
+    let mut out = vec![];
+    while let Some(r) = all.join_next().await {
+        let (name, r) = r?;
+        out.push((
+            name.clone(),
+            r.map(|(_, dev, n)| {
+                learnt(dir, &name, None, dev);
+                n
+            }),
+        ));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     ep.close().await;
     if news {
         wake(dir, "").await;
@@ -343,7 +344,7 @@ pub async fn sync(
 
 /// Accept syncs from paired devices; wake the others after news.
 pub async fn serve(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
-    let ep = ep()
+    let ep = ep()?
         .secret_key(key(dir, "node")?)
         .alpns(vec![ALPN.into()])
         .bind()
@@ -352,7 +353,7 @@ pub async fn serve(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
         let dir = dir.to_path_buf();
         tokio::spawn(async move {
             let ps = peers(&dir);
-            let psks: Vec<&[u8]> = ps.iter().map(|p| &p.psk[..]).collect();
+            let psks: Vec<&[u8; 32]> = ps.iter().map(|p| &p.psk).collect();
             let go = async {
                 let (i, tx, rx) =
                     irnet::psk::accept(&inc.await?, &psks).await?;
@@ -374,19 +375,21 @@ pub async fn serve(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
     Ok(())
 }
 
-/// Desktop: attach to the irpush daemon; sync on each fresh wake.
+/// Desktop: attach to the pushir daemon; sync now, and on each message
+/// (a peer's wake, or the mailbox back from a gap). Wakes that came during
+/// a sync are answered by one more.
 #[cfg(unix)]
 pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
     let (id, mut rx) =
-        irpush::local::attach(&irpush::local::sock(), slot(dir)?).await?;
+        pushir::local::attach(&pushir::local::sock(), &lane(dir)?).await?;
     set_mailbox(dir, id)?;
-    sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
-    while let Some(m) = rx.recv().await {
-        if is_wake(dir, &m) {
-            sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
+    loop {
+        sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
+        if rx.recv().await.is_none() {
+            return Ok(());
         }
+        while rx.try_recv().is_ok() {}
     }
-    Ok(())
 }
 
 /// Keep a pairing's hand-over key, sealed in `dev`.
@@ -397,27 +400,31 @@ pub fn keep_hand(s: &mut Store, name: &str, hand: &[u8]) -> Result<()> {
 
 /// For a new device, called `name` here: this device's endpoint, fresh
 /// transport and hand-over keys, and the key file (still sealed to the
-/// password and YubiKey), by irpair under `pw`. `qr`: an offline QR
+/// password and YubiKey), by pairir under `pw`. `qr`: an offline QR
 /// code's text, else a short code. The hand-over key goes straight into
-/// the unlocked store's `dev`.
+/// the unlocked store's `dev`. With a short code: how it ends too.
 pub async fn pair(
     s: &mut Store,
     name: &str,
     pw: &str,
     qr: bool,
-) -> Result<String> {
+) -> Result<(String, Option<tokio::task::JoinHandle<pairir::End>>)> {
     let dir = s.dir.clone();
     let (psk, hand) = (rand::<32>(), rand::<32>());
     let id = key(&dir, "node")?.public();
     let f = fs::read(dir.join("key")).context("no store here")?;
     let secret = Zeroizing::new([&psk[..], &hand, id.as_bytes(), &f].concat());
     let out = match qr {
-        true => irpair::seal_qr("pasa", &secret, pw).await?,
-        false => irpair::give(ep(), "pasa", &secret, Some(pw)).await?,
+        true => (pairir::seal_qr("pasa", &secret, pw).await?, None),
+        false => {
+            let (code, end) =
+                pairir::give(ep()?, "pasa", &secret, Some(pw)).await?;
+            (code, Some(end))
+        }
     };
     add(
         &dir,
-        Peer { name: name.into(), psk, id: None, mailbox: None, device: None },
+        Peer { name: name.into(), psk, id: None, lane: None, device: None },
     )?;
     keep_hand(s, name, &hand)?;
     Ok(out)
@@ -432,9 +439,11 @@ pub async fn join(
     code: &str,
     pw: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let s = match code.trim().starts_with("IRPAIR1:") {
-        true => irpair::open_qr("pasa", code, pw).await?,
-        false => irpair::take(ep(), &[relay()], "pasa", code, Some(pw)).await?,
+    let s = match code.trim().starts_with("PAIRIR1:") {
+        true => pairir::open_qr("pasa", code, pw).await?,
+        false => {
+            pairir::take(ep()?, &[relay()?], "pasa", code, Some(pw)).await?
+        }
     };
     ensure!(s.len() > 96, "not a pasa pairing");
     if !dir.join("key").exists() {
@@ -447,7 +456,7 @@ pub async fn join(
             name: name.into(),
             psk: s[..32].try_into()?,
             id,
-            mailbox: None,
+            lane: None,
             device: None,
         },
     )?;
@@ -471,7 +480,7 @@ mod tests {
             name: n.into(),
             psk,
             id: None,
-            mailbox: None,
+            lane: None,
             device: None,
         };
         add(&a.dir, p(bn)).unwrap();
@@ -533,11 +542,15 @@ mod tests {
         sa.put("x", b"1").unwrap();
         sb.put("y", b"2").unwrap();
         fs::write(a.join("v/stray"), b"editor backup").unwrap();
+        // a listens: whoever it dials learns its lane, to wake it there.
+        set_mailbox(&a, SecretKey::from_bytes(&[3; 32]).public()).unwrap();
         assert_eq!(
             swap_once(&a, &b, "b", "a").await,
             (1, 1),
             "a stray file stays"
         );
+        let at = peers(&b).into_iter().find(|p| p.name == "a").unwrap().lane;
+        assert!(at.is_some_and(|l| l.secret == lane(&a).unwrap()));
         swap_once(&a, &c, "c", "a").await;
         swap_once(&b, &c, "c", "b").await;
         assert_eq!(

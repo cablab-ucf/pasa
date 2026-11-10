@@ -439,11 +439,13 @@ impl Store {
         Ok(last.into_iter().filter(|(_, (_, c))| *c).map(|(n, _)| n).collect())
     }
 
+    /// An entry's body: its newest version, found without sorting the rest.
     pub fn get(&self, name: &str) -> Result<Secret> {
-        let v = self
-            .entries()?
-            .remove(name)
-            .with_context(|| format!("{name}: not in store"))?;
+        let x = self.index()?;
+        let v = x.heads.values().filter(|v| v.name == name);
+        let v = v.max_by_key(|v| (v.ms, &v.file)).filter(|v| v.size > 0);
+        let v = v.with_context(|| format!("{name}: not in store"))?.clone();
+        drop(x);
         self.body(&v)
     }
 

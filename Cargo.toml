@@ -1,6 +1,6 @@
 [package]
 name = "pasa"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -11,7 +11,7 @@ members = ["kdbx2pasa", "apasa-jni"]
 
 [features]
 default = ["sync"]
-sync = ["dep:irnet", "dep:irpair", "dep:irpush", "dep:iroh", "dep:tokio", "dep:qrcode"]
+sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode"]
 
 [dependencies]
 anyhow = "1"
@@ -26,9 +26,9 @@ tar = { version = "0.4", default-features = false }
 totp-lite = "2"
 data-encoding = "2"
 zeroize = "1"
-irnet = { git = "https://github.com/cab-ucf/irnet", rev = "32a79274df3fa5e2826e18d52f27cab2a0848b44", optional = true }
-irpush = { git = "https://github.com/cab-ucf/irpush", rev = "551e860311d551eb73faaaf8a21abdbe1fa57fea", optional = true }
-irpair = { git = "https://github.com/cab-ucf/irpair", rev = "58096f7a4bfb4e5b5a62e9a3920eb365d1bfdcf0", optional = true }
+irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "845dcb4f5145ecf06dc15e22fbc6f2c3d4484c81", optional = true }
+pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "6a4ad4856141c717948acbd558063f773f674d07", optional = true }
+pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "83193d50abb6e96435eb4486ff4213f065c6bffd", optional = true }
 iroh = { version = "1.4", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }

@@ -1,6 +1,6 @@
 [package]
 name = "apasa-jni"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 anyhow = "1"
 jni = "0.22"
 pasa = { path = ".." }
-# org.irpush.Native, for the shared push connection (android/irpush).
-irpush = { git = "https://github.com/cab-ucf/irpush", rev = "551e860311d551eb73faaaf8a21abdbe1fa57fea", features = ["jni"] }
+# org.pushir.Native, for the shared push connection (android/pushir).
+pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "6a4ad4856141c717948acbd558063f773f674d07", features = ["jni"] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
