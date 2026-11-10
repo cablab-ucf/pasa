@@ -1,6 +1,6 @@
 [package]
 name = "pasa"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -10,8 +10,10 @@ description = "A tiny password store: sealed versions, synced by union"
 members = ["kdbx2pasa", "apasa-jni"]
 
 [features]
-default = ["sync"]
+default = ["sync", "tui"]
 sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode"]
+tui = ["dep:crossterm"]
+gui = ["dep:eframe"]
 
 [dependencies]
 anyhow = "1"
@@ -32,6 +34,8 @@ pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "6e7faa92e6732834
 iroh = { version = "1.4", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
+crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
 
 [profile.release]
 lto = true

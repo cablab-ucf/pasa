@@ -5,8 +5,16 @@ use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
 
+#[cfg(feature = "gui")]
+mod gui;
+#[cfg(feature = "tui")]
+mod tui;
+#[cfg(any(feature = "tui", feature = "gui"))]
+mod view;
+
 const USAGE: &str = "\
 pasa [ls]                    names
+pasa tui | gui               browse, copy, edit: one unlock
 pasa [show] NAME [FIELD]     entry, or a field: pass, user, otp, ...
 pasa cp NAME [FIELD]         to the clipboard for 45 s
 pasa set NAME                from stdin (a terminal: the password)
@@ -52,11 +60,14 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 }
 
 fn open() -> Result<Store> {
+    unlock(&ask("Password: ")?)
+}
+
+fn unlock(pw: &[u8]) -> Result<Store> {
     let k = std::fs::read(home().join("key")).context("no store: pasa init")?;
-    let pw = ask("Password: ")?;
     let yk = challenge(&k).map(yubikey).transpose()?;
     #[allow(unused_mut)]
-    let mut s = Store::open(&home(), &pw, yk.as_deref().map(|v| &v[..]))?;
+    let mut s = Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))?;
     #[cfg(feature = "sync")]
     pasa::sync::adopt(&mut s)?;
     Ok(s)
@@ -74,8 +85,9 @@ const CLIPS: [(&[&str], &[&str]); 3] = [
 ];
 
 fn piped(cmd: &[&str], s: &[u8]) -> Result<()> {
-    let mut c =
-        Command::new(cmd[0]).args(&cmd[1..]).stdin(Stdio::piped()).spawn()?;
+    let mut c = Command::new(cmd[0]);
+    c.args(&cmd[1..]).stdin(Stdio::piped()).stderr(Stdio::null());
+    let mut c = c.spawn()?;
     c.stdin.take().context("stdin")?.write_all(s)?;
     ensure!(c.wait()?.success(), "{} failed", cmd[0]);
     Ok(())
@@ -126,6 +138,15 @@ fn edit(old: &[u8]) -> Result<Secret> {
     std::fs::remove_file(&f)?;
     ensure!(ok?.success(), "{ed} failed");
     Ok(new?)
+}
+
+/// A new password for `n`, its other lines kept.
+fn generate(s: &Store, n: &str, len: usize, symbols: bool) -> Result<String> {
+    let pw = pasa::generate(len, symbols);
+    let old = s.get(n).unwrap_or_default();
+    let rest = text(&old)?.split_once('\n').map_or("", |r| r.1);
+    s.put(n, format!("{pw}\n{rest}").as_bytes())?;
+    Ok(pw)
 }
 
 /// `git` in `v/`, where the user made that a repository: its output.
@@ -182,6 +203,14 @@ fn main() -> Result<()> {
             }
             return Ok(());
         }
+        ["help" | "-h" | "--help"] => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        #[cfg(feature = "tui")]
+        ["tui"] => return tui::run(open()?),
+        #[cfg(feature = "gui")]
+        ["gui"] => return gui::run(),
         ["--clear-clipboard", i] => return clear_clipboard(i.parse()?),
         ["keys"] => {
             print!("{}", *open()?.passphrases());
@@ -222,11 +251,7 @@ fn main() -> Result<()> {
         }
         ["gen", n, ..] => {
             let len = a.get(2).and_then(|l| l.parse().ok()).unwrap_or(24);
-            let pw = pasa::generate(len, !flag("-n"));
-            let s = open()?;
-            let old = s.get(n).unwrap_or_default();
-            let rest = text(&old)?.split_once('\n').map_or("", |r| r.1);
-            s.put(n, format!("{pw}\n{rest}").as_bytes())?;
+            let pw = generate(&open()?, n, len, !flag("-n"))?;
             match flag("-c") {
                 true => clip(&pw)?,
                 false => println!("{pw}"),
@@ -311,6 +336,18 @@ fn main() -> Result<()> {
         sync(&["sync", "--news"])?;
     }
     Ok(())
+}
+
+/// `pasa sync` beside a view, unseen: what it brings shows as `v/` changes.
+#[cfg(any(feature = "tui", feature = "gui"))]
+fn aside(news: bool) {
+    if cfg!(feature = "sync") && home().join("peers").exists() {
+        let c = std::env::current_exe().map(Command::new);
+        let _ = c.map(|mut c| {
+            c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
+            c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
+        });
+    }
 }
 
 #[cfg(feature = "sync")]

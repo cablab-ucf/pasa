@@ -11,9 +11,28 @@ pasa cp mail/work                 # clipboard, cleared after 45 s if unchanged
 pasa mail/work otp                # a field: pass, user, otp, ...
 ```
 
+```sh
+pasa tui                          # one unlock: type to filter, Enter copies
+pasa gui                          # the same in a window (--features gui)
+nix run github:cablab-ucf/pasa -- gui   # NixOS, macOS: all three, nothing to install
+```
+
 `pasa help` lists every command. An entry is text as in `pass`: the
 password, then `key: value` lines and any `otpauth://totp/` URI.
 [apasa](android/) is the Android app.
+
+## Desktop
+
+One binary is the command line, the terminal browser and the window. A
+release has it for Linux (x86-64, glibc) and macOS (Apple silicon, with
+`pasa.app`); elsewhere, and on NixOS, build it: the flake's `pasa-gui`
+(default) or `pasa-cli` (no window libraries), or `cargo install --locked
+--path . --features gui`. `pasa.app` is signed ad hoc, by no Apple account:
+after a download, `xattr -dr com.apple.quarantine pasa.app`.
+
+Both browsers lock after 5 minutes left alone, sync as the command line
+does, and copy through `wl-copy`, `xclip` or `pbcopy`. The window needs
+libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 
 ## Files
 
