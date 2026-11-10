@@ -535,6 +535,60 @@ pub fn field(body: &str, f: &str) -> Option<String> {
     }
 }
 
+/// An entry's text as the fields a form shows: the password (line 1),
+/// `user:`, `url:`, the otpauth URI's line, and every other line.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Form {
+    pub pass: String,
+    pub user: String,
+    pub url: String,
+    pub otp: String,
+    pub notes: String,
+}
+
+impl Form {
+    pub fn parse(body: &str) -> Form {
+        let mut l = body.lines();
+        let mut f = Form {
+            pass: l.next().unwrap_or_default().into(),
+            ..Form::default()
+        };
+        let mut notes = vec![];
+        for l in l {
+            let key = |k: &str| {
+                Some(l.strip_prefix(k)?.strip_prefix(':')?.trim().to_string())
+            };
+            match (key("user"), key("url")) {
+                (Some(u), _) if f.user.is_empty() => f.user = u,
+                (_, Some(u)) if f.url.is_empty() => f.url = u,
+                _ if l.contains("otpauth://") && f.otp.is_empty() => {
+                    f.otp = l.trim().into()
+                }
+                _ => notes.push(l),
+            }
+        }
+        f.notes = notes.join("\n").trim_end().into();
+        f
+    }
+
+    /// The entry's text again: what [`Form::parse`] reads back the same.
+    pub fn text(&self) -> String {
+        let one = |s: &str| s.replace(['\n', '\r'], " ");
+        let mut t = one(&self.pass) + "\n";
+        for (k, v) in
+            [("user: ", &self.user), ("url: ", &self.url), ("", &self.otp)]
+        {
+            if !v.trim().is_empty() {
+                t += &format!("{k}{}\n", one(v.trim()));
+            }
+        }
+        if !self.notes.trim().is_empty() {
+            t += &format!("{}\n", self.notes.trim_end());
+        }
+        t
+    }
+}
+
 /// RFC 6238.
 pub fn totp(uri: &str, t: u64) -> Option<String> {
     use totp_lite::{Sha1, Sha256, Sha512, totp_custom as f};
@@ -661,6 +715,27 @@ mod tests {
         let pt = open(&s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
         assert_eq!(pt.len(), 256, "padded");
+    }
+
+    #[test]
+    fn forms_round_trip() {
+        let t = "pw\nuser: ada\nfree line\nurl: https://x.org\notpauth://totp/x?secret=JBSWY3DP\nlast\n";
+        let f = Form::parse(t);
+        assert_eq!(
+            (&*f.pass, &*f.user, &*f.url),
+            ("pw", "ada", "https://x.org")
+        );
+        assert_eq!(
+            (&*f.otp, &*f.notes),
+            ("otpauth://totp/x?secret=JBSWY3DP", "free line\nlast")
+        );
+        assert_eq!(Form::parse(&f.text()), f);
+        assert_eq!(field(&f.text(), "user").as_deref(), Some("ada"));
+        assert!(field(&f.text(), "otp").is_some());
+        // A password is one line, whatever is typed; nothing else: only it.
+        let bare = Form { pass: "a\nb".into(), ..Form::default() };
+        assert_eq!(bare.text(), "a b\n");
+        assert_eq!(Form::parse(""), Form::default());
     }
 
     #[test]

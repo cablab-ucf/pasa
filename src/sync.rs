@@ -422,6 +422,8 @@ pub fn keep_hand(s: &mut Store, name: &str, hand: &[u8]) -> Result<()> {
     s.save()
 }
 
+pub use pairir::password;
+
 /// For a new device, called `name` here: this device's endpoint, fresh
 /// transport and hand-over keys, and the key file (still sealed to the
 /// password and YubiKey), by pairir under `pw`. `qr`: an offline QR

@@ -190,8 +190,92 @@ pub extern "system" fn Java_com_apasa_Native_generate<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     len: i32,
+    symbols: bool,
 ) -> JString<'l> {
-    run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, true))?))
+    run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, symbols))?))
+}
+
+/// An entry's text as its form: password, user, url, otpauth URI and
+/// notes, U+001F between them.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_form<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    body: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let f = pasa::Form::parse(&body.to_string());
+        Ok(e.new_string(
+            [f.pass, f.user, f.url, f.otp, f.notes].join("\u{1f}"),
+        )?)
+    })
+}
+
+/// The entry's text of a form as [`Java_com_apasa_Native_form`] gives it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_text<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    form: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let s = form.to_string();
+        let mut p = s.splitn(5, '\u{1f}').map(String::from);
+        let mut next = || p.next().unwrap_or_default();
+        let f = pasa::Form {
+            pass: next(),
+            user: next(),
+            url: next(),
+            otp: next(),
+            notes: next(),
+        };
+        Ok(e.new_string(f.text())?)
+    })
+}
+
+/// The paired devices' names, one a line.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_peers<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let ps = sync::peers(Path::new(&dir.to_string()));
+        let names: Vec<String> = ps.into_iter().map(|p| p.name).collect();
+        Ok(e.new_string(names.join("\n"))?)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_forget<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+    name: JString<'l>,
+) {
+    run(&mut env, |_| {
+        Ok(sync::forget(Path::new(&dir.to_string()), &name.to_string())?)
+    })
+}
+
+/// Let a device join, called `name` here: its code, then the pairing
+/// password, a line each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_pair<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let pw = sync::password();
+        let mut stores = STORES.lock().unwrap();
+        let st = stores.get_mut(&h).context("locked")?;
+        let (code, _) =
+            RT.block_on(sync::pair(st, &name.to_string(), &pw, false))?;
+        Ok(e.new_string(format!("{code}\n{pw}"))?)
+    })
 }
 
 #[unsafe(no_mangle)]

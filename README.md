@@ -30,8 +30,17 @@ release has it for Linux (x86-64, glibc) and macOS (Apple silicon, with
 --path . --features gui`. `pasa.app` is signed ad hoc, by no Apple account:
 after a download, `xattr -dr com.apple.quarantine pasa.app`.
 
-Both browsers lock after 5 minutes left alone, sync as the command line
-does, and copy through `wl-copy`, `xclip` or `pbcopy`. The window needs
+The window is laid out as the Android app is: a first run asks for the
+password and, if wanted, a YubiKey, with joining another device's store in
+the corner; then groups, entries with their user names, the chosen entry's
+fields each with its copy, a form to edit them, a password generator,
+devices (pair, forget, sync) and settings (`~/.pasa/ui`: when to lock, the
+theme). An entry is still the text `pass` reads: the form writes `user:`
+and `url:` lines.
+
+Both browsers lock when left alone (5 minutes; the window's is a setting),
+sync as the command line does, and copy through `wl-copy`, `xclip` or
+`pbcopy`. The window needs
 libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 
 ## Files

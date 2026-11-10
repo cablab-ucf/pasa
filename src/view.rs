@@ -13,6 +13,8 @@ pub struct View {
     pub s: Store,
     pub filter: String,
     pub names: Vec<String>,
+    /// Each name's newest version, by its file: what a cache keys on.
+    pub files: Vec<String>,
     pub at: usize,
     pub note: String,
 }
@@ -21,7 +23,8 @@ impl View {
     pub fn new(s: Store) -> View {
         aside(false);
         let (filter, note) = Default::default();
-        let mut v = View { s, filter, names: vec![], at: 0, note };
+        let mut v =
+            View { s, filter, names: vec![], files: vec![], at: 0, note };
         v.load();
         v
     }
@@ -35,7 +38,11 @@ impl View {
                 && f.split_whitespace().all(|w| n.contains(w))
         };
         let all = self.s.entries().unwrap_or_default();
-        self.names = all.into_keys().filter(has).collect();
+        (self.names, self.files) = all
+            .into_iter()
+            .filter(|e| has(&e.0))
+            .map(|(n, v)| (n, v.file))
+            .unzip();
         self.at = self.at.min(self.names.len().saturating_sub(1));
     }
 

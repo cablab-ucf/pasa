@@ -11,7 +11,12 @@ object Native {
     external fun get(h: Long, name: String): String
     external fun put(h: Long, name: String, body: String)
     external fun field(body: String, f: String): String
-    external fun generate(len: Int): String
+    external fun generate(len: Int, symbols: Boolean): String
+    external fun form(body: String): String
+    external fun text(form: String): String
+    external fun peers(dir: String): String
+    external fun forget(dir: String, name: String)
+    external fun pair(h: Long, name: String): String
     external fun join(dir: String, name: String, code: String, pw: String): String
     external fun sync(dir: String, news: Boolean): String
     external fun lane(dir: String): ByteArray
