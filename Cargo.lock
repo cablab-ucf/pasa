@@ -133,7 +133,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apasa-jni"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "jni 0.22.4",
@@ -1988,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "kdbx2pasa"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "keepass",
@@ -2685,8 +2685,8 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "pairir"
-version = "0.3.0"
-source = "git+https://github.com/cablab-ucf/pairir?rev=43d6c130de74f60b6fc8d3310d18ae2bd8c2684c#43d6c130de74f60b6fc8d3310d18ae2bd8c2684c"
+version = "0.4.0"
+source = "git+https://github.com/cablab-ucf/pairir?rev=6e7faa92e6732834db30e8a67fc439f5cb333132#6e7faa92e6732834db30e8a67fc439f5cb333132"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "pasa"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "age",
  "age-core",
@@ -3015,8 +3015,8 @@ dependencies = [
 
 [[package]]
 name = "pushir"
-version = "0.3.0"
-source = "git+https://github.com/cablab-ucf/pushir?rev=cf0dad19c1e67d6bcd9fcf90c467b45e9b9f2d51#cf0dad19c1e67d6bcd9fcf90c467b45e9b9f2d51"
+version = "0.4.0"
+source = "git+https://github.com/cablab-ucf/pushir?rev=5d02db72e41c6646de1d60600a71a7d1b82f44cd#5d02db72e41c6646de1d60600a71a7d1b82f44cd"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
