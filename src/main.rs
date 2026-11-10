@@ -302,9 +302,9 @@ async fn sync(a: &[&str]) -> Result<()> {
     let dir = home();
     match a {
         ["pair", name, ..] => {
-            let (pw, qr) = (irpair::password(), a.contains(&"--qr"));
+            let (pw, qr) = (pairir::password(), a.contains(&"--qr"));
             let mut s = open()?;
-            let code = sync::pair(&mut s, name, &pw, qr).await?;
+            let (code, end) = sync::pair(&mut s, name, &pw, qr).await?;
             if qr {
                 println!(
                     "{}",
@@ -314,8 +314,18 @@ async fn sync(a: &[&str]) -> Result<()> {
                 );
             }
             println!("{code}\npassword: {pw}\nthere: pasa join NAME {code}");
-            if !qr {
-                tokio::time::sleep(irpair::TTL).await;
+            match end {
+                None => {}
+                Some(end) => match end.await? {
+                    pairir::End::Taken => eprintln!("{name} took it"),
+                    pairir::End::Expired => {
+                        eprintln!("nobody came: pair again")
+                    }
+                    pairir::End::Spent => bail!(
+                        "the code was used by someone who did not prove it: \
+                         pasa forget {name}, then pair again"
+                    ),
+                },
             }
         }
         ["join", name, code] => {

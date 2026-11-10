@@ -21,7 +21,7 @@ password, then `key: value` lines and any `otpauth://totp/` URI.
 ~/.pasa/v/       versions: age files, named by their hash; synced
 ~/.pasa/key      store keys, sealed to the password (+ YubiKey); handed to new devices
 ~/.pasa/dev      this device's hand-over keys, sealed the same; never leaves
-~/.pasa/peers    pairings: transport key, endpoint, mailbox, device id
+~/.pasa/peers    pairings: transport key, endpoint, lane, device id
 ```
 
 Nothing else is written: no index, no cache. A listing opens every
@@ -48,7 +48,7 @@ history. Back up `~/.pasa` with anything.
   factors needed. The password is per device (`passwd` changes this one);
   each `passwd` takes a fresh challenge. Program two YubiKeys with one
   secret (`ykman otp chalresp 2 SECRET`).
-- **Transport keys, endpoint, mailbox, device id**: what `serve` holds;
+- **Transport keys, endpoint, lanes, device id**: what `serve` holds;
   none opens a version or a hand-over.
 
 ## Sync
@@ -57,11 +57,11 @@ history. Back up `~/.pasa` with anything.
 pasa pair phone        # here: a code and pairing password (--qr: offline)
 pasa join home CODE    # there
 pasa serve             # accept syncs; wake listening peers on news
-pasa listen            # sync when woken, through irpush's daemon (laptops)
-pasa sync              # with every peer that serves (also after each change)
+pasa listen            # sync when woken, through pushir's daemon (laptops)
+pasa sync              # with every peer that serves, all at once (also after each change)
 ```
 
-Pairing hands over, through [irpair](https://github.com/cab-ucf/irpair),
+Pairing hands over, through [pairir](https://github.com/cablab-ucf/pairir),
 this device's endpoint, fresh transport and hand-over keys, and the key
 file, still sealed to the password and YubiKey: the only way store keys
 travel, but for hand-overs below. Both sides unlock to pair, so the
@@ -79,9 +79,14 @@ ciphertext. Dialers use throwaway endpoints. Received files must match
 their names, be asked for, and be under 16 MiB; strays in `v/` are
 ignored.
 
-A wake (after a change here, never otherwise) is the time sealed to the
-pairing's transport key, through [irpush](https://github.com/cab-ucf/irpush):
-a device syncs only on one that opens and is under five minutes old.
+A wake (after a change here, never otherwise) is an empty message to a
+peer's lane, through [pushir](https://github.com/cablab-ucf/pushir), which
+seals it: the relay sees a mailbox and 1024 random-looking bytes. It says
+"sync" and nothing else, so one lost, repeated or forged by a peer costs a
+sync at most; a device also syncs when its connection comes back. Every
+peer of a device holds its lane's secret, so `forget` and `revoke` make a
+new one, which the peers that stay get at their next sync (`listen` moves
+to it within a quarter of an hour, the Android app when it next starts).
 
 `revoke NAME` ends the pairing, marks the device's id revoked and rotates
 the store key: every entry is sealed again to a new key, which reaches the

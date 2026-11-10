@@ -1,7 +1,7 @@
 //! libapasa.so: pasa for com.apasa.Native (errors become RuntimeExceptions),
-//! and irpush's org.irpush.Native.
+//! and pushir's org.pushir.Native.
 
-extern crate irpush;
+extern crate pushir;
 
 use anyhow::Context;
 use jni::errors::ThrowRuntimeExAndDefault as Throw;
@@ -230,19 +230,19 @@ pub extern "system" fn Java_com_apasa_Native_sync<'l>(
     })
 }
 
-/// This device's irpush slot for pasa.
+/// This device's pushir lane secret for pasa.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_apasa_Native_slot<'l>(
+pub extern "system" fn Java_com_apasa_Native_lane<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     dir: JString<'l>,
 ) -> JByteArray<'l> {
     run(&mut env, |e| {
-        Ok(e.byte_array_from_slice(&sync::slot(Path::new(&dir.to_string()))?)?)
+        Ok(e.byte_array_from_slice(&sync::lane(Path::new(&dir.to_string()))?)?)
     })
 }
 
-/// The mailbox irpush gave this device, for peers to wake it.
+/// The mailbox pushir gave this device, for peers to wake it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_mailbox<'l>(
     mut env: EnvUnowned<'l>,
@@ -256,21 +256,26 @@ pub extern "system" fn Java_com_apasa_Native_mailbox<'l>(
     })
 }
 
-/// A push: if a peer's fresh wake, sync and say how it went; else "".
+/// A push on our lane (a peer's wake, or the connection back from a gap):
+/// sync, and say how it went. One at a time: a push during a sync waits,
+/// and those that pile up behind it make one sync, not one each.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_wake<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     dir: JString<'l>,
-    m: JByteArray<'l>,
 ) -> JString<'l> {
+    static WAITING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static SYNC: Mutex<()> = Mutex::new(());
     run(&mut env, |e| {
-        let (dir, m) = (dir.to_string(), bytes(e, &m)?.unwrap_or_default());
-        let dir = Path::new(&dir);
-        let r = match sync::is_wake(dir, &m) {
-            true => report(RT.block_on(sync::sync(dir, false))?),
-            false => String::new(),
-        };
-        Ok(e.new_string(r)?)
+        use std::sync::atomic::Ordering::SeqCst;
+        if WAITING.swap(true, SeqCst) {
+            return Ok(e.new_string("")?);
+        }
+        let _one = SYNC.lock().unwrap_or_else(|p| p.into_inner());
+        WAITING.store(false, SeqCst);
+        let r = RT.block_on(sync::sync(Path::new(&dir.to_string()), false))?;
+        Ok(e.new_string(report(r))?)
     })
 }

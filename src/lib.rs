@@ -190,11 +190,27 @@ impl Version {
     }
 }
 
-/// `v/` as read: heads by file, and `v/`'s mtime then.
+/// `v/` as read: heads by file, `v/`'s mtime then, and what a lookup or a
+/// new version needs without a pass over every head: each entry's newest
+/// version (its time and file) and the latest time of all.
 #[derive(Default)]
 struct Index {
     heads: HashMap<String, Version>,
     mtime: Option<SystemTime>,
+    tips: HashMap<String, (u64, String)>,
+    last: u64,
+}
+
+impl Index {
+    fn tip(&mut self, v: &Version) {
+        let t = (v.ms, v.file.clone());
+        match self.tips.get_mut(&v.name) {
+            Some(old) if *old >= t => {}
+            Some(old) => *old = t,
+            None => drop(self.tips.insert(v.name.clone(), t)),
+        }
+        self.last = self.last.max(v.ms);
+    }
 }
 
 pub struct Store {
@@ -396,6 +412,10 @@ impl Store {
         }
         self.unreadable.store(bad, Relaxed);
         x.mtime = mtime;
+        (x.tips, x.last) = Default::default();
+        let heads = std::mem::take(&mut x.heads);
+        heads.values().for_each(|v| x.tip(v));
+        x.heads = heads;
         Ok(x)
     }
 
@@ -439,11 +459,13 @@ impl Store {
         Ok(last.into_iter().filter(|(_, (_, c))| *c).map(|(n, _)| n).collect())
     }
 
+    /// An entry's body: its newest version, found without sorting the rest.
     pub fn get(&self, name: &str) -> Result<Secret> {
-        let v = self
-            .entries()?
-            .remove(name)
-            .with_context(|| format!("{name}: not in store"))?;
+        let x = self.index()?;
+        let v = x.tips.get(name).and_then(|t| x.heads.get(&t.1));
+        let v = v.filter(|v| v.size > 0);
+        let v = v.with_context(|| format!("{name}: not in store"))?.clone();
+        drop(x);
         self.body(&v)
     }
 
@@ -454,13 +476,8 @@ impl Store {
         ensure!(name.len() <= 255, "name over 255 bytes");
         ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
         let mut x = self.index()?;
-        let newest = x
-            .heads
-            .values()
-            .filter(|v| v.name == name)
-            .max_by_key(|v| (v.ms, v.file.clone()));
-        let parent = newest.map_or("-".into(), |v| v.file.clone());
-        let last = x.heads.values().map(|v| v.ms).max().unwrap_or(0);
+        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let last = x.last;
         let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
         let mut v = Version {
             ms: now.max(last + 1),
@@ -478,6 +495,7 @@ impl Store {
         write(&self.dir.join("v").join(&v.file), &ct)?;
         x.mtime =
             fs::metadata(self.dir.join("v")).and_then(|m| m.modified()).ok();
+        x.tip(&v);
         x.heads.insert(v.file.clone(), v);
         Ok(())
     }

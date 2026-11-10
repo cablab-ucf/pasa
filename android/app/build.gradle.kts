@@ -1,22 +1,20 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    id("com.android.application") // AGP 9: Kotlin is built in
     id("org.jetbrains.kotlin.plugin.compose")
-    id("org.mozilla.rust-android-gradle.rust-android")
 }
 
 android {
     namespace = "com.apasa"
-    compileSdk = 35
-    ndkVersion = "26.3.11579264"
+    compileSdk = 37
+    ndkVersion = "30.0.16248370"
     defaultConfig {
         applicationId = "com.apasa"
         minSdk = 26
         targetSdk = 35
-        versionCode = 10
-        versionName = "0.2.0"
-        // irpush: apps signed by the same key share one connection.
-        manifestPlaceholders["irpushGroup"] = "center.cxn"
+        versionCode = 12
+        versionName = "0.4.0"
+        // pushir: apps signed by the same key share one connection.
+        manifestPlaceholders["pushirGroup"] = "center.cxn"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
     buildTypes {
@@ -30,30 +28,31 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
 }
 
-// libapasa.so from apasa-jni, cross-compiled by cargo (NDK, rustup Android targets).
-cargo {
-    module = "../.."
-    libname = "apasa"
-    targets = listOf("arm64", "x86_64")
-    profile = "release"
-    extraCargoBuildArguments = listOf("--package", "apasa-jni", "--locked")
+// libapasa.so from apasa-jni, cross-compiled by cargo-ndk (ANDROID_NDK_HOME,
+// rustup's Android targets) into jniLibs, which the app packs.
+val cargoBuild by tasks.registering(Exec::class) {
+    workingDir = rootDir.parentFile
+    commandLine(
+        "cargo", "ndk", "-t", "arm64-v8a", "-t", "x86_64", "--platform", "26",
+        "-o", file("src/main/jniLibs").path,
+        "build", "--release", "--locked", "--package", "apasa-jni",
+    )
 }
 
 tasks.matching { it.name.matches(Regex("merge[A-Za-z]+JniLibFolders")) }.configureEach {
-    dependsOn("cargoBuild")
+    dependsOn(cargoBuild)
 }
 
 dependencies {
-    implementation(platform("androidx.compose:compose-bom:2024.10.01"))
+    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-    implementation("com.yubico.yubikit:android:2.7.0")
-    implementation("com.yubico.yubikit:yubiotp:2.7.0")
-    implementation(project(":irpair"))
-    implementation(project(":irpush"))
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
+    implementation("com.yubico.yubikit:android:3.3.0")
+    implementation("com.yubico.yubikit:yubiotp:3.3.0")
+    implementation(project(":pairir"))
+    implementation(project(":pushir"))
 }

@@ -1,11 +1,8 @@
-buildscript {
-    repositories { google(); mavenCentral() }
-    dependencies { classpath("org.mozilla.rust-android-gradle:plugin:0.9.6") }
-}
+// AGP's built-in Kotlin, at the latest compiler; Compose's compiler with it.
+buildscript { dependencies { classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.21") } }
 
 plugins {
-    id("com.android.application") version "8.7.3" apply false
-    id("com.android.library") version "8.7.3" apply false
-    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
-    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.android.application") version "9.5.1" apply false
+    id("com.android.library") version "9.5.1" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.4.21" apply false
 }

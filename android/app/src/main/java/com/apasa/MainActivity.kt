@@ -29,7 +29,7 @@ import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.irpair.ScanQr
+import org.pairir.ScanQr
 
 fun store(c: Context) = File(c.filesDir, "pasa")
 

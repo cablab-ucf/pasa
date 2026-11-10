@@ -14,7 +14,7 @@ object Native {
     external fun generate(len: Int): String
     external fun join(dir: String, name: String, code: String, pw: String): String
     external fun sync(dir: String, news: Boolean): String
-    external fun slot(dir: String): ByteArray
+    external fun lane(dir: String): ByteArray
     external fun mailbox(dir: String, id: String)
-    external fun wake(dir: String, m: ByteArray): String
+    external fun wake(dir: String): String
 }
