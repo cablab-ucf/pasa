@@ -39,6 +39,11 @@ two devices changing an entry apart show up in `pasa ls` until an edit
 follows the winner. A file alone tells nothing: not its entry, not its
 history. Back up `~/.pasa` with anything.
 
+`git init ~/.pasa/v` and pasa commits each new version there, and pushes
+if a remote is set (`git push -u` once): a remote holds what `serve` does,
+ciphertext, and learns when you change things. A version deleted from
+`v/` is then named by `pasa ls` and restored by `git checkout .`.
+
 ## Keys
 
 - **Store keys**: 256 random bits each (hedged with the password, RFC
