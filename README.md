@@ -84,8 +84,9 @@ peer's lane, through [pushir](https://github.com/cablab-ucf/pushir), which
 seals it: the relay sees a mailbox and 1024 random-looking bytes. It says
 "sync" and nothing else, so one lost, repeated or forged by a peer costs a
 sync at most; a device also syncs when its connection comes back. Every
-peer of a device holds its lane's secret, a revoked one too: it can still
-make that device sync, and learns nothing by it.
+peer of a device holds its lane's secret, so `forget` and `revoke` make a
+new one, which the peers that stay get at their next sync (`listen` moves
+to it within a quarter of an hour, the Android app when it next starts).
 
 `revoke NAME` ends the pairing, marks the device's id revoked and rotates
 the store key: every entry is sealed again to a new key, which reaches the

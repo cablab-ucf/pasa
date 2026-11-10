@@ -76,7 +76,16 @@ pub fn forget(dir: &Path, name: &str) -> Result<()> {
     ps.retain(|p| p.name != name);
     ensure!(ps.len() < n, "no peer {name}");
     let _ = fs::remove_file(dir.join("give").join(name));
-    save(dir, &ps)
+    save(dir, &ps)?;
+    // It held our lane's secret: a new one, which the peers that stay get
+    // at their next sync. `listen` moves to it by itself; the Android app
+    // when it next starts.
+    let at = fs::read_to_string(dir.join("mailbox")).ok();
+    if let Some(at) = at.and_then(|l| l.parse::<Lane>().ok()) {
+        let _ = fs::remove_file(dir.join("lane"));
+        set_mailbox(dir, at.id)?;
+    }
+    Ok(())
 }
 
 /// This device's id: public, random, made once.
@@ -166,12 +175,7 @@ pub fn adopt(s: &mut Store) -> Result<()> {
 
 /// A secret key in `dir/file`, made once.
 fn key(dir: &Path, file: &str) -> Result<SecretKey> {
-    let p = dir.join(file);
-    if !p.exists() {
-        write(&p, &rand::<32>())?;
-    }
-    let b: [u8; 32] = fs::read(p)?.try_into().ok().context("bad key")?;
-    Ok(SecretKey::from_bytes(&b))
+    Ok(SecretKey::from_bytes(&pushir::kept(&dir.join(file))?))
 }
 
 /// This device's pushir lane secret for pasa, made once: peers alone get
@@ -283,16 +287,27 @@ fn learnt(
     }
 }
 
-/// Wake every listening peer but `except`, all at once: an empty message
-/// to its lane. A wake lost or repeated costs a sync at most.
+/// Wake every listening peer but `except`: an empty message to its lane,
+/// over one connection per relay, the relays at once. A wake lost or
+/// repeated costs a sync at most.
 async fn wake(dir: &Path, except: &str) {
-    let ps = peers(dir);
-    let lanes =
-        ps.iter().filter(|p| p.name != except).filter_map(|p| p.lane.as_ref());
-    let mut all: tokio::task::JoinSet<_> = lanes
-        .cloned()
-        .map(|l| async move { pushir::send(&l, b"").await })
-        .collect();
+    let mut by: std::collections::BTreeMap<String, Vec<Lane>> =
+        Default::default();
+    for p in peers(dir).into_iter().filter(|p| p.name != except) {
+        if let Some(l) = p.lane {
+            by.entry(l.relay.to_string()).or_default().push(l);
+        }
+    }
+    let mut all = tokio::task::JoinSet::new();
+    for lanes in by.into_values() {
+        all.spawn(async move {
+            let mut tx = pushir::Sender::connect(&lanes[0].relay).await?;
+            for l in &lanes {
+                tx.send(l, b"").await?;
+            }
+            tx.close().await
+        });
+    }
     while all.join_next().await.is_some() {}
 }
 
@@ -380,15 +395,26 @@ pub async fn serve(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
 /// a sync are answered by one more.
 #[cfg(unix)]
 pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
-    let (id, mut rx) =
-        pushir::local::attach(&pushir::local::sock(), &lane(dir)?).await?;
-    set_mailbox(dir, id)?;
     loop {
-        sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
-        if rx.recv().await.is_none() {
-            return Ok(());
+        // On the lane as it is now: a forgotten peer ends the old one,
+        // which is seen at the next wake or within a quarter of an hour.
+        let secret = lane(dir)?;
+        let (id, mut rx) =
+            pushir::local::attach(&pushir::local::sock(), &secret).await?;
+        set_mailbox(dir, id)?;
+        while lane(dir)? == secret {
+            sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
+            // The next wake; or, each quarter hour, whether the lane moved.
+            loop {
+                match timeout(Duration::from_secs(900), rx.recv()).await {
+                    Ok(None) => return Ok(()),
+                    Ok(Some(_)) => break,
+                    Err(_) if lane(dir)? != secret => break,
+                    Err(_) => {}
+                }
+            }
+            while rx.try_recv().is_ok() {}
         }
-        while rx.try_recv().is_ok() {}
     }
 }
 
@@ -559,7 +585,11 @@ mod tests {
         );
         // a revokes b: c gets the new key and the revocation, so c's
         // hand-over to b (still paired there) carries nothing new.
+        let old = lane(&a).unwrap();
         revoke(&mut sa, "b").unwrap();
+        let now = fs::read_to_string(a.join("mailbox")).unwrap();
+        let now = now.parse::<Lane>().unwrap().secret;
+        assert!(now != old && now == lane(&a).unwrap(), "b knew a's lane");
         swap_once(&a, &c, "c", "a").await;
         adopt(&mut sc).unwrap();
         assert_eq!(sc.keys().len(), 2);
