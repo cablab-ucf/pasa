@@ -12,9 +12,7 @@ use crate::{MAX, Store, is_name, name_of, open, rand, seal, write};
 use anyhow::{Context, Result, anyhow, ensure};
 use data_encoding::HEXLOWER;
 use irnet::psk::{Rx, Tx};
-use iroh::{
-    EndpointAddr, PublicKey, RelayMode, RelayUrl, SecretKey, TransportAddr,
-};
+use iroh::{EndpointAddr, PublicKey, RelayUrl, SecretKey, TransportAddr};
 use pushir::Lane;
 use std::{collections::HashSet, fs, path::Path, time::Duration};
 use tokio::time::timeout;
@@ -203,7 +201,7 @@ fn relay() -> Result<RelayUrl> {
 }
 
 fn ep() -> Result<iroh::endpoint::Builder> {
-    Ok(irnet::endpoint().relay_mode(RelayMode::custom([relay()?])))
+    Ok(irnet::on(&[relay()?]))
 }
 
 /// What a swap learnt of the peer, and how many versions it took.
@@ -444,7 +442,7 @@ pub async fn pair(
         true => (pairir::seal_qr("pasa", &secret, pw).await?, None),
         false => {
             let (code, end) =
-                pairir::give(ep()?, "pasa", &secret, Some(pw)).await?;
+                pairir::give(&[relay()?], "pasa", &secret, Some(pw)).await?;
             (code, Some(end))
         }
     };
@@ -467,9 +465,7 @@ pub async fn join(
 ) -> Result<Zeroizing<Vec<u8>>> {
     let s = match code.trim().starts_with("PAIRIR1:") {
         true => pairir::open_qr("pasa", code, pw).await?,
-        false => {
-            pairir::take(ep()?, &[relay()?], "pasa", code, Some(pw)).await?
-        }
+        false => pairir::take(&[relay()?], "pasa", code, Some(pw)).await?,
     };
     ensure!(s.len() > 96, "not a pasa pairing");
     if !dir.join("key").exists() {
@@ -492,6 +488,7 @@ pub async fn join(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::RelayMode;
 
     /// `a` paired with `b`, as `pair` and `join` leave them.
     fn pair_by_hand(

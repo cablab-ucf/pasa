@@ -13,6 +13,6 @@ anyhow = "1"
 jni = "0.22"
 pasa = { path = ".." }
 # org.pushir.Native, for the shared push connection (android/pushir).
-pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "6a4ad4856141c717948acbd558063f773f674d07", features = ["jni"] }
+pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "cf0dad19c1e67d6bcd9fcf90c467b45e9b9f2d51", features = ["jni"] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }

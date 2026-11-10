@@ -7,5 +7,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "apasa"
 include(":app", ":pairir", ":pushir")
-project(":pairir").projectDir = file("qr") // the pairir submodule's QR codes, built by qr/
+project(":pairir").projectDir = file("pairir/android/pairir") // submodule: QR codes
 project(":pushir").projectDir = file("pushir/android/pushir") // submodule: one push connection
