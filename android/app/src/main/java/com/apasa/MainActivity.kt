@@ -156,8 +156,22 @@ class MainActivity : ComponentActivity(), Host {
     /** The key's answer to the quick challenge, from a tap made before the PIN was typed: gone when the app leaves the screen. */
     private var answer: ByteArray? = null
 
-    override suspend fun tapQuick() {
-        answer = yubikey(this, Native.quick(dir)!!.copyOf(32))
+    override suspend fun tapKey(pin: String): Boolean {
+        val quick = Native.quick(dir)
+        val keys = fidoHere()
+        return when (val t = anyKey(this, quick?.copyOf(32), keys?.first, keys?.second.orEmpty(), pin)) {
+            is Tapped.Slot2 -> {
+                answer = t.answer
+                // No PIN was set: the tap is all of it.
+                (quick!![32].toInt() != 1).also { if (it) unlockQuick("") }
+            }
+            is Tapped.Ctap -> {
+                handle = io { Native.openFido(dir, t.cred, t.secret) }
+                t.secret.fill(0)
+                if (sync) io { runCatching { Native.sync(dir, false) } }
+                true
+            }
+        }
     }
 
     override suspend fun unlockQuick(pin: String) {
@@ -185,14 +199,6 @@ class MainActivity : ComponentActivity(), Host {
         io { Native.fidoAdd(handle, salt, cred, uv, secret) }
         secret.fill(0)
         readFido()
-    }
-
-    override suspend fun unlockFido(pin: String) {
-        val (salt, keys) = fidoHere() ?: throw Exception("No security key opens this store")
-        val (cred, secret) = fidoSecret(this, keys, salt, pin)
-        handle = io { Native.openFido(dir, cred, secret) }
-        secret.fill(0)
-        if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
     override fun fidoOff() {

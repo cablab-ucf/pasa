@@ -338,7 +338,6 @@ struct App {
     /// The store's password as generated here, and its bits.
     made: (Zeroizing<String>, u32),
     /// At the unlock: the password, though quick unlock is on.
-    by_password: bool,
     joining: bool,
     peer: String,
     code: String,
@@ -807,14 +806,6 @@ impl App {
         } else {
             "Unlock"
         };
-        let quick = pasa::quick(&home()).filter(|_| !self.by_password);
-        if let Some((_, pin)) = quick {
-            return self.unlock_quick(ui, pin);
-        }
-        let back = pasa::quick(&home()).is_some();
-        if back && corner(ui, "Quick unlock is on.", "Use the YubiKey") {
-            (self.by_password, self.said) = (false, String::new());
-        }
         card(ui, "A small password store", title, |ui| {
             let pw = field(ui, "Password", &mut self.pw, true);
             let enter = entered(ui, &pw);
@@ -834,45 +825,34 @@ impl App {
                 let say = if yk { "Touch your YubiKey" } else { "Unlocking" };
                 self.begin(ui, Job::Unlock, say);
             }
-            // A security key of this store's opens it without the password.
-            if let Some(f) = pasa::fido(&home()) {
+            // Every other way in is here too: the quick-unlock YubiKey, a
+            // security key (CTAP2). One PIN field serves whichever is used.
+            let (quick, keys) = (pasa::quick(&home()), pasa::fido(&home()));
+            if quick.is_some() || keys.is_some() {
                 ui.separator();
-                if f.keys.iter().any(|k| k.1) {
-                    field(
-                        ui,
-                        "The security key's PIN, if it has one",
-                        &mut self.pin,
-                        true,
-                    );
+                let l = look(ui);
+                ui.label(RichText::new("Or a key").small().color(l.muted));
+                let pin = quick.as_ref().is_some_and(|q| q.1);
+                if pin
+                    || keys.as_ref().is_some_and(|f| f.keys.iter().any(|k| k.1))
+                {
+                    field(ui, "PIN", &mut self.pin, true);
                 }
-                if ui.button("Unlock with a security key").clicked() {
-                    self.begin(ui, Job::Fido, "Touch your security key");
-                }
+                ui.horizontal_wrapped(|ui| {
+                    if quick.is_some()
+                        && ui.button("Unlock with the YubiKey").clicked()
+                    {
+                        self.begin(ui, Job::Quick, "Touch your YubiKey");
+                    }
+                    if keys.is_some()
+                        && ui.button("Unlock with a security key").clicked()
+                    {
+                        self.begin(ui, Job::Fido, "Touch your security key");
+                    }
+                });
             }
             self.said(ui);
         });
-    }
-
-    /// A tap, and the PIN if one is set; the password is the other way in.
-    fn unlock_quick(&mut self, ui: &mut Ui, pin: bool) {
-        card(ui, "A small password store", "Unlock", |ui| {
-            let mut enter = false;
-            if pin {
-                let p = field(ui, "PIN", &mut self.pin, true);
-                enter = entered(ui, &p);
-                if ui.memory(|m| m.focused().is_none()) {
-                    p.request_focus();
-                }
-            }
-            ui.add_space(6.0);
-            if primary(ui, "Unlock with the YubiKey", true).clicked() || enter {
-                self.begin(ui, Job::Quick, "Touch your YubiKey");
-            }
-            self.said(ui);
-        });
-        if corner(ui, "No key at hand?", "Use the password") {
-            (self.by_password, self.said) = (true, String::new());
-        }
     }
 
     /// What a row shows of the entry, read once per version.

@@ -43,10 +43,13 @@ private val waits = AtomicInteger()
  * the app listens, Android does not open the web address a YubiKey carries. (Ending the listening as soon
  * as the key was seen lost the key mid-answer, "Tag was lost", and let that page open.)
  */
-suspend fun yubikey(a: Activity, challenge: ByteArray, enroll: Boolean = false): ByteArray = withKey(a) { s ->
+suspend fun yubikey(a: Activity, challenge: ByteArray, enroll: Boolean = false): ByteArray = withKey(a) { slot2(it, challenge, enroll) }
+
+/** The slot 2 answer of a key at hand. */
+internal fun slot2(s: YubiOtpSession, challenge: ByteArray, enroll: Boolean): ByteArray {
     // Asked first where the key can say: an empty slot answers with nothing, which reads as nonsense.
     if (runCatching { !s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(false)) throw Empty(enroll)
-    s.calculateHmacSha1(Slot.TWO, challenge, null)
+    return s.calculateHmacSha1(Slot.TWO, challenge, null)
 }
 
 /**
@@ -94,7 +97,7 @@ suspend fun <T> withDevice(a: Activity, open: (YubiKeyDevice, (Result<T>) -> Uni
 }
 
 /** Slot 2 holds nothing; said while a key is being taken on ([enroll]), it can be set up here. */
-private class Empty(val enroll: Boolean) : Exception()
+internal class Empty(val enroll: Boolean) : Exception()
 private class InUse : Exception()
 
 /** Already in the words for someone holding the key. */

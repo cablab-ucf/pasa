@@ -12,6 +12,7 @@ import com.yubico.yubikit.core.fido.CtapException
 import com.yubico.yubikit.fido.webauthn.PublicKeyCredentialCreationOptions
 import com.yubico.yubikit.fido.webauthn.PublicKeyCredentialRequestOptions
 import com.yubico.yubikit.fido.webauthn.SerializationType
+import com.yubico.yubikit.yubiotp.YubiOtpSession
 import java.security.SecureRandom
 import java.util.Base64
 
@@ -26,14 +27,17 @@ private const val RP = "pasa"
 private fun rand(n: Int) = ByteArray(n).also { SecureRandom().nextBytes(it) }
 private fun b64(b: ByteArray) = Base64.getUrlEncoder().withoutPadding().encodeToString(b)
 
-/** What [use] makes of the next security key tapped (NFC) or plugged in (USB). */
-private suspend fun <T> withFido(a: Activity, use: (Ctap2Client) -> T): T = withDevice(a) { d: YubiKeyDevice, done ->
+/** What [use] makes of a security key at hand, said through [done]. */
+private fun <T> onFido(d: YubiKeyDevice, use: (Ctap2Client) -> T, done: (Result<T>) -> Unit) {
     val run = { session: () -> Ctap2Session ->
         done(runCatching { use(Ctap2Client(session(), listOf(HmacSecretExtension(true)))) }.recoverCatching { throw told(it) })
     }
     if (d.supportsConnection(FidoConnection::class.java)) d.requestConnection(FidoConnection::class.java) { c -> run { Ctap2Session(c.value) } }
     else d.requestConnection(SmartCardConnection::class.java) { c -> run { Ctap2Session(c.value) } }
 }
+
+/** What [use] makes of the next security key tapped (NFC) or plugged in (USB). */
+private suspend fun <T> withFido(a: Activity, use: (Ctap2Client) -> T): T = withDevice(a) { d, done -> onFido(d, use, done) }
 
 /** What went wrong with a security key, for someone holding it; a key that did not answer is left to be said as that. */
 private fun told(e: Throwable): Throwable {
@@ -92,12 +96,34 @@ suspend fun fidoNew(a: Activity, salt: ByteArray, pin: String): Triple<ByteArray
     Triple(made.rawId, typed != null, secret(c, listOf(made.rawId), salt, typed != null, typed).second)
 }
 
-/** The secret of the key tapped, if it is one of [keys] (credential, whether its PIN goes with it): which, and the secret. */
-suspend fun fidoSecret(a: Activity, keys: List<Pair<ByteArray, Boolean>>, salt: ByteArray, pin: String): Pair<ByteArray, ByteArray> = withFido(a) { c ->
+/** The secret of the key at hand, if it is one of [keys] (credential, whether its PIN goes with it): which, and the secret. */
+private fun ctapSecret(c: Ctap2Client, keys: List<Pair<ByteArray, Boolean>>, salt: ByteArray, pin: String): Pair<ByteArray, ByteArray> {
     val typed = if (keys.any { it.second }) pinOf(c, pin) else null
     val got = secret(c, keys.map { it.first }, salt, typed != null, typed)
     // Added without its PIN and given one since (or the other way): its secret is another now.
     if (keys.first { it.first.contentEquals(got.first) }.second != (typed != null))
         throw Said("This key's PIN was set or removed since it was added: use the password, then add the key again.")
-    got
+    return got
 }
+
+/** What a tapped key opens the store with: its slot 2 answer (the quick-unlock PIN comes next), or its CTAP2 secret. */
+sealed interface Tapped {
+    class Slot2(val answer: ByteArray) : Tapped
+    class Ctap(val cred: ByteArray, val secret: ByteArray) : Tapped
+}
+
+/**
+ * Whatever the key tapped opens the store with, whichever kind it is: its slot 2 answer to [challenge]
+ * (quick unlock, if that is on), else its CTAP2 secret if it is one of [keys]. One tap, tried in that order.
+ */
+suspend fun anyKey(a: Activity, challenge: ByteArray?, salt: ByteArray?, keys: List<Pair<ByteArray, Boolean>>, pin: String): Tapped =
+    withDevice(a) { d, done ->
+        val ctap = { before: Throwable? ->
+            if (salt == null || keys.isEmpty()) done(Result.failure(before ?: Said("No key opens this store.")))
+            else onFido(d, { c -> ctapSecret(c, keys, salt, pin).let { Tapped.Ctap(it.first, it.second) } }, done)
+        }
+        if (challenge == null) ctap(null)
+        else YubiOtpSession.create(d) { s ->
+            runCatching { Tapped.Slot2(slot2(s.value, challenge, false)) as Tapped }.fold({ done(Result.success(it)) }, { ctap(it) })
+        }
+    }
