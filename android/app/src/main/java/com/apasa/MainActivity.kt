@@ -79,12 +79,20 @@ class MainActivity : ComponentActivity(), Host {
         keySecret?.fill(0)
         keySecret = null
         if (isChangingConfigurations || picking) return
-        if (setting("lock") == 0) lock() else main.postDelayed(locker, setting("lock") * 1000L)
+        if (setting("lock") == 0) lock() else {
+            left = android.os.SystemClock.elapsedRealtime()
+            main.postDelayed(locker, setting("lock") * 1000L)
+        }
     }
+
+    /** When the app left the screen, by the clock that runs while the phone sleeps: the handler's does not. */
+    private var left = 0L
 
     override fun onStart() {
         super.onStart()
         main.removeCallbacks(locker)
+        if (left != 0L && android.os.SystemClock.elapsedRealtime() - left >= setting("lock") * 1000L) lock()
+        left = 0
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -108,7 +116,7 @@ class MainActivity : ComponentActivity(), Host {
         get() = syncOn(this)
         set(on) {
             getSharedPreferences("pasa", 0).edit().putBoolean("sync", on).apply()
-            if (on) push(this)
+            if (on) { broker(this, true); push(this) }
         }
 
     private var quickNow by mutableStateOf<Boolean?>(null)

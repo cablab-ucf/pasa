@@ -540,9 +540,16 @@ fn main() -> Result<()> {
                 .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
             h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
             h.expired.iter().for_each(|n| println!("expired {n}"));
-            for n in s.entries()?.into_keys().filter(|_| flag("--pwned")) {
+            // Passwords alone: not what is attached, nor an empty one.
+            let asked = |n: &String| {
+                flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
+            };
+            for n in s.entries()?.into_keys().filter(asked) {
                 let pw =
                     pasa::Form::parse(text(&s.get(&n)?).unwrap_or("")).pass;
+                if pw.is_empty() {
+                    continue;
+                }
                 match pwned(&pw)? {
                     0 => {}
                     times => println!("pwned   {n}: in breaches {times} times"),
@@ -717,7 +724,18 @@ async fn sync(a: &[&str]) -> Result<()> {
             let pw = String::from_utf8(ask("Pairing password: ")?.to_vec())?;
             let hand = sync::join(&dir, name, code, &pw).await?;
             eprintln!("Now the store's password, to keep the pairing sealed:");
-            sync::keep_hand(&mut open()?, name, &hand)?;
+            // The pairing's key is here alone: a slip is asked again.
+            let mut s = open();
+            for _ in 0..2 {
+                if let Err(e) = &s {
+                    eprintln!("{e:#}");
+                    s = open();
+                }
+            }
+            let mut s = s.with_context(|| {
+                format!("not sealed: pasa forget {name}, then pair again")
+            })?;
+            sync::keep_hand(&mut s, name, &hand)?;
             report_all(sync::sync(&dir, false).await?);
         }
         ["sync", ..] => {

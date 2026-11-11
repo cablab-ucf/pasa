@@ -151,22 +151,35 @@ pub fn hand(s: &Store) -> Result<()> {
 /// At unlock: what peers handed over (revocations first, then keys);
 /// hand on to the rest.
 pub fn adopt(s: &mut Store) -> Result<()> {
+    // Each hand-over a pairing's key opens: whose, its keys, its ids. One
+    // that does not read is passed over: no peer's file stops an unlock.
+    let mut got = vec![];
     for e in fs::read_dir(s.dir.join("take")).into_iter().flatten() {
         let p = e?.path();
         let b = fs::read(&p)?;
         fs::remove_file(&p)?;
-        let Some(m) = s.hands.values().find_map(|k| open(k, &b)) else {
-            continue;
+        let read = |(name, k): (&String, &crate::Secret)| {
+            let m = open(k, &b)?;
+            let n = 32 * *m.first()? as usize;
+            let (keys, ids) = m[1..].split_at_checked(n)?;
+            let ids = std::str::from_utf8(ids).ok()?.lines();
+            let ids: Vec<String> =
+                ids.filter(|i| is_name(i)).map(String::from).collect();
+            Some((name.clone(), Zeroizing::new(keys.to_vec()), ids))
         };
-        let n = *m.first().context("empty hand-over")? as usize;
-        let (keys, ids) =
-            m[1..].split_at_checked(32 * n).context("short hand-over")?;
-        revoke_ids(
-            &s.dir,
-            std::str::from_utf8(ids)?.lines().map(String::from),
-        )?;
-        s.hands.retain(|name, _| peers(&s.dir).iter().any(|p| &p.name == name));
-        s.add_keys(keys)?;
+        got.extend(s.hands.iter().find_map(read));
+    }
+    if got.is_empty() {
+        return hand(s);
+    }
+    // Every revocation before any key: a device one hand-over revokes
+    // gives no keys in another, whichever was read first.
+    revoke_ids(&s.dir, got.iter().flat_map(|g| g.2.clone()))?;
+    s.hands.retain(|name, _| peers(&s.dir).iter().any(|p| &p.name == name));
+    for (from, keys, _) in &got {
+        if s.hands.contains_key(from) {
+            s.add_keys(keys)?;
+        }
     }
     hand(s)
 }
@@ -219,8 +232,7 @@ async fn swap(
     tx.send(&fs::read(dir.join("give").join(peer)).unwrap_or_default()).await?;
     let theirs = String::from_utf8(rx.recv(1024).await?).ok();
     let theirs = theirs.and_then(|l| l.parse().ok());
-    let dev =
-        String::from_utf8(rx.recv(32).await?).ok().filter(|d| d.len() == 32);
+    let dev = String::from_utf8(rx.recv(32).await?).ok().filter(|d| is_name(d));
     let keys = rx.recv(64 << 10).await?;
     if !keys.is_empty() {
         write(&dir.join("take").join(name_of(&keys)), &keys)?;
@@ -279,7 +291,8 @@ fn learnt(
     let Some(p) = ps.iter_mut().find(|p| p.name == name) else { return };
     let before = (p.lane.clone(), p.device.clone());
     p.lane = lane.unwrap_or(p.lane.take());
-    p.device = dev.or(p.device.take());
+    // The id a pairing first said stays: a revocation names it.
+    p.device = p.device.take().or(dev);
     if before != (p.lane.clone(), p.device.clone()) {
         let _ = save(dir, &ps);
     }
@@ -322,17 +335,25 @@ pub async fn sync(
         let Some(id) = p.id else { continue };
         let (ep, relay, dir) = (ep.clone(), relay.clone(), dir.to_path_buf());
         all.spawn(async move {
-            let go = async {
+            let meet = async {
                 let at =
                     EndpointAddr::from_parts(id, [TransportAddr::Relay(relay)]);
                 let c = ep.connect(at, ALPN).await?;
                 let (tx, rx) = irnet::psk::dial(&c, &p.psk).await?;
-                let r = swap(&dir, &p.name, tx, rx).await;
-                c.close(0u32.into(), b"");
-                r
+                anyhow::Ok((c, tx, rx))
             };
-            let r = timeout(Duration::from_secs(30), go).await;
-            (p.name, r.unwrap_or_else(|_| Err(anyhow!("no answer"))))
+            // Away: 30 s. Met: as long as `serve` gives a swap.
+            let r = match timeout(Duration::from_secs(30), meet).await {
+                Ok(Ok((c, tx, rx))) => {
+                    let go = swap(&dir, &p.name, tx, rx);
+                    let r = timeout(Duration::from_secs(300), go).await;
+                    c.close(0u32.into(), b"");
+                    r.unwrap_or_else(|_| Err(anyhow!("timed out")))
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(anyhow!("no answer")),
+            };
+            (p.name, r)
         });
     }
     // What each swap learnt is kept one at a time: `peers` is one file.
@@ -607,5 +628,40 @@ mod tests {
         for p in peers(&a) {
             assert!(open(&p.psk, &give).is_none());
         }
+    }
+    /// A revoked device that still reaches a third one gains nothing
+    /// there: its id stays the one revoked, its hand-over gives no key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoked_devices_forge_nothing() {
+        let d = crate::tests::dir("forge");
+        let (a, b, c) = (d.join("a"), d.join("b"), d.join("c"));
+        let mut sa = Store::create(&a, b"pw", None).unwrap();
+        let (mut sb, mut sc) = (device_store(&b, &a), device_store(&c, &a));
+        pair_by_hand(&mut sa, "a", &mut sb, "b", [5; 32]);
+        pair_by_hand(&mut sa, "a", &mut sc, "c", [6; 32]);
+        pair_by_hand(&mut sb, "b", &mut sc, "c", [7; 32]);
+        sa.put("x", b"1").unwrap();
+        swap_once(&a, &b, "b", "a").await;
+        swap_once(&a, &c, "c", "a").await;
+        swap_once(&b, &c, "c", "b").await;
+        revoke(&mut sa, "b").unwrap();
+        swap_once(&a, &c, "c", "a").await;
+        // b, before c is next unlocked: another id, and a hand-over that
+        // revokes a and gives a key b knows.
+        let evil = [9; 32];
+        let ida = fs::read_to_string(a.join("id")).unwrap();
+        let msg = [&[1][..], &evil, ida.as_bytes()].concat();
+        write(&b.join("give/c"), &seal(&sb.hands["c"], &msg).unwrap()).unwrap();
+        fs::write(b.join("id"), HEXLOWER.encode(&[8; 16])).unwrap();
+        swap_once(&b, &c, "c", "b").await;
+        adopt(&mut sc).unwrap();
+        // Each revokes the other: c trusts neither, and takes no key.
+        assert!(peers(&c).is_empty() && sc.hands.is_empty());
+        assert_eq!(sc.keys().len(), 1);
+        // A hand-over that does not read is passed over, not an error.
+        keep_hand(&mut sc, "a", &[4; 32]).unwrap();
+        write(&c.join("take/x"), &seal(&[4; 32], b"").unwrap()).unwrap();
+        adopt(&mut sc).unwrap();
+        assert!(!c.join("take/x").exists());
     }
 }

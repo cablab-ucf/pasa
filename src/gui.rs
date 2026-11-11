@@ -444,6 +444,9 @@ fn field(
 
 /// `body` as `file` in the downloads folder, under a name not yet there.
 fn saved(file: &str, body: &[u8]) -> Result<String> {
+    // A name, never a path: an entry's name is whatever a device wrote.
+    let file = std::path::Path::new(file).file_name().context("no name")?;
+    let file = &*file.to_string_lossy();
     let dir =
         std::env::var_os("XDG_DOWNLOAD_DIR").map(std::path::PathBuf::from);
     let home = || std::env::home_dir().unwrap_or_default().join("Downloads");
@@ -1549,15 +1552,16 @@ impl App {
                 ui.label(name);
             }
             if let Some(found) = &*self.breached.lock().unwrap() {
-                part(ui, format!("IN KNOWN BREACHES: {}", found.len()));
+                let hit = found.iter().filter(|f| f.1 > 0).count();
+                part(ui, format!("IN KNOWN BREACHES: {hit}"));
                 for (name, times) in found {
+                    let said = match times {
+                        0 => "could not be checked".into(),
+                        n => format!("seen {n} times"),
+                    };
                     ui.horizontal(|ui| {
                         ui.label(name);
-                        ui.label(
-                            RichText::new(format!("seen {times} times"))
-                                .small()
-                                .color(l.bad),
-                        );
+                        ui.label(RichText::new(said).small().color(l.bad));
                     });
                 }
             }
@@ -1589,12 +1593,15 @@ impl App {
                         .pass,
                     )
                 })
+                .filter(|p| !p.1.is_empty())
                 .collect();
             let (out, ctx) = (self.breached.clone(), ui.ctx().clone());
             std::thread::spawn(move || {
                 let hit = |(n, pw): &(String, String)| match crate::pwned(pw) {
-                    Ok(0) | Err(_) => None,
+                    Ok(0) => None,
                     Ok(times) => Some((n.clone(), times)),
+                    // Not asked is not clean: 0 says so.
+                    Err(_) => Some((n.clone(), 0)),
                 };
                 *out.lock().unwrap() =
                     Some(pws.iter().filter_map(hit).collect());
@@ -1952,6 +1959,16 @@ impl App {
                             Ok(()) => format!("{}: forgotten", p.name),
                             Err(e) => format!("{e:#}"),
                         };
+                    }
+                    let lost = "Lost or stolen: forget it and change the \
+                                store key, which the other devices get";
+                    if ui.small_button("Revoke").on_hover_text(lost).clicked() {
+                        v.note = match sync::revoke(&mut v.s, &p.name) {
+                            Ok(()) => format!("{}: revoked", p.name),
+                            Err(e) => format!("{e:#}"),
+                        };
+                        crate::record();
+                        crate::aside(true);
                     }
                 });
             });

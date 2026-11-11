@@ -14,8 +14,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=tmpfs
-BindPaths=%h/.pasa/v %h/.pasa/take %h/.pasa/peers
-BindReadOnlyPaths=%h/.pasa/give %h/.pasa/node -%h/.pasa/id -%h/.pasa/mailbox %h/.cargo/bin/pasa
+# The store's directory, less what opens it: `peers` and `id` are written
+# by rename, which a file bound by itself refuses.
+BindPaths=%h/.pasa
+InaccessiblePaths=-%h/.pasa/key -%h/.pasa/dev -%h/.pasa/quick -%h/.pasa/ctap
+BindReadOnlyPaths=%h/.cargo/bin/pasa
 
 [Install]
 WantedBy=default.target

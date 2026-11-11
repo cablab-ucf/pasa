@@ -532,8 +532,8 @@ impl Store {
             .context("damaged version")?;
         let at =
             b.iter().position(|&c| c == b'\n').context("damaged version")? + 1;
-        ensure!(b.len() >= at + v.size, "damaged version");
-        Ok(Zeroizing::new(b[at..at + v.size].to_vec()))
+        let body = b.get(at..).and_then(|b| b.get(..v.size));
+        Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
     }
 
     /// Each entry's newest version, deleted ones left out.
@@ -696,7 +696,7 @@ impl Store {
         let mut x = self.index()?;
         let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
         let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
-        let ms = now.max(x.last + 1);
+        let ms = now.max(x.last.saturating_add(1));
         self.keep(&mut x, name, body, ms, parent)
     }
 
