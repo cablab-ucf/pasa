@@ -406,7 +406,7 @@ private fun Create(host: Host, nav: Nav) {
     val create = { if (ok) work.go { host.create(pw, key, pin) } }
     Front(
         "Create your store", work, "A store on another device already?", "Join it", { nav.joining = true },
-        wait = if (key != Key.None) "Hold your YubiKey to the phone, or plug it in" else "", host = host,
+        wait = if (key != Key.None) "Hold your YubiKey still against the phone, or plug it in" else "", host = host,
     ) {
         Text(
             "Its password opens everything, and is the way back in when all else is lost: a long one. 256 bits is the suggestion.",
@@ -489,7 +489,7 @@ private fun Unlock(host: Host) {
     var byPassword by remember { mutableStateOf(false) }
     val work = rememberJob()
     val quick = host.quick
-    val tap = "Hold your YubiKey to the phone, or plug it in"
+    val tap = "Hold your YubiKey still against the phone, or plug it in"
     if (quick != null && !byPassword) {
         val open = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
         return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap, host = host) {
@@ -989,7 +989,7 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
         }
     }
     if (host.quick == null) NfcOff(host)
-    Doing(work, "Hold your YubiKey to the phone, or plug it in", host)
+    Doing(work, "Hold your YubiKey still against the phone, or plug it in", host)
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     for ((what, how) in listOf(
         "Locking" to "The store locks whenever the app leaves the screen.",
