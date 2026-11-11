@@ -60,6 +60,19 @@ class MainActivity : ComponentActivity(), Host {
         }
     }
 
+    /** Read again each time the app comes back: NFC may have been switched meanwhile. */
+    private var nfcIsOff by mutableStateOf(false)
+    override val nfcOff get() = nfcIsOff
+
+    override fun onResume() {
+        super.onResume()
+        nfcIsOff = nfcOff(this)
+    }
+
+    override fun nfcSettings() {
+        runCatching { startActivity(Intent(android.provider.Settings.ACTION_NFC_SETTINGS)) }
+    }
+
     override fun onStop() {
         super.onStop()
         if (!isChangingConfigurations && !picking) lock()

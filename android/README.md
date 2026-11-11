@@ -10,8 +10,8 @@ pasa on Android: a thin Compose UI over the same Rust (`apasa-jni`).
 - Then the desktop window's layout and words: entries by group with their
   user names, an entry's fields each with its copy, a form to edit them,
   a password generator, devices (pair, forget, sync) and settings.
-- Unlock with the password and, if the store has one, a YubiKey over NFC
-  (HMAC-SHA1 slot 2); or, with quick unlock on, by a tap of the key and a
+- Unlock with the password and, if the store has one, a YubiKey held to the
+  phone or plugged in (HMAC-SHA1 slot 2); or, with quick unlock on, by a tap of the key and a
   PIN, the password staying the other way in. Locks whenever the app leaves the screen.
 - Copy password, user or TOTP (cleared after 45 s, marked sensitive).
   FLAG_SECURE, overlays hidden, no backup or device transfer.
@@ -25,4 +25,5 @@ rustup target add aarch64-linux-android x86_64-linux-android
 cargo install --locked cargo-ndk
 git submodule update --init
 cd android && ./gradlew assembleDebug   # ANDROID_HOME, ANDROID_NDK_HOME (NDK 30)
+./gradlew installDebug -Ppasa.fast=true # to try a change: seconds, not minutes
 ```
