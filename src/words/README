@@ -1,0 +1,7 @@
+eff.txt     EFF's long word list for passphrases (7,776 words), by the
+            Electronic Frontier Foundation, CC BY 3.0 US:
+            https://www.eff.org/dice
+common.txt  The 10,000 commonest passwords, commonest first, from SecLists
+            (Daniel Miessler and others), MIT:
+            https://github.com/danielmiessler/SecLists
+Both are built into pasa to estimate a typed password's strength.

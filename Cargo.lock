@@ -180,7 +180,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apasa-jni"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
  "jni 0.22.4",
@@ -2730,13 +2730,15 @@ dependencies = [
 
 [[package]]
 name = "kdbx2pasa"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "keepass",
  "rpassword",
  "serde_json",
  "tar",
+ "uuid",
 ]
 
 [[package]]
@@ -3930,7 +3932,7 @@ dependencies = [
 
 [[package]]
 name = "pasa"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "age",
  "age-core",
@@ -3947,6 +3949,7 @@ dependencies = [
  "pushir",
  "qrcode",
  "rpassword",
+ "sha1",
  "sha2 0.11.1",
  "tar",
  "tokio",

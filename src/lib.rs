@@ -20,7 +20,9 @@ use data_encoding::HEXLOWER;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
-use std::sync::{Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed};
+use std::sync::{
+    LazyLock, Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed,
+};
 use std::{fs, path::Path, path::PathBuf, time::SystemTime};
 use zeroize::Zeroizing;
 
@@ -275,10 +277,49 @@ impl Store {
     /// Open with the password and, if `key` asks, the YubiKey's response.
     pub fn open(dir: &Path, pw: &[u8], yk: Option<&[u8]>) -> Result<Store> {
         let f = fs::read(dir.join("key")).context("no store: pasa init")?;
+        let salt = f.get(..32).context("not a pasa key file")?;
+        Store::unsealed(dir, kek(pw, salt, yk)?)
+            .context("wrong password or key")
+    }
+
+    /// Open by a YubiKey's answer and the PIN, if [`quick_on`] set them:
+    /// they open the key the password opens.
+    ///
+    /// [`quick_on`]: Store::quick_on
+    pub fn open_quick(dir: &Path, pin: &[u8], yk: &[u8]) -> Result<Store> {
+        let f = fs::read(dir.join("quick")).context("quick unlock is off")?;
+        let (head, sealed) =
+            f.split_at_checked(33).context("not a quick file")?;
+        let k = kek(pin, &head[..32], Some(yk))?;
+        let kek = open(&k, sealed).context("wrong PIN or key")?;
+        Store::unsealed(dir, kek)
+            .context("quick unlock is out of date: use the password")
+    }
+
+    /// Let this device open the store by a YubiKey's answer to `challenge`
+    /// and a PIN (empty: none), beside the password: `quick` holds the key
+    /// the password opens, sealed to them. With the device's storage and
+    /// the YubiKey a PIN is guessed in days, so the password, which opens
+    /// the store alone, must be long.
+    pub fn quick_on(
+        &self,
+        pin: &[u8],
+        challenge: &[u8],
+        yk: &[u8],
+    ) -> Result<()> {
+        ensure!(challenge.len() == 32, "a challenge is 32 bytes");
+        let k = kek(pin, challenge, Some(yk))?;
+        let head = [challenge, &[!pin.is_empty() as u8]].concat();
+        let quick = [&head[..], &seal(&k, &self.kek)?].concat();
+        write(&self.dir.join("quick"), &quick)
+    }
+
+    /// With the key the password gives.
+    fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
+        let f = fs::read(dir.join("key")).context("no store: pasa init")?;
         let (salt, sealed) =
             f.split_at_checked(33).context("not a pasa key file")?;
-        let kek = kek(pw, &salt[..32], yk)?;
-        let keys = open(&kek, sealed).context("wrong password or key")?;
+        let keys = open(&kek, sealed).context("the key does not open it")?;
         ensure!(
             !keys.is_empty() && keys.len() % 32 == 0,
             "not a pasa key file"
@@ -298,7 +339,10 @@ impl Store {
         let salt = yk.map_or(rand::<32>().to_vec(), |c| c.0.to_vec());
         self.salt = [&salt[..], &[yk.is_some() as u8]].concat();
         self.kek = kek(pw, &salt, yk.map(|c| c.1))?;
-        self.save()
+        self.save()?;
+        // What quick unlock held opens the old lock only.
+        let _ = fs::remove_file(self.dir.join("quick"));
+        Ok(())
     }
 
     /// Write `key` and `dev` under a lock, unless `key` changed since we
@@ -449,6 +493,131 @@ impl Store {
         Ok(m)
     }
 
+    /// The names of the files attached to entry `name`.
+    pub fn files(&self, name: &str) -> Result<Vec<String>> {
+        let at = format!("{name}{FILES}");
+        let all = self.entries()?.into_keys();
+        Ok(all.filter_map(|n| n.strip_prefix(&at).map(String::from)).collect())
+    }
+
+    /// Delete entry `name` and what is attached to it.
+    pub fn remove(&self, name: &str) -> Result<()> {
+        for f in self.files(name)? {
+            self.put(&format!("{name}{FILES}{f}"), b"")?;
+        }
+        self.put(name, b"")
+    }
+
+    /// Entry `from` and what is attached to it, as `to`.
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        ensure!(self.get(to).is_err(), "{to} exists");
+        for f in self.files(from)? {
+            let body = self.get(&format!("{from}{FILES}{f}"))?;
+            self.put(&format!("{to}{FILES}{f}"), &body)?;
+        }
+        self.put(to, &self.get(from)?)?;
+        self.remove(from)
+    }
+
+    /// When entry `name` was made and last changed, in milliseconds.
+    pub fn times(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        let ms = self.versions()?.into_iter().filter(|v| v.name == name);
+        let ms: Vec<u64> = ms.map(|v| v.ms).collect();
+        Ok(ms.first().copied().zip(ms.last().copied()))
+    }
+
+    /// Weak (under 65 bits by [`strength`]), shared and expired passwords.
+    pub fn health(&self) -> Result<Health> {
+        let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let (mut h, today) = (Health::default(), today());
+        for (name, f) in self.forms()? {
+            if !f.expires.is_empty() && f.expires < today {
+                h.expired.push(name.clone());
+            }
+            if f.pass.is_empty() {
+                continue;
+            }
+            match strength(&f.pass) {
+                b if b < 65 => h.weak.push((name.clone(), b)),
+                _ => {}
+            }
+            by.entry(f.pass).or_default().push(name);
+        }
+        h.reused = by.into_values().filter(|n| n.len() > 1).collect();
+        Ok(h)
+    }
+
+    /// Every listed entry as its form.
+    fn forms(&self) -> Result<Vec<(String, Form)>> {
+        let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
+        let names = self.entries()?.into_keys().filter(shown);
+        let form = |n: String| {
+            let f = Form::parse(&String::from_utf8_lossy(&self.get(&n)?));
+            Ok((n, f))
+        };
+        names.map(form).collect()
+    }
+
+    /// The store in numbers: what each counts, and the count.
+    pub fn stats(&self) -> Result<Vec<(&'static str, String)>> {
+        let (forms, h) = (self.forms()?, self.health()?);
+        let versions = self.versions()?;
+        let files = versions.iter().filter(|v| v.name.contains(FILES));
+        let files = files.map(|v| &v.name).collect::<HashSet<_>>().len();
+        let bits: Vec<u32> =
+            forms.iter().map(|f| strength(&f.1.pass)).collect();
+        let graded = |lo: u32, hi: u32| {
+            bits.iter().filter(|b| (lo..hi).contains(b)).count()
+        };
+        let count =
+            |f: fn(&Form) -> bool| forms.iter().filter(|e| f(&e.1)).count();
+        let groups: HashSet<&str> = forms
+            .iter()
+            .filter_map(|f| Some(f.0.rsplit_once('/')?.0))
+            .collect();
+        let unique: HashSet<&str> = forms.iter().map(|f| &*f.1.pass).collect();
+        let size =
+            fs::read_dir(self.dir.join("v")).into_iter().flatten().flatten();
+        let size: u64 =
+            size.filter_map(|e| Some(e.metadata().ok()?.len())).sum();
+        let date = |ms: Option<u64>| {
+            let at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(ms.unwrap_or(0));
+            humantime::format_rfc3339_seconds(at).to_string()[..10].to_string()
+        };
+        let n = |n: usize| n.to_string();
+        let mean = bits.iter().sum::<u32>() / bits.len().max(1) as u32;
+        Ok(vec![
+            ("Entries", n(forms.len())),
+            ("Groups", n(groups.len())),
+            ("Versions kept", n(versions.len())),
+            ("Attached files", n(files)),
+            ("Size on disk", format!("{} KiB", size / 1024)),
+            ("First change", date(versions.first().map(|v| v.ms))),
+            ("Last change", date(versions.last().map(|v| v.ms))),
+            ("Different passwords", n(unique.len())),
+            (
+                "Entries sharing a password",
+                n(h.reused.iter().map(Vec::len).sum()),
+            ),
+            ("Average strength", format!("{mean} bits")),
+            ("Excellent (100 bits and up)", n(graded(100, u32::MAX))),
+            ("Good (65 to 99)", n(graded(65, 100))),
+            ("Weak (40 to 64)", n(graded(40, 65))),
+            ("Poor (under 40)", n(graded(0, 40))),
+            ("With a one-time code", n(count(|f| !f.otp.is_empty()))),
+            ("With an expiry date", n(count(|f| !f.expires.is_empty()))),
+            ("Expired", n(h.expired.len())),
+        ])
+    }
+
+    /// Entry `name`'s versions and their bodies, newest first.
+    pub fn history(&self, name: &str) -> Result<Vec<(u64, Secret)>> {
+        let mut vs = self.versions()?;
+        vs.retain(|v| v.name == name);
+        vs.iter().rev().map(|v| Ok((v.ms, self.body(v)?))).collect()
+    }
+
     /// Entries whose newest version did not follow the one before it: two
     /// devices changed them apart. The other change is in `pasa log`.
     pub fn conflicts(&self) -> Result<Vec<String>> {
@@ -473,15 +642,53 @@ impl Store {
     /// A new version of `name` (empty: deleted): after every version seen,
     /// following the newest of `name`.
     pub fn put(&self, name: &str, body: &[u8]) -> Result<()> {
+        let mut x = self.index()?;
+        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
+        let ms = now.max(x.last + 1);
+        self.keep(&mut x, name, body, ms, parent)
+    }
+
+    /// A version of `name` as it was at `at` (milliseconds): an import's.
+    /// It takes its place among the others by time and follows the one
+    /// before it; dated in the newest one's second, it follows that one.
+    /// The same text in the same second is not kept twice.
+    pub fn put_at(&self, name: &str, body: &[u8], at: u64) -> Result<()> {
+        let mut x = self.index()?;
+        let named = |v: &&Version| v.name == name;
+        let mut of: Vec<Version> =
+            x.heads.values().filter(named).cloned().collect();
+        of.sort_by(|a, b| (a.ms, &a.file).cmp(&(b.ms, &b.file)));
+        for v in &of {
+            if v.ms / 1000 == at / 1000
+                && v.size == body.len()
+                && *self.body(v)? == *body
+            {
+                return Ok(());
+            }
+        }
+        let ms = match of.last() {
+            Some(tip) if tip.ms / 1000 == at / 1000 => tip.ms + 1,
+            _ => at,
+        };
+        let before = of.iter().rfind(|v| v.ms < ms);
+        let parent = before.map_or("-".into(), |v| v.file.clone());
+        self.keep(&mut x, name, body, ms, parent)
+    }
+
+    fn keep(
+        &self,
+        x: &mut Index,
+        name: &str,
+        body: &[u8],
+        ms: u64,
+        parent: String,
+    ) -> Result<()> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
         ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
-        let mut x = self.index()?;
-        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
-        let last = x.last;
-        let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
         let mut v = Version {
-            ms: now.max(last + 1),
+            ms,
             size: body.len(),
             name: name.into(),
             parent,
@@ -500,6 +707,13 @@ impl Store {
         x.heads.insert(v.file.clone(), v);
         Ok(())
     }
+}
+
+/// Quick unlock on this device, if it is on: the YubiKey's challenge, and
+/// whether a PIN goes with its answer.
+pub fn quick(dir: &Path) -> Option<(Vec<u8>, bool)> {
+    let f = fs::read(dir.join("quick")).ok()?;
+    Some((f.get(..32)?.to_vec(), *f.get(32)? == 1))
 }
 
 pub fn generate(len: usize, symbols: bool) -> String {
@@ -532,6 +746,261 @@ pub fn field(body: &str, f: &str) -> Option<String> {
         _ => l.skip(1).find_map(|l| {
             Some(l.strip_prefix(f)?.strip_prefix(':')?.trim().into())
         }),
+    }
+}
+
+// A syllable is an onset, a vowel and a coda: 5 + 3 + 3 bits. The
+// consonants between two vowels split into a coda and an onset one way
+// only (tested), so a password reads back as one sequence: the bits
+// counted are the bits there.
+const ONSETS: [&str; 32] = [
+    "b", "c", "d", "f", "g", "h", "j", "k", "p", "s", "t", "v", "bl", "br",
+    "ch", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "pl", "pr", "sh", "sk",
+    "sl", "sn", "sp", "st", "th", "tr",
+];
+const VOWELS: [&str; 8] = ["a", "e", "i", "o", "u", "ai", "ee", "ou"];
+const CODAS: [&str; 8] = ["", "n", "m", "l", "r", "ng", "rn", "ll"];
+
+/// A password to say aloud: `words` made-up words of two syllables, 22
+/// bits each (four: 88). `hyphens`: snur-deslat-genres, else
+/// SnurDeslatGenres. `leet`: a e i o s t as 4 3 1 0 5 7, digits that
+/// stand nowhere else, so nothing is lost; a capital stays a letter.
+pub fn speakable(words: usize, hyphens: bool, leet: bool) -> String {
+    let word = |_| {
+        let mut w = String::new();
+        for _ in 0..2 {
+            let r = u16::from_be_bytes(rand()) as usize;
+            w += ONSETS[r & 31];
+            w += VOWELS[r >> 5 & 7];
+            w += CODAS[r >> 8 & 7];
+        }
+        if !hyphens {
+            w = w[..1].to_uppercase() + &w[1..];
+        }
+        let digit = |c| match "aeiost".find(c) {
+            Some(i) if leet => b"431057"[i] as char,
+            _ => c,
+        };
+        w.chars().map(digit).collect::<String>()
+    };
+    let words: Vec<String> = (0..words).map(word).collect();
+    words.join(if hyphens { "-" } else { "" })
+}
+
+/// Where an entry's attachments are: entries of their own, hidden from
+/// listings, so they sync, keep their history and are deleted as any other.
+pub const FILES: &str = "/.files/";
+
+/// What a health check finds: entries whose password is weak, with its
+/// bits; those sharing a password, group by group; those past their
+/// `expires` date.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Health {
+    pub weak: Vec<(String, u32)>,
+    pub reused: Vec<Vec<String>>,
+    pub expired: Vec<String>,
+}
+
+/// What a guesser tries before letters: the 10,000 commonest passwords, by
+/// rank (SecLists, MIT), and the 7,776 words of EFF's long list (CC BY 3.0),
+/// each with the bits it is worth.
+static WORDS: LazyLock<HashMap<&'static str, f64>> = LazyLock::new(|| {
+    let eff = include_str!("words/eff.txt").lines().map(|w| (w, 12.925));
+    let rank = |(i, w)| (w, ((i + 2) as f64).log2());
+    let common = include_str!("words/common.txt").lines().enumerate().map(rank);
+    let mut m = HashMap::new();
+    for (w, bits) in eff.chain(common) {
+        let had = m.entry(w).or_insert(bits);
+        *had = bits.min(*had);
+    }
+    m
+});
+
+/// A guess at the bits in a typed password: the cheapest way to spell it
+/// from common passwords (by rank), dictionary words (13 bits; a capital
+/// or 1337 costs a little more) and single characters (by the alphabets
+/// used; one next to its neighbour, as in abc or 111, costs one bit). An
+/// estimate: only a generated password's bits are known. Under 40 is
+/// poor, under 65 weak, under 100 good.
+pub fn strength(pw: &str) -> u32 {
+    let cs: Vec<char> = pw.chars().collect();
+    let has = |f: fn(&char) -> bool| cs.iter().any(f);
+    let pool = [
+        (has(char::is_ascii_lowercase), 26),
+        (has(char::is_ascii_uppercase), 26),
+        (has(char::is_ascii_digit), 10),
+        (has(|c| c.is_ascii() && !c.is_ascii_alphanumeric()), 33),
+        (has(|c| !c.is_ascii()), 64),
+    ];
+    let pool: u32 = pool.iter().filter(|p| p.0).map(|p| p.1).sum();
+    let each = (pool.max(1) as f64).log2();
+    let plain = |c: &char| match c {
+        '4' | '@' => 'a',
+        '3' => 'e',
+        '1' | '!' => 'i',
+        '0' => 'o',
+        '5' | '$' => 's',
+        '7' => 't',
+        c => c.to_ascii_lowercase(),
+    };
+    let mut best = vec![0.0f64; cs.len() + 1];
+    for i in 1..=cs.len() {
+        let near = i >= 2 && (cs[i - 1] as i64 - cs[i - 2] as i64).abs() <= 1;
+        best[i] = best[i - 1] + if near { 1.0 } else { each };
+        for len in 3..=i.min(24) {
+            let part = &cs[i - len..i];
+            let low: String =
+                part.iter().map(char::to_ascii_lowercase).collect();
+            let word = WORDS.get(&*low).copied().or_else(|| {
+                let undone: String = part.iter().map(plain).collect();
+                WORDS.get(&*undone).map(|bits| bits + 2.0)
+            });
+            if let Some(bits) = word {
+                let capital = part.iter().any(char::is_ascii_uppercase) as u8;
+                best[i] = best[i].min(best[i - len] + bits + capital as f64);
+            }
+        }
+    }
+    best[cs.len()] as u32
+}
+
+/// Today as YYYY-MM-DD: what an `expires` date is held against.
+pub fn today() -> String {
+    let now = humantime::format_rfc3339_seconds(SystemTime::now());
+    now.to_string()[..10].into()
+}
+
+/// How often a local copy of haveibeenpwned's passwords holds `pw`:
+/// `file` is its `HASH:COUNT` lines ordered by hash, as its downloader
+/// writes them. Nothing leaves the machine.
+pub fn pwned_file(file: &Path, pw: &str) -> Result<u64> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let (sent, kept) = pwned_key(pw);
+    let want = format!("{sent}{kept}");
+    let mut f = BufReader::new(fs::File::open(file)?);
+    let (mut lo, mut hi) = (0, f.get_ref().metadata()?.len());
+    let mut line = String::new();
+    // The line that starts at or after the middle: before or after `want`?
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        f.seek(SeekFrom::Start(mid))?;
+        line.clear();
+        if mid > 0 {
+            f.read_line(&mut line)?;
+            line.clear();
+        }
+        let at = f.stream_position()?;
+        f.read_line(&mut line)?;
+        match line.get(..40).map(|h| h.to_ascii_uppercase().cmp(&want)) {
+            Some(std::cmp::Ordering::Equal) => {
+                let n = line[40..].trim().trim_start_matches(':');
+                return Ok(n.parse().unwrap_or(1));
+            }
+            Some(std::cmp::Ordering::Less) => lo = at + line.len() as u64,
+            _ => hi = mid,
+        }
+    }
+    Ok(0)
+}
+
+/// For haveibeenpwned's range search: the 5 hex digits of the password's
+/// SHA-1 that are sent, and the 35 that are not.
+pub fn pwned_key(pw: &str) -> (String, String) {
+    use sha1::Digest;
+    let h = data_encoding::HEXUPPER.encode(&sha1::Sha1::digest(pw.as_bytes()));
+    (h[..5].into(), h[5..].into())
+}
+
+/// How many breaches' worth of `rest` the range's answer `text` lists.
+pub fn pwned_count(rest: &str, text: &str) -> u64 {
+    let hit =
+        |l: &str| l.trim().strip_prefix(rest)?.strip_prefix(':')?.parse().ok();
+    text.lines().find_map(hit).unwrap_or(0)
+}
+
+/// An entry's text as the fields a form shows: the password (line 1),
+/// `user:`, `url:`, the otpauth URI's line, and every other line.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Form {
+    pub pass: String,
+    pub user: String,
+    pub url: String,
+    pub otp: String,
+    /// The `tags:` line: names, commas between.
+    pub tags: String,
+    /// The `expires:` line: a date, YYYY-MM-DD.
+    pub expires: String,
+    /// Every other `key: value` line, as written.
+    pub more: String,
+    pub notes: String,
+}
+
+impl Form {
+    pub fn parse(body: &str) -> Form {
+        let mut l = body.lines();
+        let mut f = Form {
+            pass: l.next().unwrap_or_default().into(),
+            ..Form::default()
+        };
+        // `key: value`, the key a short name: a field of its own.
+        let named = |l: &str| {
+            let name = |c: char| c.is_ascii_alphanumeric() || " _-".contains(c);
+            l.split_once(':').is_some_and(|(k, v)| {
+                k.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && k.len() <= 32
+                    && k.chars().all(name)
+                    && (v.is_empty() || v.starts_with(' '))
+            })
+        };
+        let (mut notes, mut more, mut within) = (vec![], vec![], false);
+        for l in l {
+            let key = |k: &str| {
+                Some(l.strip_prefix(k)?.strip_prefix(':')?.trim().to_string())
+            };
+            let was = std::mem::take(&mut within);
+            match (key("user"), key("url"), key("tags"), key("expires")) {
+                (Some(u), ..) if f.user.is_empty() => f.user = u,
+                (_, Some(u), ..) if f.url.is_empty() => f.url = u,
+                (_, _, Some(t), _) if f.tags.is_empty() => f.tags = t,
+                (.., Some(e)) if f.expires.is_empty() => f.expires = e,
+                _ if l.contains("otpauth://") && f.otp.is_empty() => {
+                    f.otp = l.trim().into()
+                }
+                // A field, or the rest of one that runs over lines.
+                _ if named(l) || was && l.starts_with("  ") => {
+                    more.push(l);
+                    within = true;
+                }
+                _ => notes.push(l),
+            }
+        }
+        f.more = more.join("\n");
+        f.notes = notes.join("\n").trim_end().into();
+        f
+    }
+
+    /// The entry's text again: what [`Form::parse`] reads back the same.
+    pub fn text(&self) -> String {
+        let one = |s: &str| s.replace(['\n', '\r'], " ");
+        let mut t = one(&self.pass) + "\n";
+        for (k, v) in [
+            ("user: ", &self.user),
+            ("url: ", &self.url),
+            ("tags: ", &self.tags),
+            ("expires: ", &self.expires),
+            ("", &self.otp),
+        ] {
+            if !v.trim().is_empty() {
+                t += &format!("{k}{}\n", one(v.trim()));
+            }
+        }
+        if !self.more.trim().is_empty() {
+            t += &format!("{}\n", self.more.trim_end());
+        }
+        if !self.notes.trim().is_empty() {
+            t += &format!("{}\n", self.notes.trim_end());
+        }
+        t
     }
 }
 
@@ -661,6 +1130,201 @@ mod tests {
         let pt = open(&s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
         assert_eq!(pt.len(), 256, "padded");
+    }
+
+    #[test]
+    fn speakable_passwords_keep_their_bits() {
+        // Between two vowels stand a coda and an onset: no two such pairs
+        // spell the same, so the syllables read back one way.
+        let runs =
+            CODAS.iter().flat_map(|c| ONSETS.iter().map(move |o| (c, o)));
+        let runs: std::collections::HashSet<String> =
+            runs.map(|(c, o)| format!("{c}{o}")).collect();
+        assert_eq!(runs.len(), CODAS.len() * ONSETS.len());
+        let vowel = |s: &&str| s.contains(['a', 'e', 'i', 'o', 'u']);
+        assert!(!ONSETS.iter().chain(&CODAS).any(vowel));
+        let mut seen = std::collections::HashSet::new();
+        for (o, v, c) in ONSETS
+            .iter()
+            .flat_map(|o| VOWELS.iter().map(move |v| (o, v)))
+            .flat_map(|(o, v)| CODAS.iter().map(move |c| (o, v, c)))
+        {
+            assert!(seen.insert(format!("{o}{v}{c}")));
+        }
+        assert_eq!(seen.len(), 1 << 11);
+        let p = speakable(4, true, false);
+        assert_eq!(p.split('-').count(), 4);
+        assert!(p.chars().all(|c| c == '-' || c.is_ascii_lowercase()));
+        let p = speakable(3, false, true);
+        assert_eq!(p.chars().filter(|c| c.is_ascii_uppercase()).count(), 3);
+        assert!(!p.contains(['a', 'e', 'i', 'o', 's', 't', '-']));
+    }
+
+    #[test]
+    fn files_and_history() {
+        let s = Store::create(&dir("files"), b"pw", None).unwrap();
+        s.put("mail", b"one\n").unwrap();
+        s.put("mail", b"two\n").unwrap();
+        s.put(&format!("mail{FILES}key.pem"), &[0, 159, 255]).unwrap();
+        assert_eq!(s.files("mail").unwrap(), ["key.pem"]);
+        assert_eq!(*s.get("mail/.files/key.pem").unwrap(), [0, 159, 255]);
+        let h = s.history("mail").unwrap();
+        let bodies: Vec<&[u8]> = h.iter().map(|v| &v.1[..]).collect();
+        assert_eq!(bodies, [&b"two\n"[..], b"one\n"]);
+        s.rename("mail", "post").unwrap();
+        assert_eq!(s.files("post").unwrap(), ["key.pem"]);
+        s.remove("post").unwrap();
+        assert!(s.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quick_unlock_opens_what_the_password_opens() {
+        let d = dir("quick");
+        let mut s = Store::create(&d, b"a long master phrase", None).unwrap();
+        s.put("mail", b"pw\n").unwrap();
+        assert!(quick(&d).is_none());
+        let (c, r) = ([7; 32], [9; 20]);
+        s.quick_on(b"2468", &c, &r).unwrap();
+        assert_eq!(quick(&d), Some((c.to_vec(), true)));
+        let q = Store::open_quick(&d, b"2468", &r).unwrap();
+        assert_eq!(*q.get("mail").unwrap(), *b"pw\n");
+        assert!(Store::open_quick(&d, b"0000", &r).is_err());
+        assert!(Store::open_quick(&d, b"2468", &[1; 20]).is_err());
+        // The password still opens it alone; no PIN is a setting too.
+        Store::open(&d, b"a long master phrase", None).unwrap();
+        s.quick_on(b"", &c, &r).unwrap();
+        assert_eq!(quick(&d), Some((c.to_vec(), false)));
+        Store::open_quick(&d, b"", &r).unwrap();
+        // A new password ends it.
+        s.lock(b"another phrase", None).unwrap();
+        assert!(quick(&d).is_none());
+    }
+
+    #[test]
+    fn imports_keep_their_dates_and_order() {
+        let s = Store::create(&dir("dated"), b"pw", None).unwrap();
+        let day = 86_400_000;
+        // Out of order, twice, and two in one second.
+        for (at, body) in [
+            (3 * day, "c"),
+            (day, "a"),
+            (2 * day, "b"),
+            (day, "a"),
+            (3 * day, "d"),
+        ] {
+            s.put_at("mail", body.as_bytes(), at).unwrap();
+        }
+        let h = s.history("mail").unwrap();
+        let bodies: Vec<&[u8]> = h.iter().map(|v| &v.1[..]).collect();
+        assert_eq!(bodies, [&b"d"[..], b"c", b"b", b"a"]);
+        assert_eq!(h[3].0, day);
+        assert_eq!(*s.get("mail").unwrap(), *b"d");
+        // In order from the start: one line of versions, nothing flagged.
+        let t = Store::create(&dir("dated2"), b"pw", None).unwrap();
+        for (at, body) in [(day, "a"), (2 * day, "b"), (2 * day, "c")] {
+            t.put_at("mail", body.as_bytes(), at).unwrap();
+        }
+        assert!(t.conflicts().unwrap().is_empty());
+        assert_eq!(t.times("mail").unwrap().unwrap().0, day);
+    }
+
+    #[test]
+    fn strength_and_breaches() {
+        for (pw, most) in [
+            ("password1", 20),
+            ("aaaaaaaaaaaa", 16),
+            ("abcdefgh", 12),
+            ("Summer2024", 39),
+            ("P@ssw0rd!", 25),
+            ("correcthorse", 30),
+        ] {
+            assert!(strength(pw) <= most, "{pw}: {}", strength(pw));
+        }
+        assert_eq!(strength(""), 0);
+        assert!(strength("k3Vq9xLp2mZt") >= 65);
+        assert!(strength(&generate(24, true)) >= 100);
+        assert!(strength(&speakable(4, false, false)) >= 65);
+        // SHA-1("password") = 5BAA6 1E4C9B93F3F0682250B6CF8331B7EE68FD8.
+        let (sent, kept) = pwned_key("password");
+        assert_eq!(
+            (&*sent, &*kept),
+            ("5BAA6", "1E4C9B93F3F0682250B6CF8331B7EE68FD8")
+        );
+        let text = "0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n1E4C9B93F3F0682250B6CF8331B7EE68FD8:52256179\r\n";
+        assert_eq!(pwned_count(&kept, text), 52256179);
+        assert_eq!(pwned_count("FFFF", text), 0);
+        let s = Store::create(&dir("health"), b"pw", None).unwrap();
+        s.put("a", b"hunter2\nuser: x\n").unwrap();
+        s.put("b", b"hunter2\n").unwrap();
+        s.put("c", generate(24, true).as_bytes()).unwrap();
+        let old = format!("{}\nexpires: 2020-01-01\n", generate(24, true));
+        s.put("old", old.as_bytes()).unwrap();
+        let h = s.health().unwrap();
+        let weak: Vec<&str> = h.weak.iter().map(|w| &*w.0).collect();
+        assert_eq!(
+            (weak, h.reused),
+            (vec!["a", "b"], vec![vec!["a".to_string(), "b".into()]])
+        );
+        assert_eq!(h.expired, ["old"]);
+        let stats = s.stats().unwrap();
+        let of = |k: &str| stats.iter().find(|r| r.0 == k).unwrap().1.clone();
+        assert_eq!(
+            (of("Entries"), of("Different passwords"), of("Expired")),
+            ("4".into(), "3".into(), "1".into())
+        );
+        // A phrase of dictionary words is worth its words, not its letters.
+        let phrase = strength("correct horse battery staple");
+        assert!((40..80).contains(&phrase), "{phrase}");
+        // A local copy of the breach list, ordered by hash.
+        let (sent, kept) = pwned_key("hunter2");
+        let row = |i: u128| {
+            format!(
+                "{:040X}:1",
+                i.wrapping_mul(0x9E3779B97F4A7C15F39CC0605CEDC8)
+            )
+        };
+        let mut rows: Vec<String> = (1..2000).map(row).collect();
+        rows.push(format!("{sent}{kept}:7"));
+        rows.sort();
+        let list = s.dir.join("pwned");
+        fs::write(&list, rows.join("\r\n") + "\r\n").unwrap();
+        assert_eq!(pwned_file(&list, "hunter2").unwrap(), 7);
+        assert_eq!(pwned_file(&list, "not there").unwrap(), 0);
+        // The first and the last line are found too.
+        for edge in [&rows[0], &rows[rows.len() - 1]] {
+            let mut one = [edge.clone(), format!("{sent}{kept}:7")];
+            one.sort();
+            fs::write(&list, one.join("\r\n") + "\r\n").unwrap();
+            assert_eq!(pwned_file(&list, "hunter2").unwrap(), 7);
+        }
+        let (made, changed) = s.times("a").unwrap().unwrap();
+        assert!(made <= changed && s.times("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn forms_round_trip() {
+        let t = "pw\nuser: ada\nfree line\nurl: https://x.org\ntags: work, mail\nexpires: 2030-01-31\nRecovery email: a@b.c\npin: 12\n  34\notpauth://totp/x?secret=JBSWY3DP\nlast\n";
+        let f = Form::parse(t);
+        assert_eq!(
+            (&*f.pass, &*f.user, &*f.url),
+            ("pw", "ada", "https://x.org")
+        );
+        assert_eq!(
+            (&*f.otp, &*f.notes),
+            ("otpauth://totp/x?secret=JBSWY3DP", "free line\nlast")
+        );
+        assert_eq!(f.tags, "work, mail");
+        assert_eq!(
+            (&*f.expires, &*f.more),
+            ("2030-01-31", "Recovery email: a@b.c\npin: 12\n  34")
+        );
+        assert_eq!(Form::parse(&f.text()), f);
+        assert_eq!(field(&f.text(), "user").as_deref(), Some("ada"));
+        assert!(field(&f.text(), "otp").is_some());
+        // A password is one line, whatever is typed; nothing else: only it.
+        let bare = Form { pass: "a\nb".into(), ..Form::default() };
+        assert_eq!(bare.text(), "a b\n");
+        assert_eq!(Form::parse(""), Form::default());
     }
 
     #[test]

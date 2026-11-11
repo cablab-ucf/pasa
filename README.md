@@ -30,8 +30,52 @@ release has it for Linux (x86-64, glibc) and macOS (Apple silicon, with
 --path . --features gui`. `pasa.app` is signed ad hoc, by no Apple account:
 after a download, `xattr -dr com.apple.quarantine pasa.app`.
 
-Both browsers lock after 5 minutes left alone, sync as the command line
-does, and copy through `wl-copy`, `xclip` or `pbcopy`. The window needs
+The window is laid out as the Android app is: a first run asks for the
+password and, if wanted, a YubiKey, with joining another device's store in
+the corner; then groups, entries with their user names, the chosen entry's
+fields each with its copy, a form to edit them, a password generator,
+devices (pair, forget, sync) and settings (`~/.pasa/ui`: when to lock, the
+theme). An entry is still the text `pass` reads: the form writes `user:`
+and `url:` lines. Both also show an entry's history (each version, with a
+way back) and its files.
+
+Both also have: a `tags: a, b` line to filter by; an `expires:` date; any
+other `name: value` line as a field of its own (the form's Advanced tab);
+a search through names, users, addresses, tags and notes, with how many
+of how many entries show; a table whose columns you choose (user, address,
+tags, strength, expiry, files, last change, notes: right-click its
+header); what can be done with an entry under a right-click or a long
+press; the user names most entries have, to pick when making one; and when
+an entry was made and changed.
+
+A bar fills and turns from red to green as a typed password's bits grow
+(under 40 poor, under 65 weak, under 100 good). The bits are the cheapest
+way to spell it from the 10,000 commonest passwords by rank, the 7,776
+words of EFF's list at 13 bits each, and single characters: an estimate,
+only a generated password's bits being known (`src/words/README`).
+
+A health check lists weak, shared and expired passwords, and the store in
+numbers (`pasa health`, `pasa stats`). `--pwned`, or the button, also
+finds those breaches hold. With `PASA_PWNED` naming a local copy of
+haveibeenpwned's list, ordered by hash as its downloader writes it (tens
+of gigabytes: for a desk, not a phone), that file answers and nothing
+leaves. Without it the site is asked: of each password only the first 5
+hex digits of its SHA-1 leave the machine, and the answer is padded.
+Nothing is asked unless you ask.
+
+A file kept with an entry (`pasa attach NAME FILE`, or dropped on the
+window) is an entry of its own, `NAME/.files/FILE`, hidden from listings:
+it syncs, keeps its history, and goes when its entry is removed or moved.
+
+`pasa gen NAME -w` makes a password to say aloud: made-up words of two
+syllables, 22 bits each (four: 88), `SnouldengThollglirPeemtaimCerdul`
+or, with `-d`, `blongder-hilfloum-gainghung-paircairn`; `-l` writes
+a e i o s t as 4 3 1 0 5 7. A password reads back as one sequence of
+syllables only, so the bits counted are the bits there.
+
+Both browsers lock when left alone (5 minutes; the window's is a setting),
+sync as the command line does, and copy through `wl-copy`, `xclip` or
+`pbcopy`. The window needs
 libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 
 ## Files
@@ -72,6 +116,13 @@ ciphertext, and learns when you change things. A version deleted from
   factors needed. The password is per device (`passwd` changes this one);
   each `passwd` takes a fresh challenge. Program two YubiKeys with one
   secret (`ykman otp chalresp 2 SECRET`).
+- **Quick unlock** (`pasa quick`, or the apps' settings; per device, never
+  synced): `quick` holds the key the password derives, sealed to Argon2id
+  of a PIN with the YubiKey's answer as its secret. A tap and the PIN then
+  open the store; so does the password alone, which must therefore be
+  long. The key alone opens nothing; the device's storage with the key
+  leaves only the PIN to guess, at Argon2id's pace: days for six digits.
+  `passwd` ends it.
 - **Transport keys, endpoint, lanes, device id**: what `serve` holds;
   none opens a version or a hand-over.
 
@@ -122,8 +173,16 @@ paired with. It keeps what it had: change the passwords it held.
 ## Migrating
 
 ```sh
-kdbx2pasa Passwords.kdbx | pasa load   # KeePass: history, attachments, .kdbx.json
+kdbx2pasa A.kdbx [B.kdbx ...] [-k KEYFILE] | pasa load   # KeePass
 contrib/migrate.sh                      # pasa 0.1 (age 1.3+)
 ```
+
+`kdbx2pasa` brings every entry with its history, each version dated as
+KeePass dated it, its attachments and tags, and `.kdbx.json` (the first
+database, whole); what is in the recycle bin stays out. Several databases
+are copies of one that went apart (sync conflicts): an entry is the same
+by its id in each, and its versions from all of them make one history by
+time, each once, the newest being the entry. `pasa load` keeps a tar
+member's date as its version's.
 
 License: GPL-3.0-or-later.

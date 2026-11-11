@@ -13,6 +13,11 @@ pub struct View {
     pub s: Store,
     pub filter: String,
     pub names: Vec<String>,
+    /// Each name's newest version, by its file: what a cache keys on.
+    pub files: Vec<String>,
+    /// When each name last changed (ms), and how many files it keeps.
+    pub ms: Vec<u64>,
+    pub kept: Vec<usize>,
     pub at: usize,
     pub note: String,
 }
@@ -21,7 +26,16 @@ impl View {
     pub fn new(s: Store) -> View {
         aside(false);
         let (filter, note) = Default::default();
-        let mut v = View { s, filter, names: vec![], at: 0, note };
+        let mut v = View {
+            s,
+            filter,
+            names: vec![],
+            files: vec![],
+            ms: vec![],
+            kept: vec![],
+            at: 0,
+            note,
+        };
         v.load();
         v
     }
@@ -35,7 +49,15 @@ impl View {
                 && f.split_whitespace().all(|w| n.contains(w))
         };
         let all = self.s.entries().unwrap_or_default();
-        self.names = all.into_keys().filter(has).collect();
+        let kept = |n: &str| {
+            let at = format!("{n}{}", pasa::FILES);
+            all.range(at.clone()..).take_while(|e| e.0.starts_with(&at)).count()
+        };
+        self.kept = all.keys().filter(|n| has(n)).map(|n| kept(n)).collect();
+        let shown = all.iter().filter(|e| has(e.0));
+        self.ms = shown.clone().map(|e| e.1.ms).collect();
+        (self.names, self.files) =
+            shown.map(|(n, v)| (n.clone(), v.file.clone())).unzip();
         self.at = self.at.min(self.names.len().saturating_sub(1));
     }
 
@@ -71,13 +93,23 @@ impl View {
         })
     }
 
-    pub fn generate(&mut self, name: &str) {
+    /// `pw` as `name`'s new password, copied.
+    pub fn generate(&mut self, name: &str, pw: String) {
         self.act(|v| {
             ensure!(!name.trim().is_empty(), "type a name first");
-            let pw = crate::generate(&v.s, name.trim(), 24, true)?;
+            let pw = crate::generate(&v.s, name.trim(), pw)?;
             news();
             clip(&pw)?;
             Ok(format!("{name}: new password copied, cleared in 45 s"))
+        })
+    }
+
+    /// Something done to the store: said, recorded, the peers told.
+    pub fn change(&mut self, f: impl FnOnce(&pasa::Store) -> Result<String>) {
+        self.act(|v| {
+            let said = f(&v.s)?;
+            news();
+            Ok(said)
         })
     }
 }

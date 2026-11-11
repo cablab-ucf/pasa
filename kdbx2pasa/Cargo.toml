@@ -1,6 +1,6 @@
 [package]
 name = "kdbx2pasa"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A KeePass database as a tar of pass-style entries: | pasa load"
@@ -11,3 +11,8 @@ keepass = { version = "0.17", features = ["serialization"] }
 serde_json = "1"
 rpassword = "7"
 tar = { version = "0.4", default-features = false }
+uuid = "1"
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false }
+keepass = { version = "0.17", features = ["save_kdbx4"] }

@@ -95,8 +95,12 @@ fn browse(mut v: View) -> Result<()> {
             (Char('u'), _) if ctrl => v.copy("user"),
             (Char('o'), _) if ctrl => v.copy("otp"),
             (Tab, _) => shown = !was,
-            (Char('n'), _) if ctrl => v.generate(&v.filter.clone()),
-            (Char('g'), Some(n)) if ctrl => v.generate(&n),
+            (Char('n'), _) if ctrl => {
+                v.generate(&v.filter.clone(), pasa::generate(24, true))
+            }
+            (Char('g'), Some(n)) if ctrl => {
+                v.generate(&n, pasa::generate(24, true))
+            }
             (Char('e'), Some(n)) if ctrl => {
                 let old = v.body();
                 screen(false)?;
@@ -108,7 +112,10 @@ fn browse(mut v: View) -> Result<()> {
                     Err(e) => v.note = format!("{e:#}"),
                 }
             }
-            (Char('d'), Some(n)) if ctrl && del => v.put(&n, b""),
+            (Char('d'), Some(n)) if ctrl && del => v.change(|s| {
+                s.remove(&n)?;
+                Ok(format!("{n}: deleted; pasa log {n} has every version"))
+            }),
             (Char('d'), Some(n)) if ctrl => {
                 armed = true;
                 v.note = format!("^D again deletes {n}");

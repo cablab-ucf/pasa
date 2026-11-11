@@ -103,17 +103,88 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
         let (dir, pw) = (dir.to_string(), bytes(e, &pw)?.unwrap_or_default());
         let (c, r) = (bytes(e, &chal)?, bytes(e, &resp)?);
         let dir = Path::new(&dir);
-        let mut st = match create {
+        let st = match create {
             true => Store::create(dir, &pw, c.as_deref().zip(r.as_deref()))?,
             false => Store::open(dir, &pw, r.as_deref())?,
         };
-        if let Some((name, hand)) = PENDING.lock().unwrap().take() {
-            sync::keep_hand(&mut st, &name, &hand)?;
-        }
-        sync::adopt(&mut st)?;
-        let h = jlong::from_be_bytes(pasa::rand());
-        STORES.lock().unwrap().insert(h, st);
-        Ok(h)
+        opened(st)
+    })
+}
+
+/// An opened store's handle: a joined pairing's hand-over key sealed into
+/// it, what peers handed over adopted.
+fn opened(mut st: Store) -> Result<jlong> {
+    if let Some((name, hand)) = PENDING.lock().unwrap().take() {
+        sync::keep_hand(&mut st, &name, &hand)?;
+    }
+    sync::adopt(&mut st)?;
+    let h = jlong::from_be_bytes(pasa::rand());
+    STORES.lock().unwrap().insert(h, st);
+    Ok(h)
+}
+
+/// Quick unlock, if it is on here: the YubiKey's challenge, then 1 if a
+/// PIN goes with its answer; else null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_quick<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JByteArray<'l> {
+    run(&mut env, |e| {
+        Ok(match pasa::quick(Path::new(&dir.to_string())) {
+            Some((c, pin)) => {
+                e.byte_array_from_slice(&[&c[..], &[pin as u8]].concat())?
+            }
+            None => JByteArray::default(),
+        })
+    })
+}
+
+/// Open by the YubiKey's answer and the PIN (empty: none).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_openQuick<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+    pin: JByteArray<'l>,
+    resp: JByteArray<'l>,
+) -> jlong {
+    run(&mut env, |e| {
+        let pin = zeroize::Zeroizing::new(bytes(e, &pin)?.unwrap_or_default());
+        let resp = bytes(e, &resp)?.unwrap_or_default();
+        opened(Store::open_quick(Path::new(&dir.to_string()), &pin, &resp)?)
+    })
+}
+
+/// Turn quick unlock on for an open store: a PIN (empty: none), and the
+/// YubiKey's answer to a fresh 32-byte challenge.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_quickOn<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    pin: JByteArray<'l>,
+    chal: JByteArray<'l>,
+    resp: JByteArray<'l>,
+) {
+    run(&mut env, |e| {
+        let pin = zeroize::Zeroizing::new(bytes(e, &pin)?.unwrap_or_default());
+        let (c, r) = (bytes(e, &chal)?, bytes(e, &resp)?);
+        let (c, r) = (c.unwrap_or_default(), r.unwrap_or_default());
+        with(h, |s| s.quick_on(&pin, &c, &r))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_quickOff<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) {
+    run(&mut env, |_| {
+        let _ = std::fs::remove_file(Path::new(&dir.to_string()).join("quick"));
+        Ok(())
     })
 }
 
@@ -190,8 +261,280 @@ pub extern "system" fn Java_com_apasa_Native_generate<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     len: i32,
+    symbols: bool,
 ) -> JString<'l> {
-    run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, true))?))
+    run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, symbols))?))
+}
+
+/// A guess at a typed password's bits ([`pasa::strength`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_strength<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+    pw: JString<'l>,
+) -> i32 {
+    pasa::strength(&pw.to_string()) as i32
+}
+
+/// When an entry was made and last changed: milliseconds, a line each;
+/// empty if there is none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_times<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let t = with(h, |s| s.times(&name.to_string()))?;
+        let t = t.map(|(made, changed)| format!("{made}\n{changed}"));
+        Ok(e.new_string(t.unwrap_or_default())?)
+    })
+}
+
+/// Weak passwords as `weak`, tab, name, tab, bits; shared ones as
+/// `reused`, then the names, tabs between; expired ones as `expired`,
+/// tab, name: a line each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_health<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let h = with(h, |s| s.health())?;
+        let weak = h.weak.iter().map(|(n, b)| format!("weak\t{n}\t{b}"));
+        let reused =
+            h.reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
+        let expired = h.expired.iter().map(|n| format!("expired\t{n}"));
+        let all: Vec<String> = weak.chain(reused).chain(expired).collect();
+        Ok(e.new_string(all.join("\n"))?)
+    })
+}
+
+/// The store in numbers: what each counts, a tab, the count; a line each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_stats<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let rows = with(h, |s| s.stats())?;
+        let rows: Vec<String> =
+            rows.iter().map(|(what, n)| format!("{what}\t{n}")).collect();
+        Ok(e.new_string(rows.join("\n"))?)
+    })
+}
+
+/// For a breach lookup: what of the password's SHA-1 is sent, then what
+/// is kept, a line each ([`pasa::pwned_key`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_pwnedKey<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    pw: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let (sent, kept) = pasa::pwned_key(&pw.to_string());
+        Ok(e.new_string(format!("{sent}\n{kept}"))?)
+    })
+}
+
+/// How often the lookup's answer lists what was kept.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_pwnedCount<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+    kept: JString<'l>,
+    text: JString<'l>,
+) -> jlong {
+    pasa::pwned_count(&kept.to_string(), &text.to_string()) as jlong
+}
+
+/// A password to say aloud ([`pasa::speakable`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_speakable<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    words: i32,
+    hyphens: bool,
+    leet: bool,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        Ok(e.new_string(pasa::speakable(words as usize, hyphens, leet))?)
+    })
+}
+
+/// Delete an entry and what is attached to it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_remove<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) {
+    run(&mut env, |_| with(h, |s| s.remove(&name.to_string())))
+}
+
+/// An entry and what is attached to it, under a new name.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_rename<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    from: JString<'l>,
+    to: JString<'l>,
+) {
+    run(&mut env, |_| with(h, |s| s.rename(&from.to_string(), &to.to_string())))
+}
+
+/// An entry's versions, newest first: milliseconds, U+001F, the text;
+/// U+001E between versions.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_history<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let all = with(h, |s| s.history(&name.to_string()))?;
+        let one = |(ms, b): &(u64, pasa::Secret)| {
+            format!("{ms}\u{1f}{}", String::from_utf8_lossy(b))
+        };
+        let all: Vec<String> = all.iter().map(one).collect();
+        Ok(e.new_string(all.join("\u{1e}"))?)
+    })
+}
+
+/// The names of the files attached to an entry, one a line.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_files<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let f = with(h, |s| s.files(&name.to_string()))?;
+        Ok(e.new_string(f.join("\n"))?)
+    })
+}
+
+/// An entry's bytes as they are: an attached file's.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_bytes<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JByteArray<'l> {
+    run(&mut env, |e| {
+        let b = with(h, |s| s.get(&name.to_string()))?;
+        Ok(e.byte_array_from_slice(&b)?)
+    })
+}
+
+/// Keep bytes as an entry: an attached file.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_keep<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+    body: JByteArray<'l>,
+) {
+    run(&mut env, |e| {
+        let b = zeroize::Zeroizing::new(bytes(e, &body)?.unwrap_or_default());
+        with(h, |s| s.put(&name.to_string(), &b))
+    })
+}
+
+/// An entry's text as its form: password, user, url, otpauth URI, tags,
+/// expiry date, other fields and notes, U+001F between them.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_form<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    body: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let f = pasa::Form::parse(&body.to_string());
+        let all =
+            [f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes];
+        Ok(e.new_string(all.join("\u{1f}"))?)
+    })
+}
+
+/// The entry's text of a form as [`Java_com_apasa_Native_form`] gives it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_text<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    form: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let s = form.to_string();
+        let mut p = s.splitn(8, '\u{1f}').map(String::from);
+        let mut next = || p.next().unwrap_or_default();
+        let f = pasa::Form {
+            pass: next(),
+            user: next(),
+            url: next(),
+            otp: next(),
+            tags: next(),
+            expires: next(),
+            more: next(),
+            notes: next(),
+        };
+        Ok(e.new_string(f.text())?)
+    })
+}
+
+/// The paired devices' names, one a line.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_peers<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let ps = sync::peers(Path::new(&dir.to_string()));
+        let names: Vec<String> = ps.into_iter().map(|p| p.name).collect();
+        Ok(e.new_string(names.join("\n"))?)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_forget<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+    name: JString<'l>,
+) {
+    run(&mut env, |_| {
+        Ok(sync::forget(Path::new(&dir.to_string()), &name.to_string())?)
+    })
+}
+
+/// Let a device join, called `name` here: its code, then the pairing
+/// password, a line each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_pair<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let pw = sync::password();
+        let mut stores = STORES.lock().unwrap();
+        let st = stores.get_mut(&h).context("locked")?;
+        let (code, _) =
+            RT.block_on(sync::pair(st, &name.to_string(), &pw, false))?;
+        Ok(e.new_string(format!("{code}\n{pw}"))?)
+    })
 }
 
 #[unsafe(no_mangle)]
