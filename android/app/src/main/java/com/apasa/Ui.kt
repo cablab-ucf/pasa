@@ -114,6 +114,10 @@ interface Host {
     var sync: Boolean
     /** Quick unlock here: null if off, else whether a PIN goes with the tap. */
     val quick: Boolean?
+    /** The phone has NFC and it is switched off: a key can then only be plugged in. */
+    val nfcOff: Boolean
+    /** Open the phone's NFC settings. */
+    fun nfcSettings()
     suspend fun create(pw: String, key: Key, pin: String)
     suspend fun unlock(pw: String)
     suspend fun unlockQuick(pin: String)
@@ -338,7 +342,7 @@ private fun Meter(bits: Int, goal: Int = 0) = Column(verticalArrangement = Arran
 @Composable
 private fun Front(
     title: String, work: Work, ask: String = "", link: String = "", other: () -> Unit = {},
-    wait: String = "", body: @Composable () -> Unit,
+    wait: String = "", host: Host? = null, body: @Composable () -> Unit,
 ) = Box(Modifier.fillMaxSize().padding(20.dp)) {
     Column(
         Modifier.align(Alignment.TopCenter).widthIn(max = 420.dp).verticalScroll(rememberScrollState()),
@@ -355,7 +359,7 @@ private fun Front(
         ) {
             Text(title, style = MaterialTheme.typography.titleLarge)
             body()
-            Doing(work, wait)
+            Doing(work, wait, host)
         }
         Spacer(Modifier.height(64.dp))
     }
@@ -367,7 +371,7 @@ private fun Front(
 
 /** Under what was asked for: that it is being done, with a way to stop; or why it failed. */
 @Composable
-private fun Doing(work: Work, wait: String = "") {
+private fun Doing(work: Work, wait: String = "", host: Host? = null) {
     if (work.busy) {
         if (wait.isNotEmpty()) Text(wait, color = MaterialTheme.colorScheme.primary)
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -376,6 +380,16 @@ private fun Doing(work: Work, wait: String = "") {
         }
     }
     if (work.err.isNotEmpty()) Text(work.err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+    // What is wrong, and where to put it right.
+    if (host != null && host.nfcOff && work.err.contains("NFC")) OutlinedButton(host::nfcSettings) { Text("Open NFC settings") }
+}
+
+/** Before a key is asked for: that NFC is off, and where to turn it on. */
+@Composable
+private fun NfcOff(host: Host) {
+    if (!host.nfcOff) return
+    Text("NFC is off: turn it on to tap the YubiKey, or plug the key in.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    OutlinedButton(host::nfcSettings) { Text("Open NFC settings") }
 }
 
 @Composable
@@ -392,7 +406,7 @@ private fun Create(host: Host, nav: Nav) {
     val create = { if (ok) work.go { host.create(pw, key, pin) } }
     Front(
         "Create your store", work, "A store on another device already?", "Join it", { nav.joining = true },
-        wait = if (key != Key.None) "Hold your YubiKey to the phone" else "",
+        wait = if (key != Key.None) "Hold your YubiKey to the phone, or plug it in" else "", host = host,
     ) {
         Text(
             "Its password opens everything, and is the way back in when all else is lost: a long one. 256 bits is the suggestion.",
@@ -431,6 +445,7 @@ private fun Create(host: Host, nav: Nav) {
             Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
             if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true, done = create)
             Choice("As a second factor", "Needed together with the password, every time.", key == Key.Both) { key = Key.Both }
+            NfcOff(host)
         }
         Primary("Create store", enabled = ok, go = create)
     }
@@ -474,20 +489,22 @@ private fun Unlock(host: Host) {
     var byPassword by remember { mutableStateOf(false) }
     val work = rememberJob()
     val quick = host.quick
-    val tap = "Hold your YubiKey to the phone"
+    val tap = "Hold your YubiKey to the phone, or plug it in"
     if (quick != null && !byPassword) {
         val open = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
-        return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap) {
+        return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap, host = host) {
             if (quick) Field(pin, { pin = it }, "PIN", secret = true, done = open)
+            NfcOff(host)
             Primary("Unlock with the YubiKey", enabled = !work.busy, go = open)
         }
     }
     val open = { if (!work.busy) work.go { host.unlock(pw); pw = "" } }
     Front(
         "Unlock", work, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
-        { work.stop(); byPassword = false }, wait = if (host.needsKey) tap else "",
+        { work.stop(); byPassword = false }, wait = if (host.needsKey) tap else "", host = host,
     ) {
         Field(pw, { pw = it }, "Password", secret = true, done = open)
+        if (host.needsKey) NfcOff(host)
         Primary("Unlock", enabled = !work.busy, go = open)
     }
 }
@@ -971,7 +988,8 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
             TextButton({ go { host.setQuick(null) } }) { Text("Turn off") }
         }
     }
-    Doing(work, "Hold your YubiKey to the phone")
+    if (host.quick == null) NfcOff(host)
+    Doing(work, "Hold your YubiKey to the phone, or plug it in", host)
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     for ((what, how) in listOf(
         "Locking" to "The store locks whenever the app leaves the screen.",
