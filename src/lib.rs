@@ -334,7 +334,7 @@ impl Store {
     ) -> Result<()> {
         ensure!(salt.len() == 32 && secret.len() == 32, "32 bytes each");
         ensure!(fido(&self.dir).is_none_or(|f| f.salt == salt), "another salt");
-        let at = self.dir.join("fido");
+        let at = self.dir.join("ctap");
         let old = fs::read_to_string(&at).unwrap_or_default();
         let mut lines: Vec<String> =
             old.lines().skip(1).map(Into::into).collect();
@@ -349,7 +349,7 @@ impl Store {
     /// Open by the answer of the security key with credential `cred`.
     pub fn open_fido(dir: &Path, cred: &[u8], secret: &[u8]) -> Result<Store> {
         let f =
-            fs::read_to_string(dir.join("fido")).context("no security key")?;
+            fs::read_to_string(dir.join("ctap")).context("no security key")?;
         let mut keys = f.lines().skip(1).filter_map(fido_line);
         let key =
             keys.find(|k| k.0 == cred).context("not a key of this store")?;
@@ -387,7 +387,7 @@ impl Store {
         self.save()?;
         // What quick unlock held opens the old lock only.
         let _ = fs::remove_file(self.dir.join("quick"));
-        let _ = fs::remove_file(self.dir.join("fido"));
+        let _ = fs::remove_file(self.dir.join("ctap"));
         Ok(())
     }
 
@@ -767,17 +767,20 @@ pub fn quick(dir: &Path) -> Option<(Vec<u8>, bool)> {
     Some((f.get(..32)?.to_vec(), *f.get(32)? == 1))
 }
 
-/// The security keys (FIDO2, CTAP2 `hmac-secret`) that open the store on
-/// this device, beside the password: the salt each is asked with, and
+/// The security keys that open the store on this device, beside the
+/// password, by CTAP2 (`hmac-secret`): the half of FIDO2 that is between a
+/// device and a key, with nothing of the half that is between a browser
+/// and a server. No connection is made for it, here or in what it calls.
+/// What they are asked with: the salt each is asked with, and
 /// for each its credential and whether its PIN goes with it. The file
-/// `fido`: the salt, then a line a key (credential, PIN, the key the
+/// `ctap`: the salt, then a line a key (credential, PIN, the key the
 /// password opens sealed to that key's secret), all hex.
 pub struct Fido {
     pub salt: Vec<u8>,
     pub keys: Vec<(Vec<u8>, bool)>,
 }
 
-/// One line of `fido`: credential, PIN, sealed.
+/// One line of `ctap`: credential, PIN, sealed.
 fn fido_line(l: &str) -> Option<(Vec<u8>, bool, Vec<u8>)> {
     let mut p = l.split(' ');
     let hex = |p: Option<&str>| HEXLOWER.decode(p?.as_bytes()).ok();
@@ -785,7 +788,7 @@ fn fido_line(l: &str) -> Option<(Vec<u8>, bool, Vec<u8>)> {
 }
 
 pub fn fido(dir: &Path) -> Option<Fido> {
-    let f = fs::read_to_string(dir.join("fido")).ok()?;
+    let f = fs::read_to_string(dir.join("ctap")).ok()?;
     let salt = HEXLOWER.decode(f.lines().next()?.as_bytes()).ok()?;
     let keys = f.lines().skip(1).filter_map(fido_line);
     let keys: Vec<_> = keys.map(|(c, pin, _)| (c, pin)).collect();
@@ -795,7 +798,7 @@ pub fn fido(dir: &Path) -> Option<Fido> {
 /// The security key with credential `cred` opens nothing here any more;
 /// `None`: none does.
 pub fn fido_off(dir: &Path, cred: Option<&[u8]>) -> Result<()> {
-    let at = dir.join("fido");
+    let at = dir.join("ctap");
     let f = fs::read_to_string(&at).unwrap_or_default();
     let keep = |l: &&str| {
         cred.is_some() && fido_line(l).is_none_or(|k| Some(&k.0[..]) != cred)
@@ -1532,7 +1535,7 @@ mod tests {
         assert!(Store::open_fido(&d, b"cred-two", &two).is_ok());
         // A new password leaves a key behind: it says so, and is taken off.
         fido_off(&d, None).unwrap();
-        assert!(fido(&d).is_none() && !d.join("fido").exists());
+        assert!(fido(&d).is_none() && !d.join("ctap").exists());
         fido_off(&d, None).unwrap();
     }
 

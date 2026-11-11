@@ -1195,9 +1195,9 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     // Security keys (FIDO2): added one at a time, a spare at any time.
     var keyPin by remember { mutableStateOf("") }
     val keys = rememberJob()
-    Text("Security keys (FIDO2)", style = MaterialTheme.typography.bodyLarge)
+    Text("Security keys: CTAP2 (FIDO2 without the network)", style = MaterialTheme.typography.bodyLarge)
     Text(
-        "A security key of any make opens the store on this phone, beside the password. Its secret never leaves it, and nothing goes over a network. Add a spare the same way, now or later.",
+        "A security key of any make opens the store on this phone, beside the password. Only this phone and the key take part, over NFC or USB: no server, no account, no network, so it works in flight mode. The key's secret never leaves it. Add a spare the same way, now or later.",
         style = MaterialTheme.typography.bodySmall, color = muted,
     )
     Text(when (host.fidoKeys) { 0 -> "None yet"; 1 -> "1 key opens the store here"; else -> "${host.fidoKeys} keys open the store here" })

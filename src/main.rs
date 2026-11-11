@@ -33,9 +33,10 @@ pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
-pasa fido | fido off         let the security key plugged in (FIDO2, any make) open the
-                             store here beside the password; again for a spare, at any
-                             time. off: none does. Needs libfido2's tools; no network.
+pasa ctap | ctap off         let the security key plugged in open the store here beside
+                             the password, by CTAP2 (FIDO2 without the network: only
+                             this machine and the key, over USB); again for a spare, at
+                             any time. off: none does. Needs libfido2's tools.
 pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
                              spare with the same secret, now or never: have both at hand
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
@@ -112,8 +113,8 @@ fn fido_tool(
     pin: Option<&[u8]>,
 ) -> Result<Vec<String>> {
     // The input holds nothing secret: random bytes, a name, the
-    // credential and the salt the `fido` file has in the clear.
-    let at = home().join(format!(".fido-{}", HEXLOWER.encode(&rand::<4>())));
+    // credential and the salt the `ctap` file has in the clear.
+    let at = home().join(format!(".ctap-{}", HEXLOWER.encode(&rand::<4>())));
     pasa::write(&at, input.as_bytes())?;
     // Away from the terminal, the tool reads the PIN where we write it.
     let detach =
@@ -454,8 +455,8 @@ fn main() -> Result<()> {
             let (pw, c, r) = factors(flag("-y") || had && !flag("-n"))?;
             s.lock(&pw, r.as_ref().map(|r| (&c[..], &r[..])))?
         }
-        ["fido", "off"] => return pasa::fido_off(&home(), None),
-        ["fido", ..] => return fido_add(&unlock(&ask("Password: ")?)?, None),
+        ["ctap", "off"] => return pasa::fido_off(&home(), None),
+        ["ctap", ..] => return fido_add(&unlock(&ask("Password: ")?)?, None),
         // A new key, and with -s a spare: the same secret, held only here.
         ["key", ..] => {
             let secret = Zeroizing::new(pasa::rand::<20>());

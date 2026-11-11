@@ -16,9 +16,10 @@ import java.security.SecureRandom
 import java.util.Base64
 
 /*
- * Security keys (FIDO2) by CTAP2's hmac-secret: the key holds a secret made on it that never leaves it,
+ * Security keys by CTAP2 (FIDO2 without the network), its hmac-secret: the key holds a secret made on it that never leaves it,
  * and gives HMAC-SHA-256 of a salt under it. All of it is between this phone and the key, over NFC or
- * USB: no server, no account, no network; "pasa" below is a name on the key, not an address.
+ * USB: no server, no account, no network; "pasa" below is a name on the key, not an address. Nothing
+ * here or in Yubico's library opens a connection: android/no-network.sh checks both at every build.
  */
 private const val RP = "pasa"
 

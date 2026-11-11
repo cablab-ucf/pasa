@@ -2085,10 +2085,15 @@ impl App {
             },
         );
         ui.separator();
-        ui.label(RichText::new("Security keys (FIDO2)").strong());
+        ui.label(
+            RichText::new("Security keys: CTAP2 (FIDO2 without the network)")
+                .strong(),
+        );
         let how = "A security key of any make opens the store on this machine, \
-                   beside the password: its secret never leaves it, and nothing \
-                   goes over a network. Add a spare at any time.";
+                   beside the password. Only this machine and the key take \
+                   part, over USB: no server, no account, no network, so it \
+                   works offline. The key's secret never leaves it. Add a \
+                   spare at any time.";
         ui.label(RichText::new(how).small().color(l.muted));
         let keys = pasa::fido(&home()).map_or(0, |f| f.keys.len());
         ui.horizontal(|ui| {
