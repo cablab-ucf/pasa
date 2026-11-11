@@ -107,6 +107,8 @@ fn style(ctx: &Context) {
 struct Prefs {
     lock: u64,
     theme: ThemePreference,
+    /// Which of [`COLS`] the table shows; the title always.
+    cols: [bool; 9],
 }
 
 const THEMES: [(&str, ThemePreference); 3] = [
@@ -122,6 +124,11 @@ impl Default for Prefs {
         let theme = THEMES.iter().find(|t| Some(t.0) == get("theme "));
         Prefs {
             lock: get("lock ").and_then(|m| m.parse().ok()).unwrap_or(5),
+            cols: std::array::from_fn(|i| {
+                let on =
+                    get("cols ").and_then(|c| c.as_bytes().get(i).copied());
+                on.map_or([0, 1, 2, 4, 7].contains(&i), |b| b == b'1')
+            }),
             theme: theme.map_or(ThemePreference::System, |t| t.1),
         }
     }
@@ -129,17 +136,44 @@ impl Default for Prefs {
 
 impl Prefs {
     fn save(&self) {
+        let cols: String =
+            self.cols.iter().map(|on| if *on { '1' } else { '0' }).collect();
         let theme =
             THEMES.iter().find(|t| t.1 == self.theme).map_or("system", |t| t.0);
         let _ = pasa::write(
             &home().join("ui"),
-            format!("lock {}\ntheme {theme}\n", self.lock).as_bytes(),
+            format!("lock {}\ntheme {theme}\ncols {cols}\n", self.lock)
+                .as_bytes(),
         );
     }
 }
 
 /// Entries whose password breaches hold, and how often.
 type Breached = Vec<(String, u64)>;
+
+/// The table's columns: what each is called, and how wide.
+const COLS: [(&str, f32); 9] = [
+    ("Title", 230.0),
+    ("Username", 190.0),
+    ("URL", 220.0),
+    ("Tags", 130.0),
+    ("Strength", 110.0),
+    ("Expires", 100.0),
+    ("Files", 60.0),
+    ("Changed", 140.0),
+    ("Notes", 260.0),
+];
+
+/// What a row shows of an entry, and a search looks through.
+#[derive(Clone, Default)]
+struct Meta {
+    user: String,
+    url: String,
+    tags: String,
+    notes: String,
+    expires: String,
+    bits: u32,
+}
 
 enum Job {
     Create,
@@ -168,6 +202,8 @@ struct Edit {
     name: String,
     f: Form,
     show: bool,
+    /// The Advanced tab, not the entry's.
+    advanced: bool,
 }
 
 struct Generator {
@@ -245,7 +281,10 @@ struct App {
     group: Option<String>,
     /// Each version's user, address and tags, read once: what rows show
     /// and a search looks through.
-    meta: HashMap<String, [String; 3]>,
+    meta: HashMap<String, Meta>,
+    /// The store in numbers, while its tab shows.
+    stats: Option<Vec<(&'static str, String)>>,
+    numbers: bool,
     tag: Option<String>,
     /// What a breach check found, entry by entry, once it is back.
     breached: Arc<Mutex<Option<Breached>>>,
@@ -305,6 +344,18 @@ fn saved(file: &str, body: &[u8]) -> Result<String> {
     let to = (0..1000).find_map(|i| free(&i)).context("no free name")?;
     pasa::write(&to, body)?;
     Ok(format!("{file}: saved as {}", to.display()))
+}
+
+/// In the browser.
+fn open_url(url: &str) {
+    let with = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let _ = std::process::Command::new(with).arg(url).spawn();
+}
+
+/// The day `days` from now, as YYYY-MM-DD.
+fn day(days: u64) -> String {
+    let at = std::time::SystemTime::now() + Duration::from_secs(days * 86_400);
+    humantime::format_rfc3339_seconds(at).to_string()[..10].into()
 }
 
 /// A time in milliseconds, as a date and a minute.
@@ -652,14 +703,35 @@ impl App {
         }
     }
 
-    /// The entry's user name, address and tags, read once per version.
-    fn meta(&mut self, v: &View, i: usize) -> &[String; 3] {
+    /// What a row shows of the entry, read once per version.
+    fn meta(&mut self, v: &View, i: usize) -> &Meta {
         let read = || {
             let b = v.s.get(&v.names[i]).unwrap_or_default();
             let f = Form::parse(&String::from_utf8_lossy(&b));
-            [f.user, f.url, f.tags]
+            let notes = f.notes.lines().next().unwrap_or_default().into();
+            let bits = pasa::strength(&f.pass);
+            Meta {
+                user: f.user,
+                url: f.url,
+                tags: f.tags,
+                notes,
+                expires: f.expires,
+                bits,
+            }
         };
         self.meta.entry(v.files[i].clone()).or_insert_with(read)
+    }
+
+    /// The user names most entries have, the commonest first.
+    fn users(&self) -> Vec<String> {
+        let mut n: HashMap<&str, usize> = HashMap::new();
+        for m in self.meta.values().filter(|m| !m.user.is_empty()) {
+            *n.entry(&m.user).or_default() += 1;
+        }
+        let mut by: Vec<(usize, &str)> =
+            n.into_iter().map(|(u, n)| (n, u)).collect();
+        by.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        by.into_iter().take(5).map(|u| u.1.to_string()).collect()
     }
 
     fn store(&mut self, ui: &mut Ui, mut v: View) {
@@ -690,12 +762,13 @@ impl App {
         for i in 0..v.names.len() {
             let name = v.names[i].clone();
             let m = self.meta(&v, i).clone();
-            let of: Vec<&str> = m[2].split(',').map(str::trim).collect();
+            let of: Vec<&str> = m.tags.split(',').map(str::trim).collect();
             tags.extend(
                 of.iter().filter(|t| !t.is_empty()).map(|t| t.to_string()),
             );
             let hay =
-                format!("{name} {} {} {}", m[0], m[1], m[2]).to_lowercase();
+                format!("{name} {} {} {} {}", m.user, m.url, m.tags, m.notes);
+            let hay = hay.to_lowercase();
             let tagged = self.tag.as_ref().is_none_or(|t| of.contains(&&**t));
             let within = self.group.is_none() || dir(&name) == self.group;
             if tagged && within && words.iter().all(|w| hay.contains(w)) {
@@ -847,16 +920,16 @@ impl App {
                 self.entry(ui, &mut v, chosen.as_deref());
             });
 
+        let mut act = None;
         CentralPanel::default().show(ui, |ui| {
-            let width = ui.available_width();
-            let cols = |ui: &mut Ui, h: f32| {
-                let (rect, r) =
-                    ui.allocate_exact_size(vec2(width, h), Sense::click());
-                (rect, r, rect.left() + rect.width() * 0.55)
-            };
+            let shown: Vec<usize> = (0..COLS.len())
+                .filter(|c| *c == 0 || self.prefs.cols[*c])
+                .collect();
+            let wide: f32 =
+                shown.iter().map(|c| COLS[*c].1).sum::<f32>() + 20.0;
             let put = |ui: &Ui,
                        x: f32,
-                       max: f32,
+                       w: f32,
                        y: f32,
                        t: &str,
                        c: Color32,
@@ -864,85 +937,184 @@ impl App {
                 let f = FontId::proportional(if small { 12.5 } else { 15.0 });
                 let clip = egui::Rect::from_min_max(
                     pos2(x, y - 15.0),
-                    pos2(max, y + 15.0),
+                    pos2(x + w - 12.0, y + 15.0),
                 );
-                ui.painter().with_clip_rect(clip).text(
-                    pos2(x, y),
-                    Align2::LEFT_CENTER,
-                    t,
-                    f,
-                    c,
-                );
+                ui.painter()
+                    .with_clip_rect(clip.intersect(ui.clip_rect()))
+                    .text(pos2(x, y), Align2::LEFT_CENTER, t, f, c);
             };
-            let (rect, _, mid) = cols(ui, 22.0);
-            let y = rect.center().y;
-            put(ui, rect.left() + 10.0, mid - 8.0, y, "TITLE", l.muted, true);
-            put(ui, mid, rect.right(), y, "USERNAME", l.muted, true);
-            ui.separator();
-            if rows.is_empty() {
-                let none = if v.names.is_empty() && v.filter.is_empty() {
-                    "No entries yet. New adds the first."
-                } else {
-                    "Nothing matches."
-                };
-                ui.add_space(24.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new(none).color(l.muted))
-                });
-            }
-            ScrollArea::vertical().auto_shrink(false).show_rows(
-                ui,
-                30.0,
-                rows.len(),
-                |ui, shown| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    for i in shown {
-                        let at = rows[i];
-                        let user = self.meta(&v, at)[0].clone();
-                        let (rect, r, mid) = cols(ui, 30.0);
-                        let fill = match (at == v.at, r.hovered()) {
-                            (true, _) => l.accent.gamma_multiply(0.28),
-                            (_, true) => l.line.gamma_multiply(0.6),
-                            _ => Color32::TRANSPARENT,
-                        };
-                        ui.painter().rect_filled(rect, 7, fill);
-                        let name = &v.names[at];
-                        let title = match &self.group {
-                            Some(g) => &name[g.len() + 1..],
-                            None => name,
-                        };
-                        let y = rect.center().y;
-                        put(
-                            ui,
-                            rect.left() + 10.0,
-                            mid - 8.0,
-                            y,
-                            title,
-                            l.text,
-                            false,
-                        );
-                        put(
-                            ui,
-                            mid,
-                            rect.right() - 6.0,
-                            y,
-                            &user,
-                            l.muted,
-                            false,
-                        );
-                        if r.clicked() {
-                            v.at = at;
-                        }
-                        if r.double_clicked() {
-                            v.at = at;
-                            v.copy("pass");
-                        }
+            let today = pasa::today();
+            ScrollArea::horizontal().auto_shrink(false).show(ui, |ui| {
+                let width = wide.max(ui.available_width());
+                let (rect, head) =
+                    ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
+                let mut x = rect.left() + 10.0;
+                for c in &shown {
+                    let title = COLS[*c].0.to_uppercase();
+                    put(
+                        ui,
+                        x,
+                        COLS[*c].1,
+                        rect.center().y,
+                        &title,
+                        l.muted,
+                        true,
+                    );
+                    x += COLS[*c].1;
+                }
+                // The header's menu: which columns show.
+                head.on_hover_text("Right-click: columns").context_menu(|ui| {
+                    ui.label(RichText::new("COLUMNS").small().color(l.muted));
+                    for (c, col) in COLS.iter().enumerate().skip(1) {
+                        ui.checkbox(&mut self.prefs.cols[c], col.0);
                     }
-                },
-            );
+                });
+                ui.separator();
+                if rows.is_empty() {
+                    let none = if v.names.is_empty() {
+                        "No entries yet. New adds the first."
+                    } else {
+                        "Nothing matches."
+                    };
+                    ui.add_space(24.0);
+                    ui.label(RichText::new(none).color(l.muted));
+                }
+                ScrollArea::vertical().auto_shrink(false).show_rows(
+                    ui,
+                    30.0,
+                    rows.len(),
+                    |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        for i in range {
+                            let at = rows[i];
+                            let m = self.meta(&v, at).clone();
+                            let (rect, r) = ui.allocate_exact_size(
+                                vec2(width, 30.0),
+                                Sense::click(),
+                            );
+                            let fill = match (at == v.at, r.hovered()) {
+                                (true, _) => l.accent.gamma_multiply(0.28),
+                                (_, true) => l.line.gamma_multiply(0.6),
+                                _ => Color32::TRANSPARENT,
+                            };
+                            ui.painter().rect_filled(rect, 7, fill);
+                            let name = &v.names[at];
+                            let title = match &self.group {
+                                Some(g) => &name[g.len() + 1..],
+                                None => name,
+                            };
+                            let (mut x, y) =
+                                (rect.left() + 10.0, rect.center().y);
+                            for c in &shown {
+                                let w = COLS[*c].1;
+                                let grey = |t: &str| {
+                                    put(ui, x, w, y, t, l.muted, false)
+                                };
+                                match *c {
+                                    0 => put(ui, x, w, y, title, l.text, false),
+                                    1 => grey(&m.user),
+                                    2 => grey(&m.url),
+                                    3 => grey(&m.tags),
+                                    4 => {
+                                        // A short bar in the grade's colour, then the bits.
+                                        let (_, colour) = grade(m.bits);
+                                        let full = egui::Rect::from_min_size(
+                                            pos2(x, y - 3.0),
+                                            vec2(44.0, 6.0),
+                                        );
+                                        let mut bar = full;
+                                        bar.set_width(
+                                            44.0 * (m.bits as f32 / 128.0)
+                                                .min(1.0),
+                                        );
+                                        ui.painter()
+                                            .rect_filled(full, 3, l.line);
+                                        ui.painter()
+                                            .rect_filled(bar, 3, colour);
+                                        put(
+                                            ui,
+                                            x + 52.0,
+                                            w - 52.0,
+                                            y,
+                                            &m.bits.to_string(),
+                                            l.muted,
+                                            true,
+                                        );
+                                    }
+                                    5 if !m.expires.is_empty()
+                                        && m.expires < today =>
+                                    {
+                                        put(
+                                            ui, x, w, y, &m.expires, l.bad,
+                                            false,
+                                        )
+                                    }
+                                    5 => grey(&m.expires),
+                                    6 if v.kept[at] > 0 => {
+                                        grey(&v.kept[at].to_string())
+                                    }
+                                    7 => grey(&date(v.ms[at])),
+                                    8 => grey(&m.notes),
+                                    _ => {}
+                                }
+                                x += w;
+                            }
+                            if r.clicked() || r.secondary_clicked() {
+                                v.at = at;
+                            }
+                            if r.double_clicked() {
+                                act = Some((at, "pass"));
+                            }
+                            // What can be done with an entry, under the pointer.
+                            r.context_menu(|ui| {
+                                let web = m.url.starts_with("http");
+                                for (what, text, on) in [
+                                    (
+                                        "user",
+                                        "Copy username",
+                                        !m.user.is_empty(),
+                                    ),
+                                    ("pass", "Copy password", true),
+                                    ("otp", "Copy one-time code", true),
+                                    ("url", "Copy URL", !m.url.is_empty()),
+                                    ("open", "Open URL", web),
+                                    ("edit", "Edit", true),
+                                    ("history", "History", true),
+                                    ("delete", "Delete", true),
+                                ] {
+                                    if matches!(what, "edit" | "delete") {
+                                        ui.separator();
+                                    }
+                                    if ui
+                                        .add_enabled(on, Button::new(text))
+                                        .clicked()
+                                    {
+                                        act = Some((at, what));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+            });
         });
+        if let Some((at, what)) = act {
+            v.at = at;
+            match what {
+                "edit" => self.edit_entry(&v),
+                "history" => self.win = Win::History,
+                "open" => open_url(&self.meta(&v, at).url.clone()),
+                "delete" => {
+                    self.armed = true;
+                    v.note =
+                        format!("{}: Really delete, to delete it", v.names[at]);
+                }
+                field => v.copy(field),
+            }
+        }
 
-        if v.at != was {
+        if v.at != was && act.is_none() {
             (self.shown, self.armed) = (false, false);
         }
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -969,14 +1141,25 @@ impl App {
         let name =
             self.group.as_ref().map(|g| format!("{g}/")).unwrap_or_default();
         let f = Form { pass: self.generator.make(), ..Form::default() };
-        self.edit = Some(Edit { old: String::new(), name, f, show: false });
+        self.edit = Some(Edit {
+            old: String::new(),
+            name,
+            f,
+            show: false,
+            advanced: false,
+        });
     }
 
     fn edit_entry(&mut self, v: &View) {
         if let Some(n) = v.name() {
             let f = Form::parse(&String::from_utf8_lossy(&v.body()));
-            self.edit =
-                Some(Edit { old: n.into(), name: n.into(), f, show: false });
+            self.edit = Some(Edit {
+                old: n.into(),
+                name: n.into(),
+                f,
+                show: false,
+                advanced: false,
+            });
         }
     }
 
@@ -1085,14 +1268,7 @@ impl App {
                             let web = f.url.starts_with("https://")
                                 || f.url.starts_with("http://");
                             if web && ui.small_button("Open").clicked() {
-                                let with = if cfg!(target_os = "macos") {
-                                    "open"
-                                } else {
-                                    "xdg-open"
-                                };
-                                let _ = std::process::Command::new(with)
-                                    .arg(&f.url)
-                                    .spawn();
+                                open_url(&f.url);
                             }
                         });
                         ui.end_row();
@@ -1134,11 +1310,38 @@ impl App {
     /// Weak, shared and, if asked, breached passwords.
     fn health(&mut self, ui: &mut Ui, v: &mut View) {
         let l = look(ui);
-        ui.heading("Password health");
+        ui.horizontal(|ui| {
+            ui.heading("Password health");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.selectable_value(&mut self.numbers, true, "Statistics");
+                ui.selectable_value(&mut self.numbers, false, "Health");
+            });
+        });
+        if self.numbers {
+            if self.stats.is_none() {
+                self.stats = v.s.stats().ok();
+            }
+            let rows = self.stats.clone().unwrap_or_default();
+            ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                Grid::new("stats")
+                    .num_columns(2)
+                    .striped(true)
+                    .spacing([24.0, 6.0])
+                    .show(ui, |ui| {
+                        for (what, n) in rows {
+                            ui.label(what);
+                            ui.label(RichText::new(n).strong());
+                            ui.end_row();
+                        }
+                    });
+            });
+            return;
+        }
         if self.health.is_none() {
             self.health = v.s.health().ok();
         }
-        let (weak, reused) = self.health.clone().unwrap_or_default();
+        let h = self.health.clone().unwrap_or_default();
+        let (weak, reused, expired) = (h.weak, h.reused, h.expired);
         let part = |ui: &mut Ui, t: String| {
             ui.add_space(4.0);
             ui.label(RichText::new(t).small().color(l.muted));
@@ -1160,6 +1363,10 @@ impl App {
             for group in &reused {
                 ui.label(group.join(",  "));
             }
+            part(ui, format!("EXPIRED: {}", expired.len()));
+            for name in &expired {
+                ui.label(name);
+            }
             if let Some(found) = &*self.breached.lock().unwrap() {
                 part(ui, format!("IN KNOWN BREACHES: {}", found.len()));
                 for (name, times) in found {
@@ -1175,12 +1382,20 @@ impl App {
             }
         });
         ui.separator();
-        let how = "A breach check asks haveibeenpwned.com. Of each password \
-                   only the first 5 hex digits of its SHA-1 leave this \
-                   machine; the site cannot tell which password was meant.";
+        let how = match std::env::var_os("PASA_PWNED") {
+            Some(_) => {
+                "A breach check reads the local list PASA_PWNED names: \
+                 nothing leaves this machine."
+            }
+            None => {
+                "A breach check asks haveibeenpwned.com. Of each password \
+                 only the first 5 hex digits of its SHA-1 leave this \
+                 machine; the site cannot tell which password was meant."
+            }
+        };
         ui.label(RichText::new(how).small().color(l.muted));
-        if ui.button("Check for breaches online").clicked() {
-            v.note = "Asking haveibeenpwned.com".into();
+        if ui.button("Check for breaches").clicked() {
+            v.note = "Checking for breaches".into();
             let pws: Vec<(String, String)> = v
                 .names
                 .iter()
@@ -1255,71 +1470,104 @@ impl App {
         ui.label(RichText::new(note).small().color(l.muted));
     }
 
-    /// The entry being made or changed.
+    /// The entry being made or changed: what it is, and under Advanced
+    /// when it expires, its other fields and its files.
     fn form(&mut self, ctx: &Context, v: &mut View) {
+        let users = self.users();
         let Some(e) = &mut self.edit else { return };
         let (mut save, mut close) = (false, false);
-        let r =
-            Modal::new(Id::unique("edit")).frame(sheet(ctx)).show(ctx, |ui| {
-                ui.set_width(440.0);
-                let l = look(ui);
-                ui.heading(if e.old.is_empty() {
-                    "New entry"
-                } else {
-                    "Edit entry"
+        let r = Modal::new(Id::unique("edit")).frame(sheet(ctx)).show(ctx, |ui| {
+            ui.set_width(460.0);
+            let l = look(ui);
+            let small = |ui: &mut Ui, t: &str| {
+                ui.label(RichText::new(t).small().color(l.muted));
+            };
+            ui.horizontal(|ui| {
+                ui.heading(if e.old.is_empty() { "New entry" } else { "Edit entry" });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.selectable_value(&mut e.advanced, true, "Advanced");
+                    ui.selectable_value(&mut e.advanced, false, "Entry");
                 });
-                let title = field(
-                    ui,
-                    "Title (a / makes a group: mail/work)",
-                    &mut e.name,
-                    false,
-                );
+            });
+            if e.advanced {
+                small(ui, "Expires (YYYY-MM-DD; empty: never)");
+                ui.horizontal(|ui| {
+                    let t = TextEdit::singleline(&mut e.f.expires);
+                    ui.add(t.desired_width(140.0).margin(Margin::symmetric(8, 6)));
+                    for (text, days) in [("in 90 days", 90), ("in a year", 365)] {
+                        if ui.button(text).clicked() {
+                            e.f.expires = day(days);
+                        }
+                    }
+                    if ui.button("never").clicked() {
+                        e.f.expires.clear();
+                    }
+                });
+                small(ui, "Other fields: one a line, as  name: value");
+                let more = TextEdit::multiline(&mut e.f.more).desired_rows(5);
+                ui.add(more.desired_width(f32::INFINITY).code_editor());
+                small(ui, "Files");
+                let files = match e.old.is_empty() {
+                    true => vec![],
+                    false => v.s.files(&e.old).unwrap_or_default(),
+                };
+                for file in &files {
+                    ui.horizontal(|ui| {
+                        ui.label(file);
+                        if ui.small_button("Remove").clicked() {
+                            let at = format!("{}{}{file}", e.old, pasa::FILES);
+                            v.change(|s| {
+                                s.put(&at, b"")?;
+                                Ok(format!("{file}: removed"))
+                            });
+                        }
+                    });
+                }
+                small(ui, "Drop a file on the window, with the entry chosen, to keep it with it.");
+            } else {
+                let title = field(ui, "Title (a / makes a group: mail/work)", &mut e.name, false);
                 if e.old.is_empty() && ui.memory(|m| m.focused().is_none()) {
                     title.request_focus();
                 }
                 field(ui, "Username", &mut e.f.user, false);
-                ui.label(RichText::new("Password").small().color(l.muted));
+                // Those most entries have, to pick.
+                let fits = |u: &&String| **u != e.f.user && u.starts_with(&*e.f.user);
+                let picks: Vec<&String> = users.iter().filter(fits).take(4).collect();
+                if !picks.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        for u in picks {
+                            if ui.small_button(u).clicked() {
+                                e.f.user = u.clone();
+                            }
+                        }
+                    });
+                }
+                small(ui, "Password");
                 ui.horizontal(|ui| {
                     if ui.button("Generate").clicked() {
                         e.f.pass = self.generator.make();
                     }
-                    if ui.button(if e.show { "Hide" } else { "Show" }).clicked()
-                    {
+                    if ui.button(if e.show { "Hide" } else { "Show" }).clicked() {
                         e.show ^= true;
                     }
-                    let t =
-                        TextEdit::singleline(&mut e.f.pass).password(!e.show);
-                    ui.add(
-                        t.desired_width(f32::INFINITY)
-                            .margin(Margin::symmetric(8, 6)),
-                    );
+                    let t = TextEdit::singleline(&mut e.f.pass).password(!e.show);
+                    ui.add(t.desired_width(f32::INFINITY).margin(Margin::symmetric(8, 6)));
                 });
                 meter(ui, pasa::strength(&e.f.pass));
                 field(ui, "URL", &mut e.f.url, false);
                 field(ui, "Tags (commas between)", &mut e.f.tags, false);
-                field(
-                    ui,
-                    "One-time code: its otpauth:// address",
-                    &mut e.f.otp,
-                    false,
-                );
-                ui.label(RichText::new("Notes").small().color(l.muted));
-                ui.add(
-                    TextEdit::multiline(&mut e.f.notes)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let ok =
-                        !e.name.trim().is_empty() && !e.name.ends_with('/');
-                    save = ui
-                        .add_enabled_ui(ok, |ui| primary(ui, "Save", false))
-                        .inner
-                        .clicked();
-                    close = ui.button("Cancel").clicked();
-                });
+                field(ui, "One-time code: its otpauth:// address", &mut e.f.otp, false);
+                small(ui, "Notes");
+                let notes = TextEdit::multiline(&mut e.f.notes).desired_rows(3);
+                ui.add(notes.desired_width(f32::INFINITY));
+            }
+            ui.add_space(6.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let ok = !e.name.trim().is_empty() && !e.name.ends_with('/');
+                save = ui.add_enabled_ui(ok, |ui| primary(ui, "Save", false)).inner.clicked();
+                close = ui.button("Cancel").clicked();
             });
+        });
         if save {
             let (name, old) = (e.name.trim().to_string(), e.old.clone());
             if !old.is_empty() && old != name {
@@ -1363,7 +1611,7 @@ impl App {
         if close || r.should_close() {
             self.prefs.save();
             self.win = Win::None;
-            self.health = None;
+            (self.health, self.stats) = (None, None);
         }
     }
 

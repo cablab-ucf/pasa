@@ -20,7 +20,9 @@ use data_encoding::HEXLOWER;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
-use std::sync::{Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed};
+use std::sync::{
+    LazyLock, Mutex, atomic::AtomicUsize, atomic::Ordering::Relaxed,
+};
 use std::{fs, path::Path, path::PathBuf, time::SystemTime};
 use zeroize::Zeroizing;
 
@@ -524,27 +526,89 @@ impl Store {
         Ok(ms.first().copied().zip(ms.last().copied()))
     }
 
-    /// The entries whose password is weak (under 65 bits by [`strength`]),
-    /// with those bits; and those sharing a password, group by group.
+    /// Weak (under 65 bits by [`strength`]), shared and expired passwords.
     pub fn health(&self) -> Result<Health> {
         let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut weak = vec![];
-        for name in self.entries()?.into_keys() {
-            if name.split('/').any(|c| c.starts_with('.')) {
+        let (mut h, today) = (Health::default(), today());
+        for (name, f) in self.forms()? {
+            if !f.expires.is_empty() && f.expires < today {
+                h.expired.push(name.clone());
+            }
+            if f.pass.is_empty() {
                 continue;
             }
-            let pw =
-                Form::parse(&String::from_utf8_lossy(&self.get(&name)?)).pass;
-            if pw.is_empty() {
-                continue;
-            }
-            match strength(&pw) {
-                b if b < 65 => weak.push((name.clone(), b)),
+            match strength(&f.pass) {
+                b if b < 65 => h.weak.push((name.clone(), b)),
                 _ => {}
             }
-            by.entry(pw).or_default().push(name);
+            by.entry(f.pass).or_default().push(name);
         }
-        Ok((weak, by.into_values().filter(|n| n.len() > 1).collect()))
+        h.reused = by.into_values().filter(|n| n.len() > 1).collect();
+        Ok(h)
+    }
+
+    /// Every listed entry as its form.
+    fn forms(&self) -> Result<Vec<(String, Form)>> {
+        let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
+        let names = self.entries()?.into_keys().filter(shown);
+        let form = |n: String| {
+            let f = Form::parse(&String::from_utf8_lossy(&self.get(&n)?));
+            Ok((n, f))
+        };
+        names.map(form).collect()
+    }
+
+    /// The store in numbers: what each counts, and the count.
+    pub fn stats(&self) -> Result<Vec<(&'static str, String)>> {
+        let (forms, h) = (self.forms()?, self.health()?);
+        let versions = self.versions()?;
+        let files = versions.iter().filter(|v| v.name.contains(FILES));
+        let files = files.map(|v| &v.name).collect::<HashSet<_>>().len();
+        let bits: Vec<u32> =
+            forms.iter().map(|f| strength(&f.1.pass)).collect();
+        let graded = |lo: u32, hi: u32| {
+            bits.iter().filter(|b| (lo..hi).contains(b)).count()
+        };
+        let count =
+            |f: fn(&Form) -> bool| forms.iter().filter(|e| f(&e.1)).count();
+        let groups: HashSet<&str> = forms
+            .iter()
+            .filter_map(|f| Some(f.0.rsplit_once('/')?.0))
+            .collect();
+        let unique: HashSet<&str> = forms.iter().map(|f| &*f.1.pass).collect();
+        let size =
+            fs::read_dir(self.dir.join("v")).into_iter().flatten().flatten();
+        let size: u64 =
+            size.filter_map(|e| Some(e.metadata().ok()?.len())).sum();
+        let date = |ms: Option<u64>| {
+            let at = std::time::UNIX_EPOCH
+                + std::time::Duration::from_millis(ms.unwrap_or(0));
+            humantime::format_rfc3339_seconds(at).to_string()[..10].to_string()
+        };
+        let n = |n: usize| n.to_string();
+        let mean = bits.iter().sum::<u32>() / bits.len().max(1) as u32;
+        Ok(vec![
+            ("Entries", n(forms.len())),
+            ("Groups", n(groups.len())),
+            ("Versions kept", n(versions.len())),
+            ("Attached files", n(files)),
+            ("Size on disk", format!("{} KiB", size / 1024)),
+            ("First change", date(versions.first().map(|v| v.ms))),
+            ("Last change", date(versions.last().map(|v| v.ms))),
+            ("Different passwords", n(unique.len())),
+            (
+                "Entries sharing a password",
+                n(h.reused.iter().map(Vec::len).sum()),
+            ),
+            ("Average strength", format!("{mean} bits")),
+            ("Excellent (100 bits and up)", n(graded(100, u32::MAX))),
+            ("Good (65 to 99)", n(graded(65, 100))),
+            ("Weak (40 to 64)", n(graded(40, 65))),
+            ("Poor (under 40)", n(graded(0, 40))),
+            ("With a one-time code", n(count(|f| !f.otp.is_empty()))),
+            ("With an expiry date", n(count(|f| !f.expires.is_empty()))),
+            ("Expired", n(h.expired.len())),
+        ])
     }
 
     /// Entry `name`'s versions and their bodies, newest first.
@@ -727,73 +791,116 @@ pub fn speakable(words: usize, hyphens: bool, leet: bool) -> String {
 /// listings, so they sync, keep their history and are deleted as any other.
 pub const FILES: &str = "/.files/";
 
-/// Entries with a weak password and its bits; and those sharing one.
-pub type Health = (Vec<(String, u32)>, Vec<Vec<String>>);
+/// What a health check finds: entries whose password is weak, with its
+/// bits; those sharing a password, group by group; those past their
+/// `expires` date.
+#[derive(Default, Clone, PartialEq, Debug)]
+pub struct Health {
+    pub weak: Vec<(String, u32)>,
+    pub reused: Vec<Vec<String>>,
+    pub expired: Vec<String>,
+}
 
-/// What a guesser tries first, whatever the alphabet.
-const COMMON: [&str; 36] = [
-    "password",
-    "passwort",
-    "qwerty",
-    "qwertz",
-    "azerty",
-    "letmein",
-    "welcome",
-    "admin",
-    "login",
-    "iloveyou",
-    "dragon",
-    "monkey",
-    "master",
-    "sunshine",
-    "princess",
-    "football",
-    "baseball",
-    "shadow",
-    "superman",
-    "michael",
-    "123456789",
-    "1q2w3e",
-    "asdf",
-    "zxcv",
-    "secret",
-    "changeme",
-    "default",
-    "test",
-    "hello",
-    "trustno1",
-    "starwars",
-    "summer",
-    "winter",
-    "spring",
-    "autumn",
-    "pass",
-];
+/// What a guesser tries before letters: the 10,000 commonest passwords, by
+/// rank (SecLists, MIT), and the 7,776 words of EFF's long list (CC BY 3.0),
+/// each with the bits it is worth.
+static WORDS: LazyLock<HashMap<&'static str, f64>> = LazyLock::new(|| {
+    let eff = include_str!("words/eff.txt").lines().map(|w| (w, 12.925));
+    let rank = |(i, w)| (w, ((i + 2) as f64).log2());
+    let common = include_str!("words/common.txt").lines().enumerate().map(rank);
+    let mut m = HashMap::new();
+    for (w, bits) in eff.chain(common) {
+        let had = m.entry(w).or_insert(bits);
+        *had = bits.min(*had);
+    }
+    m
+});
 
-/// A guess at the bits in a typed password: each character counts for the
-/// alphabets used, unless it repeats or follows its neighbour (abc, 321);
-/// a common word counts as 4 bits. An estimate: only a generated password's bits are
-/// known. Under 40 is poor, under 65 weak, under 100 good.
+/// A guess at the bits in a typed password: the cheapest way to spell it
+/// from common passwords (by rank), dictionary words (13 bits; a capital
+/// or 1337 costs a little more) and single characters (by the alphabets
+/// used; one next to its neighbour, as in abc or 111, costs one bit). An
+/// estimate: only a generated password's bits are known. Under 40 is
+/// poor, under 65 weak, under 100 good.
 pub fn strength(pw: &str) -> u32 {
-    let has = |f: fn(&char) -> bool| pw.chars().any(|c| f(&c));
+    let cs: Vec<char> = pw.chars().collect();
+    let has = |f: fn(&char) -> bool| cs.iter().any(f);
     let pool = [
         (has(char::is_ascii_lowercase), 26),
         (has(char::is_ascii_uppercase), 26),
         (has(char::is_ascii_digit), 10),
-        (has(char::is_ascii_punctuation), 33),
-        (has(|c| !c.is_ascii_graphic()), 64),
+        (has(|c| c.is_ascii() && !c.is_ascii_alphanumeric()), 33),
+        (has(|c| !c.is_ascii()), 64),
     ];
     let pool: u32 = pool.iter().filter(|p| p.0).map(|p| p.1).sum();
     let each = (pool.max(1) as f64).log2();
-    let low = pw.to_lowercase();
-    let known: Vec<&str> =
-        COMMON.iter().copied().filter(|w| low.contains(w)).collect();
-    let known_len: usize = known.iter().map(|w| w.len()).max().unwrap_or(0);
-    let cs: Vec<i64> = pw.chars().map(|c| c as i64).collect();
-    let fresh = |w: &[i64]| (w[1] - w[0]).abs() > 1;
-    let fresh = 1 + cs.windows(2).filter(|w| fresh(w)).count();
-    let free = fresh.min(cs.len()).saturating_sub(known_len) as f64;
-    (free * each + 4.0 * known.len().min(1) as f64) as u32
+    let plain = |c: &char| match c {
+        '4' | '@' => 'a',
+        '3' => 'e',
+        '1' | '!' => 'i',
+        '0' => 'o',
+        '5' | '$' => 's',
+        '7' => 't',
+        c => c.to_ascii_lowercase(),
+    };
+    let mut best = vec![0.0f64; cs.len() + 1];
+    for i in 1..=cs.len() {
+        let near = i >= 2 && (cs[i - 1] as i64 - cs[i - 2] as i64).abs() <= 1;
+        best[i] = best[i - 1] + if near { 1.0 } else { each };
+        for len in 3..=i.min(24) {
+            let part = &cs[i - len..i];
+            let low: String =
+                part.iter().map(char::to_ascii_lowercase).collect();
+            let word = WORDS.get(&*low).copied().or_else(|| {
+                let undone: String = part.iter().map(plain).collect();
+                WORDS.get(&*undone).map(|bits| bits + 2.0)
+            });
+            if let Some(bits) = word {
+                let capital = part.iter().any(char::is_ascii_uppercase) as u8;
+                best[i] = best[i].min(best[i - len] + bits + capital as f64);
+            }
+        }
+    }
+    best[cs.len()] as u32
+}
+
+/// Today as YYYY-MM-DD: what an `expires` date is held against.
+pub fn today() -> String {
+    let now = humantime::format_rfc3339_seconds(SystemTime::now());
+    now.to_string()[..10].into()
+}
+
+/// How often a local copy of haveibeenpwned's passwords holds `pw`:
+/// `file` is its `HASH:COUNT` lines ordered by hash, as its downloader
+/// writes them. Nothing leaves the machine.
+pub fn pwned_file(file: &Path, pw: &str) -> Result<u64> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    let (sent, kept) = pwned_key(pw);
+    let want = format!("{sent}{kept}");
+    let mut f = BufReader::new(fs::File::open(file)?);
+    let (mut lo, mut hi) = (0, f.get_ref().metadata()?.len());
+    let mut line = String::new();
+    // The line that starts at or after the middle: before or after `want`?
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        f.seek(SeekFrom::Start(mid))?;
+        line.clear();
+        if mid > 0 {
+            f.read_line(&mut line)?;
+            line.clear();
+        }
+        let at = f.stream_position()?;
+        f.read_line(&mut line)?;
+        match line.get(..40).map(|h| h.to_ascii_uppercase().cmp(&want)) {
+            Some(std::cmp::Ordering::Equal) => {
+                let n = line[40..].trim().trim_start_matches(':');
+                return Ok(n.parse().unwrap_or(1));
+            }
+            Some(std::cmp::Ordering::Less) => lo = at + line.len() as u64,
+            _ => hi = mid,
+        }
+    }
+    Ok(0)
 }
 
 /// For haveibeenpwned's range search: the 5 hex digits of the password's
@@ -821,6 +928,10 @@ pub struct Form {
     pub otp: String,
     /// The `tags:` line: names, commas between.
     pub tags: String,
+    /// The `expires:` line: a date, YYYY-MM-DD.
+    pub expires: String,
+    /// Every other `key: value` line, as written.
+    pub more: String,
     pub notes: String,
 }
 
@@ -831,21 +942,39 @@ impl Form {
             pass: l.next().unwrap_or_default().into(),
             ..Form::default()
         };
-        let mut notes = vec![];
+        // `key: value`, the key a short name: a field of its own.
+        let named = |l: &str| {
+            let name = |c: char| c.is_ascii_alphanumeric() || " _-".contains(c);
+            l.split_once(':').is_some_and(|(k, v)| {
+                k.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && k.len() <= 32
+                    && k.chars().all(name)
+                    && (v.is_empty() || v.starts_with(' '))
+            })
+        };
+        let (mut notes, mut more, mut within) = (vec![], vec![], false);
         for l in l {
             let key = |k: &str| {
                 Some(l.strip_prefix(k)?.strip_prefix(':')?.trim().to_string())
             };
-            match (key("user"), key("url"), key("tags")) {
+            let was = std::mem::take(&mut within);
+            match (key("user"), key("url"), key("tags"), key("expires")) {
                 (Some(u), ..) if f.user.is_empty() => f.user = u,
-                (_, Some(u), _) if f.url.is_empty() => f.url = u,
-                (.., Some(t)) if f.tags.is_empty() => f.tags = t,
+                (_, Some(u), ..) if f.url.is_empty() => f.url = u,
+                (_, _, Some(t), _) if f.tags.is_empty() => f.tags = t,
+                (.., Some(e)) if f.expires.is_empty() => f.expires = e,
                 _ if l.contains("otpauth://") && f.otp.is_empty() => {
                     f.otp = l.trim().into()
+                }
+                // A field, or the rest of one that runs over lines.
+                _ if named(l) || was && l.starts_with("  ") => {
+                    more.push(l);
+                    within = true;
                 }
                 _ => notes.push(l),
             }
         }
+        f.more = more.join("\n");
         f.notes = notes.join("\n").trim_end().into();
         f
     }
@@ -858,11 +987,15 @@ impl Form {
             ("user: ", &self.user),
             ("url: ", &self.url),
             ("tags: ", &self.tags),
+            ("expires: ", &self.expires),
             ("", &self.otp),
         ] {
             if !v.trim().is_empty() {
                 t += &format!("{k}{}\n", one(v.trim()));
             }
+        }
+        if !self.more.trim().is_empty() {
+            t += &format!("{}\n", self.more.trim_end());
         }
         if !self.notes.trim().is_empty() {
             t += &format!("{}\n", self.notes.trim_end());
@@ -1099,9 +1232,11 @@ mod tests {
     fn strength_and_breaches() {
         for (pw, most) in [
             ("password1", 20),
-            ("aaaaaaaaaaaa", 5),
+            ("aaaaaaaaaaaa", 16),
             ("abcdefgh", 12),
-            ("Summer2024", 30),
+            ("Summer2024", 39),
+            ("P@ssw0rd!", 25),
+            ("correcthorse", 30),
         ] {
             assert!(strength(pw) <= most, "{pw}: {}", strength(pw));
         }
@@ -1122,19 +1257,53 @@ mod tests {
         s.put("a", b"hunter2\nuser: x\n").unwrap();
         s.put("b", b"hunter2\n").unwrap();
         s.put("c", generate(24, true).as_bytes()).unwrap();
-        let (weak, reused) = s.health().unwrap();
-        let weak: Vec<&str> = weak.iter().map(|w| &*w.0).collect();
+        let old = format!("{}\nexpires: 2020-01-01\n", generate(24, true));
+        s.put("old", old.as_bytes()).unwrap();
+        let h = s.health().unwrap();
+        let weak: Vec<&str> = h.weak.iter().map(|w| &*w.0).collect();
         assert_eq!(
-            (weak, reused),
+            (weak, h.reused),
             (vec!["a", "b"], vec![vec!["a".to_string(), "b".into()]])
         );
+        assert_eq!(h.expired, ["old"]);
+        let stats = s.stats().unwrap();
+        let of = |k: &str| stats.iter().find(|r| r.0 == k).unwrap().1.clone();
+        assert_eq!(
+            (of("Entries"), of("Different passwords"), of("Expired")),
+            ("4".into(), "3".into(), "1".into())
+        );
+        // A phrase of dictionary words is worth its words, not its letters.
+        let phrase = strength("correct horse battery staple");
+        assert!((40..80).contains(&phrase), "{phrase}");
+        // A local copy of the breach list, ordered by hash.
+        let (sent, kept) = pwned_key("hunter2");
+        let row = |i: u128| {
+            format!(
+                "{:040X}:1",
+                i.wrapping_mul(0x9E3779B97F4A7C15F39CC0605CEDC8)
+            )
+        };
+        let mut rows: Vec<String> = (1..2000).map(row).collect();
+        rows.push(format!("{sent}{kept}:7"));
+        rows.sort();
+        let list = s.dir.join("pwned");
+        fs::write(&list, rows.join("\r\n") + "\r\n").unwrap();
+        assert_eq!(pwned_file(&list, "hunter2").unwrap(), 7);
+        assert_eq!(pwned_file(&list, "not there").unwrap(), 0);
+        // The first and the last line are found too.
+        for edge in [&rows[0], &rows[rows.len() - 1]] {
+            let mut one = [edge.clone(), format!("{sent}{kept}:7")];
+            one.sort();
+            fs::write(&list, one.join("\r\n") + "\r\n").unwrap();
+            assert_eq!(pwned_file(&list, "hunter2").unwrap(), 7);
+        }
         let (made, changed) = s.times("a").unwrap().unwrap();
         assert!(made <= changed && s.times("nope").unwrap().is_none());
     }
 
     #[test]
     fn forms_round_trip() {
-        let t = "pw\nuser: ada\nfree line\nurl: https://x.org\ntags: work, mail\notpauth://totp/x?secret=JBSWY3DP\nlast\n";
+        let t = "pw\nuser: ada\nfree line\nurl: https://x.org\ntags: work, mail\nexpires: 2030-01-31\nRecovery email: a@b.c\npin: 12\n  34\notpauth://totp/x?secret=JBSWY3DP\nlast\n";
         let f = Form::parse(t);
         assert_eq!(
             (&*f.pass, &*f.user, &*f.url),
@@ -1145,6 +1314,10 @@ mod tests {
             ("otpauth://totp/x?secret=JBSWY3DP", "free line\nlast")
         );
         assert_eq!(f.tags, "work, mail");
+        assert_eq!(
+            (&*f.expires, &*f.more),
+            ("2030-01-31", "Recovery email: a@b.c\npin: 12\n  34")
+        );
         assert_eq!(Form::parse(&f.text()), f);
         assert_eq!(field(&f.text(), "user").as_deref(), Some("ada"));
         assert!(field(&f.text(), "otp").is_some());

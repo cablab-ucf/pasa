@@ -23,8 +23,10 @@ pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: c
 pasa gen NAME [N] -w [-d] [-l]  ... of N speakable words (-d: dash-ed, -l: 1337)
 pasa attach NAME FILE        keep a file with an entry
 pasa files NAME [FILE]       those files, or one, to stdout
-pasa health [--pwned]        weak and reused passwords; --pwned: and breached ones,
-                             asking haveibeenpwned.com by 5 hex digits of each SHA-1
+pasa health [--pwned]        weak, reused and expired passwords; --pwned: breached ones,
+                             from the list $PASA_PWNED names, else asking
+                             haveibeenpwned.com by 5 hex digits of each SHA-1
+pasa stats                   the store in numbers
 pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
@@ -183,9 +185,14 @@ fn generate(s: &Store, n: &str, pw: String) -> Result<String> {
     Ok(pw)
 }
 
-/// How often haveibeenpwned.com has seen `pw` in breaches. Only 5 hex
-/// digits of its SHA-1 leave, with curl; the answer is padded.
+/// How often breaches hold `pw`. With `$PASA_PWNED` a local copy of
+/// haveibeenpwned's list (ordered by hash) answers and nothing leaves;
+/// else the site is asked: only 5 hex digits of the password's SHA-1
+/// leave, with curl, and the answer is padded.
 fn pwned(pw: &str) -> Result<u64> {
+    if let Some(list) = std::env::var_os("PASA_PWNED") {
+        return pasa::pwned_file(std::path::Path::new(&list), pw);
+    }
     let (sent, kept) = pasa::pwned_key(pw);
     let url = format!("https://api.pwnedpasswords.com/range/{sent}");
     let o = Command::new("curl")
@@ -330,10 +337,12 @@ fn main() -> Result<()> {
         ["mv", from, to] => open()?.rename(from, to)?,
         ["health", ..] => {
             let s = open()?;
-            let (weak, reused) = s.health()?;
-            weak.iter()
+            let h = s.health()?;
+            h.weak
+                .iter()
                 .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
-            reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
+            h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
+            h.expired.iter().for_each(|n| println!("expired {n}"));
             for n in s.entries()?.into_keys().filter(|_| flag("--pwned")) {
                 let pw =
                     pasa::Form::parse(text(&s.get(&n)?).unwrap_or("")).pass;
@@ -341,6 +350,12 @@ fn main() -> Result<()> {
                     0 => {}
                     times => println!("pwned   {n}: in breaches {times} times"),
                 }
+            }
+            return Ok(());
+        }
+        ["stats"] => {
+            for (what, n) in open()?.stats()? {
+                println!("{what:<30}{n}");
             }
             return Ok(());
         }

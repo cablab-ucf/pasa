@@ -3,6 +3,7 @@ package com.apasa
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -72,6 +74,14 @@ import kotlinx.coroutines.launch
 data class Form(
     val pass: String = "", val user: String = "", val url: String = "",
     val otp: String = "", val notes: String = "", val tags: String = "",
+    /** A date, YYYY-MM-DD; and every other `name: value` line. */
+    val expires: String = "", val more: String = "",
+)
+
+/** Entries with a weak password and its bits; those sharing one; those past their date. */
+data class Health(
+    val weak: List<Pair<String, Int>> = listOf(), val reused: List<List<String>> = listOf(),
+    val expired: List<String> = listOf(),
 )
 
 /** A hardware key's part: none; a tap (and PIN) that opens the store beside the password; or needed with the password. */
@@ -122,8 +132,9 @@ interface Host {
     fun strength(pw: String): Int
     /** When [name] was made and last changed (ms). */
     suspend fun times(name: String): Pair<Long, Long>?
-    /** Entries with a weak password and its bits; and those sharing one. */
-    suspend fun health(): Pair<List<Pair<String, Int>>, List<List<String>>>
+    suspend fun health(): Health
+    /** The store in numbers: what each counts, and the count. */
+    suspend fun stats(): List<Pair<String, String>>
     /** How often known breaches hold [pw]: asks haveibeenpwned.com. */
     suspend fun pwned(pw: String): Long
     fun open(url: String)
@@ -408,7 +419,7 @@ private fun Store(host: Host, nav: Nav) {
     ) { pad ->
         Box(Modifier.padding(pad)) {
             when (val s = nav.screen) {
-                Screen.List -> Entries(host, nav, tick, go) { generator = true }
+                Screen.List -> Entries(host, nav, tick, copy, go) { generator = true }
                 is Screen.Entry -> Entry(host, nav, s.name, tick, copy, go)
                 is Screen.Edit -> Edit(host, nav, s.name, go)
                 is Screen.History -> History(host, nav, s.name, copy, go)
@@ -422,7 +433,7 @@ private fun Store(host: Host, nav: Nav) {
 }
 
 @Composable
-private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) -> Unit, generator: () -> Unit) {
+private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> Unit, go: (suspend () -> String) -> Unit, generator: () -> Unit) {
     var q by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
     val names by produceState(listOf<String>(), tick) { value = host.names() }
@@ -434,7 +445,7 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
     val tags = names.flatMap(tagsOf).distinct().sorted()
     val shown = names.filter { n ->
         val f = forms[n] ?: Form()
-        val hay = "$n ${f.user} ${f.url} ${f.tags}"
+        val hay = "$n ${f.user} ${f.url} ${f.tags} ${f.notes}"
         (tag.isEmpty() || tag in tagsOf(n)) && q.split(' ').all { hay.contains(it, ignoreCase = true) }
     }
     Column(Modifier.fillMaxSize()) {
@@ -469,6 +480,10 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                 color = if (t == tag) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
             )
         }
+        Text(
+            if (shown.size == names.size) "${names.size} entries" else "${shown.size} of ${names.size} entries",
+            Modifier.padding(start = 20.dp, top = 6.dp), style = MaterialTheme.typography.labelMedium, color = muted,
+        )
         if (shown.isEmpty()) Text(
             if (names.isEmpty()) "No entries yet. New adds the first." else "Nothing matches.",
             Modifier.fillMaxWidth().padding(32.dp), color = muted,
@@ -482,10 +497,31 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                     )
                 }
                 for (n in of) item(key = n) {
-                    val user = forms[n]?.user.orEmpty()
-                    Column(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }.padding(horizontal = 20.dp, vertical = 10.dp)) {
-                        Text(n.substringAfterLast('/'), style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        if (user.isNotEmpty()) Text(user, style = MaterialTheme.typography.bodyMedium, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    val f = forms[n] ?: Form()
+                    var held by remember { mutableStateOf(false) }
+                    Row(
+                        Modifier.fillMaxWidth().combinedClickable(onLongClick = { held = true }) { nav.screen = Screen.Entry(n) }
+                            .padding(horizontal = 20.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(n.substringAfterLast('/'), style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val under = listOf(f.user, f.url.substringAfter("://")).filter { it.isNotEmpty() }.joinToString("  \u00B7  ")
+                            if (under.isNotEmpty()) Text(under, style = MaterialTheme.typography.bodyMedium, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        // The password's grade, as a dot.
+                        if (f.pass.isNotEmpty()) Box(Modifier.padding(start = 12.dp).size(10.dp).background(grade(host.strength(f.pass)).second, RoundedCornerShape(5.dp)))
+                        // What can be done with an entry, under a long press.
+                        DropdownMenu(held, { held = false }) {
+                            val item = @Composable { t: String, act: () -> Unit -> DropdownMenuItem({ Text(t) }, { held = false; act() }) }
+                            if (f.user.isNotEmpty()) item("Copy username") { copy("Username", f.user) }
+                            item("Copy password") { copy("Password", f.pass) }
+                            host.code(host.text(f)).let { c -> if (c.isNotEmpty()) item("Copy one-time code") { copy("Code", c) } }
+                            if (f.url.isNotEmpty()) item("Copy URL") { copy("URL", f.url) }
+                            if (f.url.startsWith("http")) item("Open URL") { host.open(f.url) }
+                            item("Edit") { nav.screen = Screen.Edit(n) }
+                            item("History") { nav.screen = Screen.History(n) }
+                        }
                     }
                 }
             }
@@ -528,6 +564,11 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
             more = { if (f.url.startsWith("http")) TextButton({ host.open(f.url) }) { Text("Open") } },
         ) { copy("URL", f.url) }
         if (f.tags.isNotEmpty()) Shown("Tags", f.tags)
+        if (f.expires.isNotEmpty()) Shown("Expires", f.expires)
+        for (line in f.more.lines().filter { ':' in it }) {
+            val value = line.substringAfter(':').trim()
+            Shown(line.substringBefore(':'), value) { copy(line.substringBefore(':'), value) }
+        }
         if (f.notes.isNotEmpty()) Shown("Notes", f.notes)
         val files by produceState(listOf<String>(), name, tick) { value = runCatching { host.files(name) }.getOrDefault(listOf()) }
         for (file in files) Shown(
@@ -563,18 +604,49 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     var f by remember { mutableStateOf(if (old.isEmpty()) Form(pass = host.generate(nav.gen)) else Form()) }
     var show by remember { mutableStateOf(old.isEmpty()) }
     LaunchedEffect(old) { if (old.isNotEmpty()) f = host.form(host.get(old)) }
+    var advanced by remember { mutableStateOf(false) }
+    // The user names most entries have, to pick from.
+    val users by produceState(listOf<String>()) {
+        value = host.names().mapNotNull { n -> runCatching { host.form(host.get(n)).user }.getOrNull()?.takeIf { it.isNotEmpty() } }
+            .groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.map { it.key }.take(5)
+    }
     Page(if (old.isEmpty()) "New entry" else "Edit entry", nav) {
-        Field(name, { name = it }, "Title (a / makes a group: mail/work)")
-        Field(f.user, { f = f.copy(user = it) }, "Username")
-        Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = !show) {
-            TextButton({ show = !show }) { Text(if (show) "Hide" else "Show") }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Way("Entry", !advanced) { advanced = false }
+            Way("Advanced", advanced) { advanced = true }
         }
-        Meter(host.strength(f.pass))
-        OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show = true }) { Text("Generate a password") }
-        Field(f.url, { f = f.copy(url = it) }, "URL")
-        Field(f.tags, { f = f.copy(tags = it) }, "Tags (commas between)")
-        Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address")
-        Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3)
+        if (advanced) {
+            Field(f.expires, { f = f.copy(expires = it) }, "Expires (YYYY-MM-DD; empty: never)")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                val day = { days: Long -> java.text.SimpleDateFormat("yyyy-MM-dd").format(java.util.Date(System.currentTimeMillis() + days * 86_400_000)) }
+                OutlinedButton({ f = f.copy(expires = day(90)) }) { Text("In 90 days") }
+                OutlinedButton({ f = f.copy(expires = day(365)) }) { Text("In a year") }
+                TextButton({ f = f.copy(expires = "") }) { Text("Never") }
+            }
+            Field(f.more, { f = f.copy(more = it) }, "Other fields: one a line, as  name: value", lines = 5)
+            Text("Files are attached and removed on the entry's own screen.", style = MaterialTheme.typography.bodySmall, color = muted)
+        } else {
+            Field(name, { name = it }, "Title (a / makes a group: mail/work)")
+            Field(f.user, { f = f.copy(user = it) }, "Username")
+            val picks = users.filter { it != f.user && it.startsWith(f.user) }.take(4)
+            if (picks.isNotEmpty()) Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (u in picks) Text(
+                    u, Modifier.background(MaterialTheme.colorScheme.surface, RoundedCornerShape(16.dp))
+                        .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+                        .clickable { f = f.copy(user = u) }.padding(horizontal = 12.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
+            Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = !show) {
+                TextButton({ show = !show }) { Text(if (show) "Hide" else "Show") }
+            }
+            Meter(host.strength(f.pass))
+            OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show = true }) { Text("Generate a password") }
+            Field(f.url, { f = f.copy(url = it) }, "URL")
+            Field(f.tags, { f = f.copy(tags = it) }, "Tags (commas between)")
+            Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address")
+            Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3)
+        }
         Primary("Save", enabled = name.isNotBlank() && !name.endsWith("/")) {
             val (to, text) = name.trim() to host.text(f)
             go {
@@ -645,11 +717,24 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, clos
 /** Weak, shared and, if asked, breached passwords. */
 @Composable
 private fun Health(host: Host, nav: Nav) {
-    val found by produceState<Pair<List<Pair<String, Int>>, List<List<String>>>?>(null) { value = runCatching { host.health() }.getOrNull() }
+    val found by produceState<Health?>(null) { value = runCatching { host.health() }.getOrNull() }
+    val stats by produceState(listOf<Pair<String, String>>()) { value = runCatching { host.stats() }.getOrDefault(listOf()) }
+    var numbers by remember { mutableStateOf(false) }
     var breached by remember { mutableStateOf<List<Pair<String, Long>>?>(null) }
     val (busy, err, go) = rememberJob()
     Page("Password health", nav) {
-        val (weak, reused) = found ?: (listOf<Pair<String, Int>>() to listOf())
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Way("Health", !numbers) { numbers = false }
+            Way("Statistics", numbers) { numbers = true }
+        }
+        if (numbers) {
+            for ((what, n) in stats) Row {
+                Text(what, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                Text(n, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+            }
+            return@Page
+        }
+        val (weak, reused, expired) = found ?: Health()
         Label("WEAK: ${weak.size}")
         for ((n, bits) in weak) Row(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, verticalAlignment = Alignment.CenterVertically) {
             Text(n, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
@@ -658,6 +743,9 @@ private fun Health(host: Host, nav: Nav) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("SHARED BY SEVERAL ENTRIES: ${reused.size}")
         for (g in reused) Text(g.joinToString(",  "), style = MaterialTheme.typography.bodyLarge)
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Label("EXPIRED: ${expired.size}")
+        for (n in expired) Text(n, Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, style = MaterialTheme.typography.bodyLarge)
         breached?.let { hits ->
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Label("IN KNOWN BREACHES: ${hits.size}")

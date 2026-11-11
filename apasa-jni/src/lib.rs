@@ -293,7 +293,8 @@ pub extern "system" fn Java_com_apasa_Native_times<'l>(
 }
 
 /// Weak passwords as `weak`, tab, name, tab, bits; shared ones as
-/// `reused`, then the names, tabs between: a line each.
+/// `reused`, then the names, tabs between; expired ones as `expired`,
+/// tab, name: a line each.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_health<'l>(
     mut env: EnvUnowned<'l>,
@@ -301,10 +302,28 @@ pub extern "system" fn Java_com_apasa_Native_health<'l>(
     h: jlong,
 ) -> JString<'l> {
     run(&mut env, |e| {
-        let (weak, reused) = with(h, |s| s.health())?;
-        let weak = weak.iter().map(|(n, b)| format!("weak\t{n}\t{b}"));
-        let reused = reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
-        Ok(e.new_string(weak.chain(reused).collect::<Vec<_>>().join("\n"))?)
+        let h = with(h, |s| s.health())?;
+        let weak = h.weak.iter().map(|(n, b)| format!("weak\t{n}\t{b}"));
+        let reused =
+            h.reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
+        let expired = h.expired.iter().map(|n| format!("expired\t{n}"));
+        let all: Vec<String> = weak.chain(reused).chain(expired).collect();
+        Ok(e.new_string(all.join("\n"))?)
+    })
+}
+
+/// The store in numbers: what each counts, a tab, the count; a line each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_stats<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let rows = with(h, |s| s.stats())?;
+        let rows: Vec<String> =
+            rows.iter().map(|(what, n)| format!("{what}\t{n}")).collect();
+        Ok(e.new_string(rows.join("\n"))?)
     })
 }
 
@@ -432,8 +451,8 @@ pub extern "system" fn Java_com_apasa_Native_keep<'l>(
     })
 }
 
-/// An entry's text as its form: password, user, url, otpauth URI, tags
-/// and notes, U+001F between them.
+/// An entry's text as its form: password, user, url, otpauth URI, tags,
+/// expiry date, other fields and notes, U+001F between them.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_form<'l>(
     mut env: EnvUnowned<'l>,
@@ -442,7 +461,8 @@ pub extern "system" fn Java_com_apasa_Native_form<'l>(
 ) -> JString<'l> {
     run(&mut env, |e| {
         let f = pasa::Form::parse(&body.to_string());
-        let all = [f.pass, f.user, f.url, f.otp, f.tags, f.notes];
+        let all =
+            [f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes];
         Ok(e.new_string(all.join("\u{1f}"))?)
     })
 }
@@ -456,7 +476,7 @@ pub extern "system" fn Java_com_apasa_Native_text<'l>(
 ) -> JString<'l> {
     run(&mut env, |e| {
         let s = form.to_string();
-        let mut p = s.splitn(6, '\u{1f}').map(String::from);
+        let mut p = s.splitn(8, '\u{1f}').map(String::from);
         let mut next = || p.next().unwrap_or_default();
         let f = pasa::Form {
             pass: next(),
@@ -464,6 +484,8 @@ pub extern "system" fn Java_com_apasa_Native_text<'l>(
             url: next(),
             otp: next(),
             tags: next(),
+            expires: next(),
+            more: next(),
             notes: next(),
         };
         Ok(e.new_string(f.text())?)

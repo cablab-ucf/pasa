@@ -39,14 +39,29 @@ theme). An entry is still the text `pass` reads: the form writes `user:`
 and `url:` lines. Both also show an entry's history (each version, with a
 way back) and its files.
 
-Both also have: a `tags: a, b` line to filter by; a search through names,
-users, addresses and tags; when an entry was made and changed; a bar that
-fills and turns from red to green as a typed password's bits grow (an
-estimate: under 40 poor, under 65 weak, under 100 good); and a health
-check for weak and shared passwords (`pasa health`). `--pwned`, or the
-button, also asks haveibeenpwned.com which passwords breaches hold: of
-each, only the first 5 hex digits of its SHA-1 leave the machine, and
-the answer is padded. Nothing is asked unless you ask.
+Both also have: a `tags: a, b` line to filter by; an `expires:` date; any
+other `name: value` line as a field of its own (the form's Advanced tab);
+a search through names, users, addresses, tags and notes, with how many
+of how many entries show; a table whose columns you choose (user, address,
+tags, strength, expiry, files, last change, notes: right-click its
+header); what can be done with an entry under a right-click or a long
+press; the user names most entries have, to pick when making one; and when
+an entry was made and changed.
+
+A bar fills and turns from red to green as a typed password's bits grow
+(under 40 poor, under 65 weak, under 100 good). The bits are the cheapest
+way to spell it from the 10,000 commonest passwords by rank, the 7,776
+words of EFF's list at 13 bits each, and single characters: an estimate,
+only a generated password's bits being known (`src/words/README`).
+
+A health check lists weak, shared and expired passwords, and the store in
+numbers (`pasa health`, `pasa stats`). `--pwned`, or the button, also
+finds those breaches hold. With `PASA_PWNED` naming a local copy of
+haveibeenpwned's list, ordered by hash as its downloader writes it (tens
+of gigabytes: for a desk, not a phone), that file answers and nothing
+leaves. Without it the site is asked: of each password only the first 5
+hex digits of its SHA-1 leave the machine, and the answer is padded.
+Nothing is asked unless you ask.
 
 A file kept with an entry (`pasa attach NAME FILE`, or dropped on the
 window) is an entry of its own, `NAME/.files/FILE`, hidden from listings:

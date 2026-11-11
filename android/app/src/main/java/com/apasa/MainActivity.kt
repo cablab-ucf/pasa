@@ -145,12 +145,13 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun put(name: String, body: String) = changed { Native.put(handle, name, body) }
 
-    override fun form(body: String) = Native.form(body).split('\u001f', limit = 6).let {
+    override fun form(body: String) = Native.form(body).split('\u001f', limit = 8).let {
         val at = { i: Int -> it.getOrElse(i) { "" } }
-        Form(at(0), at(1), at(2), at(3), at(5), at(4))
+        Form(at(0), at(1), at(2), at(3), at(7), at(4), at(5), at(6))
     }
 
-    override fun text(f: Form) = Native.text(listOf(f.pass, f.user, f.url, f.otp, f.tags, f.notes).joinToString("\u001f"))
+    override fun text(f: Form) =
+        Native.text(listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f"))
     override fun strength(pw: String) = Native.strength(pw)
 
     override suspend fun times(name: String) = io {
@@ -159,8 +160,14 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun health() = io {
         val rows = lines(Native.health(handle)).map { it.split('\t') }
-        rows.filter { it[0] == "weak" }.map { it[1] to it[2].toInt() } to rows.filter { it[0] == "reused" }.map { it.drop(1) }
+        Health(
+            rows.filter { it[0] == "weak" }.map { it[1] to it[2].toInt() },
+            rows.filter { it[0] == "reused" }.map { it.drop(1) },
+            rows.filter { it[0] == "expired" }.map { it[1] },
+        )
     }
+
+    override suspend fun stats() = io { lines(Native.stats(handle)).map { it.substringBefore('\t') to it.substringAfter('\t') } }
 
     /** Only 5 hex digits of the password's SHA-1 leave the phone; the answer is padded. */
     override suspend fun pwned(pw: String) = io {

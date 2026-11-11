@@ -26,6 +26,7 @@ object Native {
     external fun strength(pw: String): Int
     external fun times(h: Long, name: String): String
     external fun health(h: Long): String
+    external fun stats(h: Long): String
     external fun pwnedKey(pw: String): String
     external fun pwnedCount(kept: String, text: String): Long
     external fun form(body: String): String
