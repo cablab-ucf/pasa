@@ -197,7 +197,7 @@ class MainActivity : ComponentActivity(), Host {
     }
     override fun code(body: String) = Native.field(body, "otp")
     override fun generate(g: Gen) =
-        if (g.words) Native.speakable(g.count, g.hyphens, g.leet) else Native.generate(g.len, g.symbols)
+        if (g.words) Native.speakable(g.count, g.seps, g.leet) else Native.generate(g.len, g.symbols)
 
     override suspend fun remove(name: String) = changed { Native.remove(handle, name) }
     override suspend fun rename(from: String, to: String) = changed { Native.rename(handle, from, to) }

@@ -212,33 +212,39 @@ struct Generator {
     len: usize,
     symbols: bool,
     count: usize,
-    hyphens: bool,
+    /// What may stand between two words: one of these.
+    seps: &'static str,
     leet: bool,
     pw: Zeroizing<String>,
+    /// `pw` as it was made: changed by hand, its bits are an estimate.
+    made: Zeroizing<String>,
 }
 
 impl Default for Generator {
     fn default() -> Generator {
         let pw = Zeroizing::new(pasa::generate(24, true));
         let (len, count) = (24, 4);
-        let (words, symbols, hyphens, leet) = (false, true, false, false);
-        Generator { words, len, symbols, count, hyphens, leet, pw }
+        let (words, symbols, seps, leet) = (false, true, "", false);
+        let made = pw.clone();
+        Generator { words, len, symbols, count, seps, leet, pw, made }
     }
 }
 
 impl Generator {
     fn make(&self) -> String {
         match self.words {
-            true => pasa::speakable(self.count, self.hyphens, self.leet),
+            true => pasa::speakable(self.count, self.seps, self.leet),
             false => pasa::generate(self.len, self.symbols),
         }
     }
 
-    /// The bits of chance in what [`Generator::make`] gives.
+    /// The bits of chance in the password: as made, what went into it;
+    /// changed by hand, an estimate.
     fn bits(&self) -> u32 {
         let abc: f64 = if self.symbols { 80.0 } else { 62.0 };
         match self.words {
-            true => 22 * self.count as u32,
+            _ if *self.pw != *self.made => pasa::strength(&self.pw),
+            true => pasa::speakable_bits(self.count, self.seps),
             false => (self.len as f64 * abc.log2()) as u32,
         }
     }
@@ -295,6 +301,9 @@ struct App {
     armed: bool,
     edit: Option<Edit>,
     win: Win,
+    /// In History: the version looked at, the one it is compared with,
+    /// and whether passwords show.
+    hist: (usize, usize, bool),
     generator: Generator,
     device: String,
     pairing: Option<Pairing>,
@@ -634,7 +643,7 @@ impl App {
                 meter_to(ui, bits, 256);
             }
             if ui.button("Generate one and show it").clicked() {
-                let pw = Zeroizing::new(pasa::speakable(12, true, false));
+                let pw = Zeroizing::new(pasa::speakable(12, "-", false));
                 (self.pw, self.pw2) = (pw.clone(), pw.clone());
                 self.made = (pw, 12 * 22);
             }
@@ -1179,7 +1188,9 @@ impl App {
             v.at = at;
             match what {
                 "edit" => self.edit_entry(&v),
-                "history" => self.win = Win::History,
+                "history" => {
+                    (self.win, self.hist) = (Win::History, (0, 0, false))
+                }
                 "open" => open_url(&self.meta(&v, at).url.clone()),
                 "delete" => {
                     self.armed = true;
@@ -1267,7 +1278,7 @@ impl App {
                     self.armed ^= true;
                 }
                 if ui.button("History").clicked() {
-                    self.win = Win::History;
+                    (self.win, self.hist) = (Win::History, (0, 0, false));
                 }
                 if ui.button("Edit").clicked() {
                     self.edit_entry(v);
@@ -1505,16 +1516,25 @@ impl App {
         ui.heading("History");
         ui.label(RichText::new(&name).color(l.muted));
         let all = v.s.history(&name).unwrap_or_default();
-        ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+        let last = all.len().saturating_sub(1);
+        let (mut a, mut b, mut show) = self.hist;
+        (a, b) = (a.min(last), b.min(last));
+        let stamp = |i: usize| {
+            let ms = all.get(i).map_or(0, |v| v.0);
+            let at = UNIX_EPOCH + Duration::from_millis(ms);
+            let at = humantime::format_rfc3339_seconds(at).to_string();
+            at.trim_end_matches('Z').replace('T', "  ")
+        };
+        let rows = ScrollArea::vertical().id_salt("versions").max_height(190.0);
+        rows.show(ui, |ui| {
             Grid::new("history").num_columns(3).spacing([14.0, 8.0]).show(
                 ui,
                 |ui| {
-                    for (i, (ms, body)) in all.iter().enumerate() {
-                        let at = UNIX_EPOCH + Duration::from_millis(*ms);
-                        let at = humantime::format_rfc3339_seconds(at);
-                        let at = at.to_string().replace('T', "  ");
+                    for (i, (_, body)) in all.iter().enumerate() {
                         let f = Form::parse(&String::from_utf8_lossy(body));
-                        ui.label(at.trim_end_matches('Z'));
+                        if ui.selectable_label(i == a, stamp(i)).clicked() {
+                            a = i;
+                        }
                         let what = match (i, body.is_empty()) {
                             (0, false) => "now".into(),
                             (_, true) => "deleted".into(),
@@ -1522,6 +1542,11 @@ impl App {
                         };
                         ui.label(RichText::new(what).color(l.muted));
                         ui.horizontal(|ui| {
+                            let with = ui.selectable_label(i == b, "Compare");
+                            if with.on_hover_text("Compare with this").clicked()
+                            {
+                                b = i;
+                            }
                             if body.is_empty() {
                                 return;
                             }
@@ -1542,7 +1567,56 @@ impl App {
                 },
             );
         });
-        let note = "Nothing is ever overwritten: each change is a new version.";
+        // The version looked at, as it was; against another, the older's
+        // lines that went (-) and the newer's that came (+).
+        if let (Some(x), Some(y)) = (all.get(a), all.get(b)) {
+            ui.separator();
+            let (old, new) = if a >= b { (a, b) } else { (b, a) };
+            ui.horizontal(|ui| {
+                ui.strong(match a == b {
+                    true => format!("As it was at {}", stamp(a)),
+                    false => format!("{}  to  {}", stamp(old), stamp(new)),
+                });
+                ui.checkbox(&mut show, "Show passwords");
+            });
+            let (x, y) = if a >= b { (x, y) } else { (y, x) };
+            let x = Form::parse(&String::from_utf8_lossy(&x.1));
+            let y = Form::parse(&String::from_utf8_lossy(&y.1));
+            let lines =
+                ScrollArea::vertical().id_salt("diff").max_height(230.0);
+            lines.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for ((field, was), (_, is)) in
+                    x.fields().into_iter().zip(y.fields())
+                {
+                    if was.is_empty() && is.is_empty() {
+                        continue;
+                    }
+                    ui.label(RichText::new(field).small().color(l.muted));
+                    let line =
+                        |ui: &mut Ui, mark: &str, t: &str, c: Color32| {
+                            let t = match field == "Password" && !show {
+                                true => "\u{2022}".repeat(8),
+                                false => t.to_string(),
+                            };
+                            let t = format!("{mark} {t}");
+                            ui.label(RichText::new(t).monospace().color(c));
+                        };
+                    let gone =
+                        was.lines().filter(|w| !is.lines().any(|i| i == *w));
+                    gone.for_each(|w| line(ui, "-", w, l.bad));
+                    for i in is.lines() {
+                        match was.lines().any(|w| w == i) {
+                            true => line(ui, " ", i, l.text),
+                            false => line(ui, "+", i, l.accent),
+                        }
+                    }
+                }
+            });
+        }
+        self.hist = (a, b, show);
+        let note = "Click a date to see that version; Compare sets what it \
+                    is compared with. Nothing is ever overwritten.";
         ui.label(RichText::new(note).small().color(l.muted));
     }
 
@@ -1698,7 +1772,10 @@ impl App {
         let f = Frame::new().fill(l.bg).corner_radius(8).inner_margin(12);
         f.show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(&**g.pw).monospace().size(16.0));
+            let t = TextEdit::singleline(&mut *g.pw).frame(Frame::NONE);
+            ui.add(
+                t.font(FontId::monospace(16.0)).desired_width(f32::INFINITY),
+            );
         });
         meter(ui, g.bits());
         let mut again = false;
@@ -1719,9 +1796,34 @@ impl App {
                 let n = Slider::new(&mut g.count, 3..=8).text("words");
                 again |= ui.add(n).changed();
                 ui.horizontal(|ui| {
-                    again |=
-                        ui.checkbox(&mut g.hyphens, "with-dashes").changed();
-                    again |= ui.checkbox(&mut g.leet, "1337").changed();
+                    let between = [
+                        ("", "Nothing: CapitalWords"),
+                        ("-", "A dash"),
+                        (".", "A period"),
+                        ("_", "An underscore"),
+                        ("-_.", "A dash, underscore or period"),
+                        (pasa::SEPS, "Any symbol"),
+                    ];
+                    let now = between.iter().find(|b| b.0 == g.seps);
+                    let now = now.map_or("", |b| b.1);
+                    ui.label("Between words");
+                    ComboBox::from_id_salt("seps").selected_text(now).show_ui(
+                        ui,
+                        |ui| {
+                            for (seps, name) in between {
+                                let r = ui.selectable_value(
+                                    &mut g.seps,
+                                    seps,
+                                    name,
+                                );
+                                again |= r.clicked();
+                            }
+                        },
+                    );
+                    let leet = ui.checkbox(&mut g.leet, "1337");
+                    again |= leet
+                        .on_hover_text("Some letters as @ 3 1 0 $ 7")
+                        .changed();
                 });
             }
             false => {
@@ -1743,8 +1845,10 @@ impl App {
         });
         if again {
             g.pw = Zeroizing::new(g.make());
+            g.made = g.pw.clone();
         }
-        let note = "New entries start with a password made this way.";
+        let note = "Change it by hand and its bits are counted again. New \
+                    entries start with a password made this way.";
         ui.label(RichText::new(note).small().color(l.muted));
     }
 
