@@ -75,7 +75,8 @@ syllables only, so the bits counted are the bits there.
 
 Both browsers lock when left alone (5 minutes; the window's is a setting),
 sync as the command line does, and copy through `wl-copy`, `xclip` or
-`pbcopy`. The window needs
+`pbcopy`. Ctrl+Q closes the window; on Wayland without server-side frames
+(GNOME) it draws its own. The window needs
 libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 
 ## Files
@@ -150,18 +151,29 @@ ciphertext, and learns when you change things. A version deleted from
 ## Sync
 
 ```sh
-pasa pair phone        # here: a code and pairing password (--qr: offline)
-pasa join home CODE    # there
+pasa pair phone --qr   # here: a QR code (offline) and its password; serves until phone has synced
+pasa join home CODE    # there (the apps scan it): dials here
 pasa serve             # accept syncs; wake listening peers on news
 pasa listen            # sync when woken, through pushir's daemon (laptops)
-pasa sync              # with every peer that serves, all at once (also after each change)
+pasa sync              # with every peer, all at once (also after each change)
 ```
+
+One device shows a code, the other scans or types it; either may hold the
+store. The one showing it serves, the other dials. The window serves while
+it is open and the Android app while it is on the screen; a QR code never
+goes online, a short code (`pair` without `--qr`, for a device with no
+camera) meets once at the relay under a PAKE. A device without a store
+takes it at the first sync and asks for its password; a phone with the
+store so fills a new desktop by scanning what the desktop shows.
 
 Pairing hands over, through [pairir](https://github.com/cablab-ucf/pairir),
 this device's endpoint, fresh transport and hand-over keys, and the key
-file, still sealed to the password and YubiKey: the only way store keys
-travel, but for hand-overs below. Both sides unlock to pair, so the
-hand-over key goes straight into `dev`: it is never on disk unsealed.
+file if there is one, still sealed to the password and YubiKey: the only
+way store keys travel, with the swap's below and the hand-overs. Each swap
+tells the other device where this one serves, so after the first, either
+dials the other. The hand-over key goes into `dev` at once, or at the
+unlock after the store arrives: it is never on disk unsealed. A device
+not met yet, or not reached in 15 s, is said, not waited on.
 
 | Layer | Holds if the others fall |
 |---|---|
@@ -171,12 +183,13 @@ hand-over key goes straight into `dev`: it is never on disk unsealed.
 
 `serve` (`contrib/pasa-serve.service` confines it) reads and writes age
 files, its endpoint key and the pairings: taking it over yields
-ciphertext. Dialers use throwaway endpoints. Received files must match
+ciphertext. One process serves a store at a time (a lock on the endpoint
+key): the window and a daemon would take each other's place at the relay. Dialers use throwaway endpoints. Received files must match
 their names, be asked for, and be under 16 MiB; strays in `v/` are
 ignored.
 
-A wake (after a change here, never otherwise) is an empty message to a
-peer's lane, through [pushir](https://github.com/cablab-ucf/pushir), which
+A wake (after a change here, or Sync now; never otherwise) is an empty
+message to a peer's lane, through [pushir](https://github.com/cablab-ucf/pushir), which
 seals it: the relay sees a mailbox and 1024 random-looking bytes. It says
 "sync" and nothing else, so one lost, repeated or forged by a peer costs a
 sync at most; a device also syncs when its connection comes back. Every
@@ -187,7 +200,9 @@ to it within a quarter of an hour, the Android app when it next starts).
 `revoke NAME` ends the pairing, marks the device's id revoked and rotates
 the store key: every entry is sealed again to a new key, which reaches the
 other peers at their next sync as an age file to their pairing's hand-over
-key, with the revoked ids, so none passes it on. Revoke on every device it
+key hashed with the store's first key, with the revoked ids, so none passes
+it on. What a pairing carries (a QR code and its password, say) so neither
+opens nor forges a hand-over: that takes the store's password too. Revoke on every device it
 paired with. It keeps what it had: change the passwords it held.
 `forget NAME` ends a pairing alone.
 

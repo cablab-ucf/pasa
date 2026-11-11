@@ -13,7 +13,7 @@ members = ["kdbx2pasa", "apasa-jni"]
 default = ["sync", "tui"]
 sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode"]
 tui = ["dep:crossterm"]
-gui = ["dep:eframe", "sync"]
+gui = ["dep:eframe", "dep:winit", "sync"]
 
 [dependencies]
 anyhow = "1"
@@ -33,10 +33,12 @@ irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "7a19e4aeac4b563656
 pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "3e91f07d51eb6b08cd807640b4edc10cde16b716", optional = true }
 pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "6e7faa92e6732834db30e8a67fc439f5cb333132", optional = true }
 iroh = { version = "1.4", default-features = false, optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
+# The frame (close, minimise, maximise) that GNOME on Wayland leaves to the app.
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"], optional = true }
 
 [profile.release]
 lto = true

@@ -76,6 +76,7 @@ class MainActivity : ComponentActivity(), Host {
 
     override fun onStop() {
         super.onStop()
+        here(false)
         keySecret?.fill(0)
         keySecret = null
         answer?.fill(0)
@@ -87,6 +88,21 @@ class MainActivity : ComponentActivity(), Host {
     override fun onStart() {
         super.onStart()
         main.removeCallbacks(locker)
+        here(sync)
+    }
+
+    /** What syncs bring shows at once: a version is a file moved into v/. */
+    override var news by mutableStateOf(0)
+    private var watch: android.os.FileObserver? = null
+
+    /** On the screen with sync on: paired devices dial here; off it, none do. */
+    @Suppress("DEPRECATION") // FileObserver(File) is API 29; this app runs from 26.
+    private fun here(on: Boolean) {
+        Native.serve(dir, on)
+        watch?.stopWatching()
+        watch = if (!on) null else object : android.os.FileObserver(File(dir, "v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
+            override fun onEvent(event: Int, path: String?) { main.post { news++ } }
+        }.apply { startWatching() }
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -111,6 +127,7 @@ class MainActivity : ComponentActivity(), Host {
         set(on) {
             getSharedPreferences("pasa", 0).edit().putBoolean("sync", on).apply()
             if (on) push(this)
+            here(on)
         }
 
     private var quickNow by mutableStateOf<Boolean?>(null)
@@ -331,5 +348,5 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun syncNow() = io { Native.sync(dir, false) }
     override suspend fun peers() = io { lines(Native.peers(dir)) }
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
-    override suspend fun pair(name: String) = io { lines(Native.pair(handle, name)).let { it[0] to it[1] } }
+    override suspend fun pair(name: String, qr: Boolean) = io { lines(Native.pair(handle, name, qr)).let { it[0] to it[1] } }
 }

@@ -4,21 +4,28 @@
 //! pairing's key (irnet::psk: HPKE over X-Wing inside TLS 1.3). A wake is
 //! an empty message to a peer's pushir lane: it says sync, nothing more.
 //!
+//! A device serves while pasa is open there; each swap tells the peer
+//! where, so either side dials the other. The one showing a pairing code
+//! serves, the one taking it dials, and either may hold the store: a swap
+//! hands the key file (sealed to the password) to a device without one.
+//!
 //! After a rotation the new store keys travel as an age file to a
 //! hand-over key each pairing shares, kept only in the devices' sealed
-//! `dev`; with them, the ids of revoked devices, so none passes keys on.
+//! `dev`, bound to the store's first key; with them, the ids of revoked
+//! devices, so none passes keys on.
 
 use crate::{MAX, Store, is_name, name_of, open, rand, seal, write};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use data_encoding::HEXLOWER;
 use irnet::psk::{Rx, Tx};
 use iroh::{EndpointAddr, PublicKey, RelayUrl, SecretKey, TransportAddr};
 use pushir::Lane;
+use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fs, path::Path, time::Duration};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-const ALPN: &[u8] = b"pasa/4";
+const ALPN: &[u8] = b"pasa/5";
 
 /// A pairing: its transport key, the peer's endpoint if it serves, its
 /// pushir lane if it listens, its device id once it said.
@@ -132,8 +139,17 @@ pub fn revoke(s: &mut Store, name: &str) -> Result<()> {
     hand(s)
 }
 
+/// A pairing's hand-over key bound to the store's first key: what a
+/// pairing's secrets alone (a QR code and its password) neither open nor
+/// forge. Every device of a store holds its first key.
+fn bound(hand: &[u8], s: &Store) -> Zeroizing<Vec<u8>> {
+    let first = s.keys().last().map_or(&[][..], |k| &k[..]);
+    let h = Sha256::new().chain_update(b"pasa hand-over\0").chain_update(hand);
+    Zeroizing::new(h.chain_update(first).finalize().to_vec())
+}
+
 /// For every peer: the store keys and the revoked device ids, sealed to
-/// that pairing's hand-over key.
+/// that pairing's hand-over key, bound.
 pub fn hand(s: &Store) -> Result<()> {
     let keys: Vec<u8> =
         s.keys().iter().flat_map(|k| k.iter().copied()).collect();
@@ -143,7 +159,7 @@ pub fn hand(s: &Store) -> Result<()> {
         [&[s.keys().len() as u8][..], &keys, r.as_bytes()].concat(),
     );
     for (name, k) in &s.hands {
-        write(&s.dir.join("give").join(name), &seal(k, &msg)?)?;
+        write(&s.dir.join("give").join(name), &seal(&bound(k, s), &msg)?)?;
     }
     Ok(())
 }
@@ -155,7 +171,8 @@ pub fn adopt(s: &mut Store) -> Result<()> {
         let p = e?.path();
         let b = fs::read(&p)?;
         fs::remove_file(&p)?;
-        let Some(m) = s.hands.values().find_map(|k| open(k, &b)) else {
+        let Some(m) = s.hands.values().find_map(|k| open(&bound(k, s), &b))
+        else {
             continue;
         };
         let n = *m.first().context("empty hand-over")? as usize;
@@ -204,23 +221,35 @@ fn ep() -> Result<iroh::endpoint::Builder> {
     Ok(irnet::on(&[relay()?]))
 }
 
-/// What a swap learnt of the peer, and how many versions it took.
-type Swapped = (Option<Lane>, Option<String>, usize);
+/// What a swap learnt of the peer (lane, device id, endpoint), and how
+/// many versions it took.
+type Swapped = (Option<Lane>, Option<String>, Option<PublicKey>, usize);
 
-/// Swap lanes, device ids and hand-overs, then the versions each lacks.
+/// Swap lanes, device ids, endpoints, key files and hand-overs, then the
+/// versions each lacks. A device without a store keeps the key file it is
+/// given: the store keys, sealed to the password, as a pairing hands them.
 async fn swap(
     dir: &Path,
     peer: &str,
     mut tx: Tx,
     mut rx: Rx,
 ) -> Result<Swapped> {
-    tx.send(&fs::read(dir.join("mailbox")).unwrap_or_default()).await?;
+    let read = |f: &Path| fs::read(f).unwrap_or_default();
+    tx.send(&read(&dir.join("mailbox"))).await?;
     tx.send(device(dir)?.as_bytes()).await?;
-    tx.send(&fs::read(dir.join("give").join(peer)).unwrap_or_default()).await?;
+    tx.send(key(dir, "node")?.public().as_bytes()).await?;
+    tx.send(&read(&dir.join("key"))).await?;
+    tx.send(&read(&dir.join("give").join(peer))).await?;
     let theirs = String::from_utf8(rx.recv(1024).await?).ok();
     let theirs = theirs.and_then(|l| l.parse().ok());
     let dev =
         String::from_utf8(rx.recv(32).await?).ok().filter(|d| d.len() == 32);
+    let id = <[u8; 32]>::try_from(&rx.recv(32).await?[..]).ok();
+    let id = id.and_then(|b| PublicKey::from_bytes(&b).ok());
+    let file = rx.recv(64 << 10).await?;
+    if !file.is_empty() && !dir.join("key").exists() {
+        write(&dir.join("key"), &file)?;
+    }
     let keys = rx.recv(64 << 10).await?;
     if !keys.is_empty() {
         write(&dir.join("take").join(name_of(&keys)), &keys)?;
@@ -265,7 +294,7 @@ async fn swap(
     };
     let (g, t) = tokio::join!(give, take);
     g?;
-    Ok((theirs, dev, t?))
+    Ok((theirs, dev, id, t?))
 }
 
 /// Keep what a swap learnt of `name`.
@@ -274,13 +303,15 @@ fn learnt(
     name: &str,
     lane: Option<Option<Lane>>,
     dev: Option<String>,
+    id: Option<PublicKey>,
 ) {
     let mut ps = peers(dir);
     let Some(p) = ps.iter_mut().find(|p| p.name == name) else { return };
-    let before = (p.lane.clone(), p.device.clone());
+    let before = (p.lane.clone(), p.device.clone(), p.id);
     p.lane = lane.unwrap_or(p.lane.take());
     p.device = dev.or(p.device.take());
-    if before != (p.lane.clone(), p.device.clone()) {
+    p.id = id.or(p.id);
+    if before != (p.lane.clone(), p.device.clone(), p.id) {
         let _ = save(dir, &ps);
     }
 }
@@ -309,61 +340,92 @@ async fn wake(dir: &Path, except: &str) {
     while all.join_next().await.is_some() {}
 }
 
-/// Sync with every peer that serves, all at once (one that is away costs
-/// its 30 s once, not once each); with `news` (a change here), then wake
-/// those that listen.
+/// Sync with every peer whose endpoint is known, all at once (one that is
+/// away costs its 15 s once, not once each); with `news` (a change here),
+/// then wake those that listen. A peer not met yet is said, not skipped.
 pub async fn sync(
     dir: &Path,
     news: bool,
 ) -> Result<Vec<(String, Result<usize>)>> {
     let (ep, relay) = (ep()?.alpns(vec![ALPN.into()]).bind().await?, relay()?);
     let mut all = tokio::task::JoinSet::new();
+    let mut out = vec![];
     for p in peers(dir) {
-        let Some(id) = p.id else { continue };
+        let Some(id) = p.id else {
+            let e = anyhow!(
+                "not met yet: it syncs once it has reached this device"
+            );
+            out.push((p.name, Err(e)));
+            continue;
+        };
         let (ep, relay, dir) = (ep.clone(), relay.clone(), dir.to_path_buf());
         all.spawn(async move {
             let go = async {
                 let at =
                     EndpointAddr::from_parts(id, [TransportAddr::Relay(relay)]);
-                let c = ep.connect(at, ALPN).await?;
-                let (tx, rx) = irnet::psk::dial(&c, &p.psk).await?;
-                let r = swap(&dir, &p.name, tx, rx).await;
+                let meet = async {
+                    let c = ep.connect(at, ALPN).await?;
+                    let (tx, rx) = irnet::psk::dial(&c, &p.psk).await?;
+                    anyhow::Ok((c, tx, rx))
+                };
+                let (c, tx, rx) =
+                    timeout(Duration::from_secs(15), meet).await.map_err(
+                        |_| anyhow!("not reached: is pasa open there?"),
+                    )??;
+                // A whole store may take a while; a stalled peer, not forever.
+                let r = timeout(SWAP, swap(&dir, &p.name, tx, rx)).await;
                 c.close(0u32.into(), b"");
-                r
+                r.unwrap_or_else(|_| Err(anyhow!("timed out")))
             };
-            let r = timeout(Duration::from_secs(30), go).await;
-            (p.name, r.unwrap_or_else(|_| Err(anyhow!("no answer"))))
+            let r = go.await;
+            (p.name, r)
         });
     }
     // What each swap learnt is kept one at a time: `peers` is one file.
-    let mut out = vec![];
     while let Some(r) = all.join_next().await {
         let (name, r) = r?;
         out.push((
             name.clone(),
-            r.map(|(_, dev, n)| {
-                learnt(dir, &name, None, dev);
+            r.map(|(_, dev, id, n)| {
+                learnt(dir, &name, None, dev, id);
                 n
             }),
         ));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    ep.close().await;
+    // Each swap ended on both sides; a peer gone since need not ack.
+    let _ = timeout(Duration::from_secs(2), ep.close()).await;
     if news {
         wake(dir, "").await;
     }
     Ok(out)
 }
 
-/// Accept syncs from paired devices; wake the others after news.
-pub async fn serve(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
-    let ep = ep()?
-        .secret_key(key(dir, "node")?)
-        .alpns(vec![ALPN.into()])
-        .bind()
-        .await?;
+/// How long one swap may take, a whole store included.
+const SWAP: Duration = Duration::from_secs(300);
+
+/// Accept syncs from paired devices; wake the others after news. One
+/// process at a time serves a store: two endpoints with one key would take
+/// its place at the relay from each other.
+pub async fn serve(
+    dir: &Path,
+    log: impl Fn(&str, Result<usize>) + Clone + Send + 'static,
+) -> Result<()> {
+    let node = key(dir, "node")?;
+    let lock = fs::File::open(dir.join("node"))?;
+    // Android's std has no file lock: an app there is one process.
+    match lock.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => bail!("pasa serves here already"),
+        Err(fs::TryLockError::Error(e))
+            if e.kind() != std::io::ErrorKind::Unsupported =>
+        {
+            Err(e)?
+        }
+        _ => {}
+    }
+    let ep = ep()?.secret_key(node).alpns(vec![ALPN.into()]).bind().await?;
     while let Some(inc) = ep.accept().await {
-        let dir = dir.to_path_buf();
+        let (dir, log) = (dir.to_path_buf(), log.clone());
         tokio::spawn(async move {
             let ps = peers(&dir);
             let psks: Vec<&[u8; 32]> = ps.iter().map(|p| &p.psk).collect();
@@ -372,9 +434,9 @@ pub async fn serve(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
                     irnet::psk::accept(&inc.await?, &psks).await?;
                 anyhow::Ok((i, swap(&dir, &ps[i].name, tx, rx).await?))
             };
-            match timeout(Duration::from_secs(300), go).await {
-                Ok(Ok((i, (mailbox, dev, n)))) => {
-                    learnt(&dir, &ps[i].name, Some(mailbox), dev);
+            match timeout(SWAP, go).await {
+                Ok(Ok((i, (mailbox, dev, id, n)))) => {
+                    learnt(&dir, &ps[i].name, Some(mailbox), dev, id);
                     if n > 0 {
                         wake(&dir, &ps[i].name).await;
                     }
@@ -424,21 +486,23 @@ pub fn keep_hand(s: &mut Store, name: &str, hand: &[u8]) -> Result<()> {
 
 pub use pairir::password;
 
-/// For a new device, called `name` here: this device's endpoint, fresh
-/// transport and hand-over keys, and the key file (still sealed to the
-/// password and YubiKey), by pairir under `pw`. `qr`: an offline QR
-/// code's text, else a short code. The hand-over key goes straight into
-/// the unlocked store's `dev`. With a short code: how it ends too.
-pub async fn pair(
-    s: &mut Store,
-    name: &str,
-    pw: &str,
-    qr: bool,
-) -> Result<(String, Option<tokio::task::JoinHandle<pairir::End>>)> {
-    let dir = s.dir.clone();
+/// A pairing shown here: its code, how a short code ends, and the
+/// hand-over key for [`keep_hand`].
+pub type Shown =
+    (String, Option<tokio::task::JoinHandle<pairir::End>>, Zeroizing<Vec<u8>>);
+
+/// For another device, called `name` here, to take with [`join`]: this
+/// device's endpoint, fresh transport and hand-over keys and, if there is
+/// a store here, the key file (still sealed to the password and YubiKey),
+/// by pairir under `pw`. `qr`: an offline QR code's text, else a short
+/// code. Serve until it has synced: it dials here. The hand-over key goes
+/// into `dev` with [`keep_hand`]: at once if the store is open, else at
+/// the unlock after the store arrives.
+pub async fn pair(dir: &Path, name: &str, pw: &str, qr: bool) -> Result<Shown> {
+    fs::create_dir_all(dir)?;
     let (psk, hand) = (rand::<32>(), rand::<32>());
-    let id = key(&dir, "node")?.public();
-    let f = fs::read(dir.join("key")).context("no store here")?;
+    let id = key(dir, "node")?.public();
+    let f = fs::read(dir.join("key")).unwrap_or_default();
     let secret = Zeroizing::new([&psk[..], &hand, id.as_bytes(), &f].concat());
     let out = match qr {
         true => (pairir::seal_qr("pasa", &secret, pw).await?, None),
@@ -449,16 +513,16 @@ pub async fn pair(
         }
     };
     add(
-        &dir,
+        dir,
         Peer { name: name.into(), psk, id: None, lane: None, device: None },
     )?;
-    keep_hand(s, name, &hand)?;
-    Ok(out)
+    Ok((out.0, out.1, Zeroizing::new(hand.to_vec())))
 }
 
 /// Join the device that showed `code`, calling it `name`: its hand-over
-/// key, held in memory for [`keep_hand`] at the unlock that follows. A
-/// device with a store keeps its own key file.
+/// key, for [`keep_hand`] (at the unlock that follows, if no store is open
+/// here). A device with a store keeps its own key file, and hands it to the
+/// other at the first sync if that has none.
 pub async fn join(
     dir: &Path,
     name: &str,
@@ -469,8 +533,8 @@ pub async fn join(
         true => pairir::open_qr("pasa", code, pw).await?,
         false => pairir::take(&[relay()?], "pasa", code, Some(pw)).await?,
     };
-    ensure!(s.len() > 96, "not a pasa pairing");
-    if !dir.join("key").exists() {
+    ensure!(s.len() >= 96, "not a pasa pairing");
+    if s.len() > 96 && !dir.join("key").exists() {
         write(&dir.join("key"), &s[96..])?;
     }
     let id = Some(PublicKey::from_bytes(s[64..96].try_into()?)?);
@@ -532,16 +596,16 @@ mod tests {
         let srv = tokio::spawn(async move {
             let c = eb.accept().await.unwrap().await.unwrap();
             let (_, tx, rx) = irnet::psk::accept(&c, &[&psk]).await.unwrap();
-            let (m, dev, n) = swap(&b2, &an, tx, rx).await.unwrap();
-            learnt(&b2, &an, Some(m), dev);
+            let (m, dev, id, n) = swap(&b2, &an, tx, rx).await.unwrap();
+            learnt(&b2, &an, Some(m), dev, id);
             c.closed().await;
             eb.close().await;
             n
         });
         let c = ea.connect(at, ALPN).await.unwrap();
         let (tx, rx) = irnet::psk::dial(&c, &psk).await.unwrap();
-        let (_, dev, n) = swap(a, bn, tx, rx).await.unwrap();
-        learnt(a, bn, None, dev);
+        let (_, dev, id, n) = swap(a, bn, tx, rx).await.unwrap();
+        learnt(a, bn, None, dev, id);
         c.close(0u32.into(), b"");
         ea.close().await;
         (n, srv.await.unwrap())
@@ -607,5 +671,68 @@ mod tests {
         for p in peers(&a) {
             assert!(open(&p.psk, &give).is_none());
         }
+    }
+
+    /// Every file under `d`, and whether any holds `secret`.
+    fn holds(d: &Path, secret: &[u8]) -> bool {
+        fs::read_dir(d).unwrap().flatten().any(|e| match e.path() {
+            p if p.is_dir() => holds(&p, secret),
+            p => {
+                fs::read(p).unwrap().windows(secret.len()).any(|w| w == secret)
+            }
+        })
+    }
+
+    /// The phone has the store, the desktop nothing: the desktop shows an
+    /// offline QR code, the phone scans it and dials. The store arrives
+    /// sealed, opens with its password alone, and each side learns where
+    /// the other serves. What the QR code holds, its password with it,
+    /// opens no hand-over and plants no key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_reaches_a_device_without_one() {
+        let d = crate::tests::dir("reach");
+        let (phone, desk) = (d.join("phone"), d.join("desk"));
+        let mut sp = Store::create(&phone, b"pw", None).unwrap();
+        sp.put("mail/work", b"hunter2\nuser: me").unwrap();
+        sp.put("bank", b"Tr0ub4dor&3").unwrap();
+        // The desktop, with no store, shows a QR code; the phone takes it.
+        let (qr, end, hand) =
+            pair(&desk, "phone", "pairing pw", true).await.unwrap();
+        assert!(end.is_none() && qr.starts_with("PAIRIR1:"));
+        assert!(!desk.join("key").exists(), "no store to give");
+        let before = fs::read(phone.join("key")).unwrap();
+        let mine = join(&phone, "desk", &qr, "pairing pw").await.unwrap();
+        assert_eq!(fs::read(phone.join("key")).unwrap(), before, "kept");
+        keep_hand(&mut sp, "desk", &mine).unwrap();
+        assert!(join(&phone, "x", &qr, "wrong").await.is_err());
+        // The phone dials; the desktop takes the key file and every version.
+        assert_eq!(swap_once(&phone, &desk, "desk", "phone").await, (0, 2));
+        let mut sd = Store::open(&desk, b"pw", None).unwrap();
+        keep_hand(&mut sd, "phone", &hand).unwrap();
+        adopt(&mut sd).unwrap();
+        assert_eq!(&sd.get("mail/work").unwrap()[..], b"hunter2\nuser: me");
+        assert_eq!(sd.entries().unwrap().len(), 2);
+        let at = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
+        let node = |d: &Path| key(d, "node").unwrap().public();
+        assert_eq!(at(&desk, "phone").unwrap().id, Some(node(&phone)));
+        assert_eq!(at(&phone, "desk").unwrap().id, Some(node(&desk)));
+        // On either disk: age files to random keys, never a password or key.
+        for d in [&phone, &desk] {
+            for e in fs::read_dir(d.join("v")).unwrap().flatten() {
+                let b = fs::read(e.path()).unwrap();
+                assert!(b.starts_with(b"age-encryption.org/v1\n-> scrypt "));
+            }
+            for secret in [&b"hunter2"[..], b"Tr0ub4dor", &sp.keys()[0]] {
+                assert!(!holds(d, secret), "{} holds a secret", d.display());
+            }
+        }
+        // The QR code and its password: the hand-over key, but no store
+        // key, so a hand-over neither opens nor is forged with it alone.
+        let give = fs::read(desk.join("give/phone")).unwrap();
+        assert!(open(&hand, &give).is_none());
+        let forged = seal(&hand, &[&[1u8][..], &[7; 32]].concat()).unwrap();
+        write(&phone.join("take/forged"), &forged).unwrap();
+        adopt(&mut sp).unwrap();
+        assert_eq!(sp.keys().len(), 1, "no key planted");
     }
 }

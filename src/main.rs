@@ -42,8 +42,9 @@ pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
                              password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
-pasa pair NAME [--qr]        let a device join, called NAME here
-pasa join NAME CODE          join the device NAME showing CODE
+pasa pair NAME [--qr]        show a code (--qr: offline) for a device, called NAME
+                             here, and serve until it has synced; either may hold the store
+pasa join NAME CODE          take the code device NAME shows, and dial it
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 
 fn ask(p: &str) -> Result<Secret> {
@@ -688,8 +689,12 @@ async fn sync(a: &[&str]) -> Result<()> {
     match a {
         ["pair", name, ..] => {
             let (pw, qr) = (pairir::password(), a.contains(&"--qr"));
-            let mut s = open()?;
-            let (code, end) = sync::pair(&mut s, name, &pw, qr).await?;
+            // A store here goes along, sealed; else it comes from there.
+            let mut s = dir.join("key").exists().then(open).transpose()?;
+            let (code, end, hand) = sync::pair(&dir, name, &pw, qr).await?;
+            if let Some(s) = &mut s {
+                sync::keep_hand(s, name, &hand)?;
+            }
             if qr {
                 println!(
                     "{}",
@@ -703,14 +708,37 @@ async fn sync(a: &[&str]) -> Result<()> {
                 None => {}
                 Some(end) => match end.await? {
                     pairir::End::Taken => eprintln!("{name} took it"),
-                    pairir::End::Expired => {
-                        eprintln!("nobody came: pair again")
-                    }
+                    pairir::End::Expired => bail!("nobody came: pair again"),
                     pairir::End::Spent => bail!(
                         "the code was used by someone who did not prove it: \
                          pasa forget {name}, then pair again"
                     ),
                 },
+            }
+            // It dials here: serve until it has synced once.
+            eprintln!(
+                "waiting for {name} to sync (Ctrl-C: later, by pasa serve)"
+            );
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let me = name.to_string();
+            let log = move |w: &str, r: Result<usize>| {
+                if r.is_ok() && w == me {
+                    let _ = tx.send(());
+                }
+                report(w, r)
+            };
+            tokio::select! {
+                r = sync::serve(&dir, log) => if let Err(e) = r {
+                    eprintln!("{e:#}: {name} syncs with it");
+                },
+                _ = rx.recv() => {}
+            }
+            if s.is_none() {
+                ensure!(dir.join("key").exists(), "{name} has no store either");
+                eprintln!(
+                    "Now the store's password, to keep the pairing sealed:"
+                );
+                sync::keep_hand(&mut open()?, name, &hand)?;
             }
         }
         ["join", name, code] => {

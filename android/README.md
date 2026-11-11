@@ -18,7 +18,10 @@ pasa on Android: a thin Compose UI over the same Rust (`apasa-jni`).
 - Wakes come through pushir, the phone's one connection shared with the
   group's other apps (`pushirGroup` = `center.cxn`, same signing key);
   whoever holds it hands them over unopened. The app also syncs on unlock,
-  after each change, and when that connection comes back.
+  after each change, and when that connection comes back, and serves while
+  it is on the screen. Devices, Add a device shows a QR code (offline) or a
+  code to type, or scans another device's: the phone then dials it and, if
+  that device has no store yet, fills it.
 
 ```sh
 rustup target add aarch64-linux-android x86_64-linux-android

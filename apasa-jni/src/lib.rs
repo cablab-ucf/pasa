@@ -614,22 +614,50 @@ pub extern "system" fn Java_com_apasa_Native_forget<'l>(
     })
 }
 
-/// Let a device join, called `name` here: its code, then the pairing
-/// password, a line each.
+/// Let a device pair, called `name` here: its code (`qr`: an offline QR
+/// code's text), then the pairing password, a line each. It dials here.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     h: jlong,
     name: JString<'l>,
+    qr: bool,
 ) -> JString<'l> {
     run(&mut env, |e| {
-        let pw = sync::password();
+        let (pw, name) = (sync::password(), name.to_string());
         let mut stores = STORES.lock().unwrap();
         let st = stores.get_mut(&h).context("locked")?;
-        let (code, _) =
-            RT.block_on(sync::pair(st, &name.to_string(), &pw, false))?;
+        let (code, _, hand) =
+            RT.block_on(sync::pair(&st.dir, &name, &pw, qr))?;
+        sync::keep_hand(st, &name, &hand)?;
         Ok(e.new_string(format!("{code}\n{pw}"))?)
+    })
+}
+
+/// While the app shows (and sync is on): paired devices dial here.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_serve<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+    on: bool,
+) {
+    static SERVING: Mutex<Option<tokio::task::JoinHandle<()>>> =
+        Mutex::new(None);
+    run(&mut env, |_| {
+        let mut s = SERVING.lock().unwrap_or_else(|p| p.into_inner());
+        // Ended, its endpoint and key's lock let go, before another starts.
+        if let Some(h) = s.take() {
+            h.abort();
+            let _ = RT.block_on(h);
+        }
+        let dir = std::path::PathBuf::from(dir.to_string());
+        if on {
+            let go = async move { drop(sync::serve(&dir, |_, _| {}).await) };
+            *s = Some(RT.spawn(go));
+        }
+        Ok(())
     })
 }
 
@@ -651,7 +679,12 @@ pub extern "system" fn Java_com_apasa_Native_join<'l>(
             &code.to_string(),
             &pw.to_string(),
         ))?;
-        *PENDING.lock().unwrap() = Some((name, hand));
+        // Into the open store at once (a phone with a store pairing a
+        // device without one), else at the unlock that follows.
+        match STORES.lock().unwrap().values_mut().next() {
+            Some(st) => sync::keep_hand(st, &name, &hand)?,
+            None => *PENDING.lock().unwrap() = Some((name, hand)),
+        }
         Ok(e.new_string(report(RT.block_on(sync::sync(dir, false))?))?)
     })
 }
