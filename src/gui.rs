@@ -222,8 +222,6 @@ struct Generator {
     seps: &'static str,
     leet: bool,
     pw: Zeroizing<String>,
-    /// `pw` as it was made: changed by hand, its bits are an estimate.
-    made: Zeroizing<String>,
 }
 
 impl Default for Generator {
@@ -231,8 +229,7 @@ impl Default for Generator {
         let pw = Zeroizing::new(pasa::generate(24, true));
         let (len, count) = (24, 4);
         let (words, symbols, seps, leet) = (false, true, "", false);
-        let made = pw.clone();
-        Generator { words, len, symbols, count, seps, leet, pw, made }
+        Generator { words, len, symbols, count, seps, leet, pw }
     }
 }
 
@@ -256,7 +253,7 @@ impl Generator {
                 .selectable_value(&mut g.words, true, "Speakable words")
                 .clicked();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let bits = format!("{} bits", g.bits());
+                let bits = format!("made of {} bits", g.bits());
                 ui.label(RichText::new(bits).small().color(l.muted));
             });
         });
@@ -304,12 +301,10 @@ impl Generator {
         again
     }
 
-    /// The bits of chance in the password: as made, what went into it;
-    /// changed by hand, an estimate.
+    /// The bits of chance that go into a password made this way.
     fn bits(&self) -> u32 {
         let abc: f64 = if self.symbols { 80.0 } else { 62.0 };
         match self.words {
-            _ if *self.pw != *self.made => pasa::strength(&self.pw),
             true => pasa::speakable_bits(self.count, self.seps),
             false => (self.len as f64 * abc.log2()) as u32,
         }
@@ -1911,7 +1906,8 @@ impl App {
                 t.font(FontId::monospace(16.0)).desired_width(f32::INFINITY),
             );
         });
-        meter(ui, g.bits());
+        // Of the password as it stands, at every change of it.
+        meter(ui, pasa::strength(&g.pw));
         let mut again = g.options(ui);
         ui.horizontal(|ui| {
             again |= ui.button("Another").clicked();
@@ -1926,10 +1922,9 @@ impl App {
         });
         if again {
             g.pw = Zeroizing::new(g.make());
-            g.made = g.pw.clone();
         }
-        let note = "Change it by hand and its bits are counted again. New \
-                    entries start with a password made this way.";
+        let note = "The bar estimates the password as it stands, at every \
+                    change. New entries start with one made this way.";
         ui.label(RichText::new(note).small().color(l.muted));
     }
 

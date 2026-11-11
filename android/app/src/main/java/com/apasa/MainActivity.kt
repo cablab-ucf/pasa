@@ -129,6 +129,8 @@ class MainActivity : ComponentActivity(), Host {
         val c = fresh()
         val r = yubikey(this, c, enroll = true)
         io { Native.quickOn(h, pin.toByteArray(), c, r) }
+        // Kept, so that unlocking shows the number pad for a PIN of digits alone.
+        set("pinDigits", if (pin.isNotEmpty() && pin.all { it in '0'..'9' }) 1 else 0)
         readQuick()
     }
 

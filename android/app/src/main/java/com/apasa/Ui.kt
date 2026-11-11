@@ -387,6 +387,8 @@ private fun Field(
     v: String, set: (String) -> Unit, label: String, secret: Boolean = false, lines: Int = 1,
     error: String = "", prose: Boolean = false, done: (() -> Unit)? = null,
     shown: MutableState<Boolean> = remember { mutableStateOf(false) },
+    /** A PIN of digits alone: the number pad. */
+    digits: Boolean = false,
     trailing: (@Composable () -> Unit)? = null,
 ) = OutlinedTextField(
     v, set, label = { Text(label) }, singleLine = lines == 1, minLines = lines,
@@ -396,7 +398,7 @@ private fun Field(
     keyboardOptions = KeyboardOptions(
         capitalization = if (prose) KeyboardCapitalization.Sentences else KeyboardCapitalization.None,
         autoCorrectEnabled = prose,
-        keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
+        keyboardType = if (digits) KeyboardType.NumberPassword else if (secret) KeyboardType.Password else KeyboardType.Text,
         imeAction = if (done != null) ImeAction.Done else ImeAction.Default,
     ),
     keyboardActions = KeyboardActions(onDone = { done?.invoke() }),
@@ -617,7 +619,8 @@ private fun Unlock(host: Host) {
     if (quick != null && !byPassword) {
         val open = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
         return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap, host = host) {
-            if (quick) Field(pin, { pin = it }, "PIN", secret = true, done = open)
+            // The number pad, if the PIN that was set is digits alone.
+            if (quick) Field(pin, { pin = it }, "PIN", secret = true, done = open, digits = host.setting("pinDigits") == 1)
             NfcOff(host)
             Primary("Unlock with the YubiKey", enabled = !work.busy, go = open)
         }
@@ -976,7 +979,8 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
     var n by remember { mutableIntStateOf(0) }
     val made = remember(g, n) { host.generate(g) }
     var pw by remember(made) { mutableStateOf(made) }
-    val bits = if (pw == made) g.bits else host.strength(pw)
+    // Of the password as it stands, at every change of it.
+    val bits = host.strength(pw)
     AlertDialog(
         close, title = { Text("Password generator") },
         text = {
@@ -991,7 +995,7 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
                     Way("Speakable", g.words) { nav.gen = g.copy(words = true) }
                 }
                 if (g.words) {
-                    Label("${g.count} words")
+                    Label("${g.count} words  \u00B7  made of ${g.bits} bits")
                     Slider(g.count.toFloat(), { nav.gen = g.copy(count = it.toInt()) }, valueRange = 3f..8f, steps = 4)
                     Label("BETWEEN WORDS")
                     for (row in listOf(listOf("" to "Nothing", "-" to "-", "." to "."), listOf("_" to "_", "-_." to "- _ .", SEPS to "Any symbol")))
@@ -1000,11 +1004,11 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
                         }
                     Tick("1337: some letters as @ 3 1 0 \$ 7", g.leet) { nav.gen = g.copy(leet = it) }
                 } else {
-                    Label("${g.len} characters")
+                    Label("${g.len} characters  \u00B7  made of ${g.bits} bits")
                     Slider(g.len.toFloat(), { nav.gen = g.copy(len = it.toInt()) }, valueRange = 8f..64f)
                     Tick("Symbols", g.symbols) { nav.gen = g.copy(symbols = it) }
                 }
-                Text("Change it by hand and its bits are counted again. New entries start with a password made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
+                Text("The bar estimates the password as it stands, at every change. New entries start with one made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
             }
         },
         confirmButton = {
