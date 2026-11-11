@@ -182,6 +182,10 @@ enum Job {
     Quick,
     /// Quick unlock on for the open store, or off.
     SetQuick(bool),
+    /// By a security key (FIDO2) and its PIN, if it has one.
+    Fido,
+    /// The security key plugged in opens the open store from now on.
+    AddFido,
     Join,
 }
 
@@ -641,6 +645,14 @@ impl App {
                 let s = crate::unlock_quick(&c, self.pin.as_bytes())?;
                 self.v = Some(View::new(s));
             }
+            Job::Fido => {
+                let s = crate::unlock_fido(Some(self.pin.as_bytes()))?;
+                self.v = Some(View::new(s));
+            }
+            Job::AddFido => {
+                let v = self.v.as_ref().context("locked")?;
+                crate::fido_add(&v.s, Some(self.pin.as_bytes()))?;
+            }
             Job::SetQuick(on) => {
                 let v = self.v.as_ref().context("locked")?;
                 match on {
@@ -826,6 +838,21 @@ impl App {
             if primary(ui, "Unlock", true).clicked() || enter {
                 let say = if yk { "Touch your YubiKey" } else { "Unlocking" };
                 self.begin(ui, Job::Unlock, say);
+            }
+            // A security key of this store's opens it without the password.
+            if let Some(f) = pasa::fido(&home()) {
+                ui.separator();
+                if f.keys.iter().any(|k| k.1) {
+                    field(
+                        ui,
+                        "The security key's PIN, if it has one",
+                        &mut self.pin,
+                        true,
+                    );
+                }
+                if ui.button("Unlock with a security key").clicked() {
+                    self.begin(ui, Job::Fido, "Touch your security key");
+                }
             }
             self.said(ui);
         });
@@ -2057,6 +2084,33 @@ impl App {
                 ui.end_row();
             },
         );
+        ui.separator();
+        ui.label(RichText::new("Security keys (FIDO2)").strong());
+        let how = "A security key of any make opens the store on this machine, \
+                   beside the password: its secret never leaves it, and nothing \
+                   goes over a network. Add a spare at any time.";
+        ui.label(RichText::new(how).small().color(l.muted));
+        let keys = pasa::fido(&home()).map_or(0, |f| f.keys.len());
+        ui.horizontal(|ui| {
+            ui.label(match keys {
+                0 => "None".into(),
+                1 => "1 key".to_string(),
+                n => format!("{n} keys"),
+            });
+            let pin = TextEdit::singleline(&mut *self.pin).password(true);
+            ui.add(
+                pin.hint_text("Its PIN, if it has one").desired_width(150.0),
+            );
+            if ui.button("Add the key plugged in").clicked() {
+                self.begin(ui, Job::AddFido, "Touch your security key, twice");
+            }
+            if keys > 0 && ui.button("Remove all").clicked() {
+                self.said = match pasa::fido_off(&home(), None) {
+                    Ok(()) => "No security key opens the store now".into(),
+                    Err(e) => format!("{e:#}"),
+                };
+            }
+        });
         ui.separator();
         ui.label(RichText::new("Quick unlock").strong());
         let how = "A tap of your YubiKey and a PIN open the store on this \

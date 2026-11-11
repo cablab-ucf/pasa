@@ -116,6 +116,19 @@ ciphertext, and learns when you change things. A version deleted from
   factors needed. The password is per device (`passwd` changes this one);
   each `passwd` takes a fresh challenge. Program two YubiKeys with one
   secret (`ykman otp chalresp 2 SECRET`).
+- **Security keys** (`pasa fido`, or the apps' settings; per device, never
+  synced): a FIDO2 key of any make opens the store beside the password, by
+  CTAP2's `hmac-secret`. The key makes a secret that never leaves it and
+  answers HMAC-SHA-256 of the device's salt under it; `fido` holds, a line
+  a key, the credential and the key the password opens sealed to that
+  answer. A key is added whenever the store is open, so a spare can come
+  later. With a PIN on the key, the key counts the wrong tries (8, then it
+  locks). All of it is between the device and the key, over USB or NFC:
+  no server, no account, no network ("pasa" is a name on the key, not an
+  address). The exchange on the cable is CTAP2's (P-256, AES-256,
+  HMAC-SHA-256), not post-quantum; what it carries opens nothing without
+  the device's files. Desktop: libfido2's tools (`fido2-token`,
+  `fido2-cred`, `fido2-assert`). A new password takes the keys off.
 - **Quick unlock** (`pasa quick`, or the apps' settings; per device, never
   synced): `quick` holds the key the password derives, sealed to Argon2id
   of a PIN with the YubiKey's answer as its secret. A tap and the PIN then

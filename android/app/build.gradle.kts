@@ -68,6 +68,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("com.yubico.yubikit:android:3.3.0")
     implementation("com.yubico.yubikit:yubiotp:3.3.0")
+    implementation("com.yubico.yubikit:fido:3.3.0")
     implementation(project(":pairir"))
     implementation(project(":pushir"))
 }

@@ -113,7 +113,7 @@ class MainActivity : ComponentActivity(), Host {
 
     private var quickNow by mutableStateOf<Boolean?>(null)
     override val quick get() = quickNow
-    private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 } }
+    private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 }; readFido() }
     private fun fresh() = ByteArray(32).also { SecureRandom().nextBytes(it) }
 
     override suspend fun create(pw: String, key: Key, pin: String) {
@@ -153,6 +153,37 @@ class MainActivity : ComponentActivity(), Host {
         val r = yubikey(this, Native.quick(dir)!!.copyOf(32))
         handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
         if (sync) io { runCatching { Native.sync(dir, false) } }
+    }
+
+    // Security keys (FIDO2): how many open the store here, and whether a PIN goes with any.
+    private var fidoNow by mutableStateOf(0 to false)
+    override val fidoKeys get() = fidoNow.first
+    override val fidoPin get() = fidoNow.second
+    private fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    private fun fidoHere() = Native.fido(dir).lines().filter { it.isNotEmpty() }.let { l ->
+        l.firstOrNull()?.let { salt -> hex(salt) to l.drop(1).map { k -> hex(k.substringBefore(' ')) to k.endsWith(" 1") } }
+    }
+    private fun readFido() { fidoNow = fidoHere()?.second.orEmpty().let { it.size to it.any { k -> k.second } } }
+
+    override suspend fun fidoAdd(pin: String) {
+        val salt = Native.fidoSalt(handle)
+        val (cred, uv, secret) = fidoNew(this, salt, pin)
+        io { Native.fidoAdd(handle, salt, cred, uv, secret) }
+        secret.fill(0)
+        readFido()
+    }
+
+    override suspend fun unlockFido(pin: String) {
+        val (salt, keys) = fidoHere() ?: throw Exception("No security key opens this store")
+        val (cred, secret) = fidoSecret(this, keys, salt, pin)
+        handle = io { Native.openFido(dir, cred, secret) }
+        secret.fill(0)
+        if (sync) io { runCatching { Native.sync(dir, false) } }
+    }
+
+    override fun fidoOff() {
+        Native.fidoOff(dir)
+        readFido()
     }
 
     override suspend fun unlock(pw: String) {

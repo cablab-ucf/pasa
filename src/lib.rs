@@ -314,6 +314,51 @@ impl Store {
         write(&self.dir.join("quick"), &quick)
     }
 
+    /// The salt security keys are asked with on this device: made at the
+    /// first key, the same for every one after.
+    pub fn fido_salt(&self) -> Vec<u8> {
+        fido(&self.dir).map_or_else(|| rand::<32>().to_vec(), |f| f.salt)
+    }
+
+    /// Let the security key with credential `cred` open the store on this
+    /// device, with its PIN or not: the key the password opens is sealed
+    /// to `secret`, the key's answer (32 bytes, never leaving the key but
+    /// so) to `salt` ([`Store::fido_salt`]). A key is added at any time
+    /// the store is open; the others stay.
+    pub fn fido_add(
+        &self,
+        salt: &[u8],
+        cred: &[u8],
+        pin: bool,
+        secret: &[u8],
+    ) -> Result<()> {
+        ensure!(salt.len() == 32 && secret.len() == 32, "32 bytes each");
+        ensure!(fido(&self.dir).is_none_or(|f| f.salt == salt), "another salt");
+        let at = self.dir.join("fido");
+        let old = fs::read_to_string(&at).unwrap_or_default();
+        let mut lines: Vec<String> =
+            old.lines().skip(1).map(Into::into).collect();
+        lines.retain(|l| fido_line(l).is_some_and(|k| k.0 != cred));
+        let hex = |b: &[u8]| HEXLOWER.encode(b);
+        let sealed = seal(secret, &self.kek)?;
+        lines.insert(0, hex(salt));
+        lines.push(format!("{} {} {}", hex(cred), pin as u8, hex(&sealed)));
+        write(&at, (lines.join("\n") + "\n").as_bytes())
+    }
+
+    /// Open by the answer of the security key with credential `cred`.
+    pub fn open_fido(dir: &Path, cred: &[u8], secret: &[u8]) -> Result<Store> {
+        let f =
+            fs::read_to_string(dir.join("fido")).context("no security key")?;
+        let mut keys = f.lines().skip(1).filter_map(fido_line);
+        let key =
+            keys.find(|k| k.0 == cred).context("not a key of this store")?;
+        let kek = open(secret, &key.2)
+            .context("the key's answer does not open it")?;
+        Store::unsealed(dir, kek)
+            .context("the security key is out of date: use the password")
+    }
+
     /// With the key the password gives.
     fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
         let f = fs::read(dir.join("key")).context("no store: pasa init")?;
@@ -342,6 +387,7 @@ impl Store {
         self.save()?;
         // What quick unlock held opens the old lock only.
         let _ = fs::remove_file(self.dir.join("quick"));
+        let _ = fs::remove_file(self.dir.join("fido"));
         Ok(())
     }
 
@@ -719,6 +765,49 @@ impl Store {
 pub fn quick(dir: &Path) -> Option<(Vec<u8>, bool)> {
     let f = fs::read(dir.join("quick")).ok()?;
     Some((f.get(..32)?.to_vec(), *f.get(32)? == 1))
+}
+
+/// The security keys (FIDO2, CTAP2 `hmac-secret`) that open the store on
+/// this device, beside the password: the salt each is asked with, and
+/// for each its credential and whether its PIN goes with it. The file
+/// `fido`: the salt, then a line a key (credential, PIN, the key the
+/// password opens sealed to that key's secret), all hex.
+pub struct Fido {
+    pub salt: Vec<u8>,
+    pub keys: Vec<(Vec<u8>, bool)>,
+}
+
+/// One line of `fido`: credential, PIN, sealed.
+fn fido_line(l: &str) -> Option<(Vec<u8>, bool, Vec<u8>)> {
+    let mut p = l.split(' ');
+    let hex = |p: Option<&str>| HEXLOWER.decode(p?.as_bytes()).ok();
+    Some((hex(p.next())?, p.next()? == "1", hex(p.next())?))
+}
+
+pub fn fido(dir: &Path) -> Option<Fido> {
+    let f = fs::read_to_string(dir.join("fido")).ok()?;
+    let salt = HEXLOWER.decode(f.lines().next()?.as_bytes()).ok()?;
+    let keys = f.lines().skip(1).filter_map(fido_line);
+    let keys: Vec<_> = keys.map(|(c, pin, _)| (c, pin)).collect();
+    (salt.len() == 32 && !keys.is_empty()).then_some(Fido { salt, keys })
+}
+
+/// The security key with credential `cred` opens nothing here any more;
+/// `None`: none does.
+pub fn fido_off(dir: &Path, cred: Option<&[u8]>) -> Result<()> {
+    let at = dir.join("fido");
+    let f = fs::read_to_string(&at).unwrap_or_default();
+    let keep = |l: &&str| {
+        cred.is_some() && fido_line(l).is_none_or(|k| Some(&k.0[..]) != cred)
+    };
+    let kept: Vec<&str> = f.lines().filter(keep).collect();
+    match kept.len() {
+        0 | 1 => fs::remove_file(at).or_else(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(e.into()),
+        }),
+        _ => write(&at, (kept.join("\n") + "\n").as_bytes()),
+    }
 }
 
 /// One of `abc`, each as likely as the next.
@@ -1409,6 +1498,42 @@ mod tests {
         }
         let (made, changed) = s.times("a").unwrap().unwrap();
         assert!(made <= changed && s.times("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn security_keys() {
+        let d = dir("fido");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        s.put("a", b"1").unwrap();
+        assert!(fido(&d).is_none());
+        // Two keys, the second added later: each opens it, with the salt
+        // of the first; a wrong answer and a stranger do not.
+        let salt = s.fido_salt();
+        let (one, two) = ([1; 32], [2; 32]);
+        s.fido_add(&salt, b"cred-one", true, &one).unwrap();
+        assert_eq!(s.fido_salt(), salt);
+        s.fido_add(&salt, b"cred-two", false, &two).unwrap();
+        let f = fido(&d).unwrap();
+        let keys =
+            vec![(b"cred-one".to_vec(), true), (b"cred-two".to_vec(), false)];
+        assert_eq!((f.salt, f.keys), (salt.clone(), keys));
+        for (cred, secret) in [(&b"cred-one"[..], one), (b"cred-two", two)] {
+            let o = Store::open_fido(&d, cred, &secret).unwrap();
+            assert_eq!(&*o.get("a").unwrap(), b"1");
+        }
+        assert!(Store::open_fido(&d, b"cred-one", &two).is_err());
+        assert!(Store::open_fido(&d, b"cred-none", &one).is_err());
+        assert!(s.fido_add(&[9; 32], b"cred-x", false, &one).is_err());
+        // Added again, a key is there once; taken off, the other stays.
+        s.fido_add(&salt, b"cred-one", false, &one).unwrap();
+        assert_eq!(fido(&d).unwrap().keys.len(), 2);
+        fido_off(&d, Some(b"cred-one")).unwrap();
+        assert!(Store::open_fido(&d, b"cred-one", &one).is_err());
+        assert!(Store::open_fido(&d, b"cred-two", &two).is_ok());
+        // A new password leaves a key behind: it says so, and is taken off.
+        fido_off(&d, None).unwrap();
+        assert!(fido(&d).is_none() && !d.join("fido").exists());
+        fido_off(&d, None).unwrap();
     }
 
     #[test]

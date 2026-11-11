@@ -148,6 +148,13 @@ interface Host {
     val quick: Boolean?
     /** The phone has NFC and it is switched off: a key can then only be plugged in. */
     val nfcOff: Boolean
+    /** Security keys (FIDO2) that open the store on this phone, and whether a PIN goes with any of them. */
+    val fidoKeys: Int
+    val fidoPin: Boolean
+    /** The key tapped opens the open store from now on (its [pin], if it has one); a spare is added the same way, at any time. */
+    suspend fun fidoAdd(pin: String)
+    suspend fun unlockFido(pin: String)
+    fun fidoOff()
     /** A setting kept on this phone: "clip" and "lock", seconds; "theme": 0 the phone's, 1 dark, 2 light. */
     fun setting(name: String): Int
     fun set(name: String, value: Int)
@@ -615,14 +622,22 @@ private fun Unlock(host: Host) {
             Primary("Unlock with the YubiKey", enabled = !work.busy, go = open)
         }
     }
-    val open = { if (!work.busy) work.go { host.unlock(pw); pw = "" } }
+    var byKey by remember { mutableStateOf(false) }
+    val open = { if (!work.busy) { byKey = false; work.go { host.unlock(pw); pw = "" } } }
     Front(
         "Unlock", work, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
-        { work.stop(); byPassword = false }, wait = if (host.needsKey) tap else "", host = host,
+        { work.stop(); byPassword = false },
+        wait = if (byKey) "Hold your security key still against the phone, or plug it in and touch it" else if (host.needsKey) tap else "", host = host,
     ) {
         Field(pw, { pw = it }, "Password", secret = true, done = open)
         if (host.needsKey) NfcOff(host)
         Primary("Unlock", enabled = !work.busy, go = open)
+        // A security key of this store's opens it without the password.
+        if (host.fidoKeys > 0) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            if (host.fidoPin) Field(pin, { pin = it }, "Security key PIN, if any", secret = true)
+            OutlinedButton({ byKey = true; work.go { host.unlockFido(pin); pin = "" } }, enabled = !work.busy) { Text("Unlock with a security key") }
+        }
     }
 }
 
@@ -1176,6 +1191,22 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     pick("clip", "Clipboard", "Copied secrets are marked sensitive and leave the clipboard after this long.", listOf(15 to "15 s", 30 to "30 s", 45 to "45 s", 90 to "90 s"))
     pick("lock", "Locking", "The store locks when the app has been off the screen this long.", listOf(0 to "At once", 60 to "1 min", 300 to "5 min"))
     pick("theme", "Looks", "Dark or light.", listOf(0 to "As the phone", 1 to "Dark", 2 to "Light"))
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+    // Security keys (FIDO2): added one at a time, a spare at any time.
+    var keyPin by remember { mutableStateOf("") }
+    val keys = rememberJob()
+    Text("Security keys (FIDO2)", style = MaterialTheme.typography.bodyLarge)
+    Text(
+        "A security key of any make opens the store on this phone, beside the password. Its secret never leaves it, and nothing goes over a network. Add a spare the same way, now or later.",
+        style = MaterialTheme.typography.bodySmall, color = muted,
+    )
+    Text(when (host.fidoKeys) { 0 -> "None yet"; 1 -> "1 key opens the store here"; else -> "${host.fidoKeys} keys open the store here" })
+    Field(keyPin, { keyPin = it }, "Security key PIN, if any", secret = true)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton({ keys.go { host.fidoAdd(keyPin); keyPin = "" } }, enabled = !keys.busy) { Text("Add a key") }
+        if (host.fidoKeys > 0) TextButton({ host.fidoOff() }) { Text("Remove all") }
+    }
+    Doing(keys, "Hold the key still against the phone until this is done, or plug it in and touch it twice", host)
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     var pin by remember { mutableStateOf("") }
     val work = rememberJob()
