@@ -266,6 +266,8 @@ struct App {
     /// needed with the password, every time.
     quick: bool,
     pin: Zeroizing<String>,
+    /// The store's password as generated here, and its bits.
+    made: (Zeroizing<String>, u32),
     /// At the unlock: the password, though quick unlock is on.
     by_password: bool,
     joining: bool,
@@ -317,18 +319,50 @@ pub fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// A muted label over a field as wide as its place.
+/// A muted label over a field as wide as its place. A secret is hidden,
+/// with an eye beside it to show it: which, the field's label remembers.
 fn field(
     ui: &mut Ui,
     label: &str,
     text: &mut String,
     secret: bool,
 ) -> Response {
-    ui.label(RichText::new(label).small().color(look(ui).muted));
-    let t = TextEdit::singleline(text)
-        .password(secret)
-        .desired_width(f32::INFINITY);
-    ui.add(t.margin(Margin::symmetric(8, 6)))
+    let l = look(ui);
+    ui.label(RichText::new(label).small().color(l.muted));
+    if !secret {
+        let t = TextEdit::singleline(text).desired_width(f32::INFINITY);
+        return ui.add(t.margin(Margin::symmetric(8, 6)));
+    }
+    let id = ui.scope_id().with(("shown", label));
+    let mut shown = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let r = ui.horizontal(|ui| {
+        let (rect, eye) =
+            ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+        // An eye, struck through while what it watches is hidden.
+        let (c, ink) = (rect.center(), Stroke::new(1.6, l.muted));
+        let lid = [
+            vec2(-9.0, 0.0),
+            vec2(-4.5, -5.0),
+            vec2(4.5, -5.0),
+            vec2(9.0, 0.0),
+            vec2(4.5, 5.0),
+            vec2(-4.5, 5.0),
+        ];
+        let lid = lid.iter().map(|v| c + *v).collect();
+        ui.painter().add(egui::Shape::closed_line(lid, ink));
+        ui.painter().circle_filled(c, 2.6, l.muted);
+        if !shown {
+            ui.painter()
+                .line_segment([c + vec2(-8.0, 8.0), c + vec2(8.0, -8.0)], ink);
+        }
+        if eye.on_hover_text(if shown { "Hide" } else { "Show" }).clicked() {
+            shown ^= true;
+        }
+        let t = TextEdit::singleline(text).password(!shown);
+        ui.add(t.desired_width(f32::INFINITY).margin(Margin::symmetric(8, 6)))
+    });
+    ui.data_mut(|d| d.insert_temp(id, shown));
+    r.inner
 }
 
 /// `body` as `file` in the downloads folder, under a name not yet there.
@@ -378,14 +412,27 @@ fn grade(bits: u32) -> (&'static str, Color32) {
 
 /// A bar that fills and turns from red to green as a password's bits grow.
 fn meter(ui: &mut Ui, bits: u32) {
+    meter_to(ui, bits, 0)
+}
+
+/// [`meter`], full at `goal` and saying how far that is (0: no goal). The
+/// store's own password has one, 256: a suggestion, nothing is refused.
+fn meter_to(ui: &mut Ui, bits: u32, goal: u32) {
     let (name, colour) = grade(bits);
+    let full = if goal > 0 { goal } else { 128 } as f32;
     let (rect, _) =
         ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
     ui.painter().rect_filled(rect, 3, look(ui).line);
     let mut filled = rect;
-    filled.set_width(rect.width() * (bits as f32 / 128.0).min(1.0));
+    filled.set_width(rect.width() * (bits as f32 / full).min(1.0));
     ui.painter().rect_filled(filled, 3, colour);
-    let said = format!("{name}: about {bits} bits");
+    let said = match goal {
+        0 => format!("{name}: about {bits} bits"),
+        g if bits >= g => {
+            format!("About {bits} bits: the {g} suggested, and more")
+        }
+        g => format!("About {bits} bits of the {g} suggested"),
+    };
     ui.label(RichText::new(said).small().color(colour));
 }
 
@@ -566,35 +613,69 @@ impl App {
     fn create(&mut self, ui: &mut Ui) {
         card(ui, "A small password store", "Create your store", |ui| {
             let l = look(ui);
+            let small = |ui: &mut Ui, t: &str, c: Color32| {
+                ui.label(RichText::new(t).small().color(c));
+            };
+            small(
+                ui,
+                "Its password opens everything, and is the way back in when all \
+                 else is lost: a long one. 256 bits is the suggestion.",
+                l.muted,
+            );
             let first = field(ui, "Password", &mut self.pw, true);
             if ui.memory(|m| m.focused().is_none()) {
                 first.request_focus();
             }
+            // A generated one's bits are known; a typed one's are guessed.
+            let ours = !self.pw.is_empty() && *self.pw == *self.made.0;
             if !self.pw.is_empty() {
-                meter(ui, pasa::strength(&self.pw));
+                let bits =
+                    if ours { self.made.1 } else { pasa::strength(&self.pw) };
+                meter_to(ui, bits, 256);
+            }
+            if ui.button("Generate one and show it").clicked() {
+                let pw = Zeroizing::new(pasa::speakable(12, true, false));
+                (self.pw, self.pw2) = (pw.clone(), pw.clone());
+                self.made = (pw, 12 * 22);
+            }
+            if ours {
+                let f =
+                    Frame::new().fill(l.bg).corner_radius(8).inner_margin(10);
+                f.show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(&**self.pw).monospace().size(15.0));
+                });
+                small(
+                    ui,
+                    "Twelve made-up words, 264 bits. Write it down and keep it \
+                     somewhere safe before going on.",
+                    l.accent,
+                );
             }
             let again = field(ui, "Password, again", &mut self.pw2, true);
+            // What is wrong with it, right under it.
+            if !self.pw2.is_empty() && *self.pw != *self.pw2 {
+                small(ui, "The passwords differ", l.bad);
+            }
             ui.add_space(4.0);
             ui.checkbox(&mut self.yk, "Use a hardware key (YubiKey)");
             if self.yk {
-                let small = |ui: &mut Ui, t: &str| {
-                    ui.label(RichText::new(t).small().color(l.muted));
-                };
                 ui.radio_value(&mut self.quick, true, "To unlock quickly");
                 small(
                     ui,
-                    "A tap and a PIN open the store. The password still \
-                           opens it alone if the key is lost: make it long.",
+                    "A tap and a PIN open the store. The password still opens \
+                     it alone if the key is lost.",
+                    l.muted,
                 );
                 if self.quick {
-                    let pin =
-                        TextEdit::singleline(&mut *self.pin).password(true);
-                    ui.add(
-                        pin.hint_text("PIN (empty: none)").desired_width(160.0),
-                    );
+                    field(ui, "PIN (empty: none)", &mut self.pin, true);
                 }
                 ui.radio_value(&mut self.quick, false, "As a second factor");
-                small(ui, "Needed together with the password, every time.");
+                small(
+                    ui,
+                    "Needed together with the password, every time.",
+                    l.muted,
+                );
             }
             ui.add_space(6.0);
             let ok = !self.pw.is_empty() && *self.pw == *self.pw2;
@@ -605,11 +686,6 @@ impl App {
                 let say =
                     if self.yk { "Touch your YubiKey" } else { "Creating" };
                 self.begin(ui, Job::Create, say);
-            } else if !self.pw2.is_empty() && !ok {
-                self.said = "The passwords differ".into();
-            } else if self.job.is_none() && self.said == "The passwords differ"
-            {
-                self.said.clear();
             }
             self.said(ui);
         });

@@ -1,5 +1,6 @@
 package com.apasa
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -23,6 +24,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -49,6 +51,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -58,9 +61,16 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -214,33 +224,78 @@ fun Pasa(host: Host, nav: Nav, dark: Boolean = isSystemInDarkTheme()) {
     }
 }
 
-/** Runs [f], busy meanwhile; what went wrong, in the app's words. */
+/** Something being done: whether it still is, what went wrong, how to start it, how to stop it. */
+private data class Work(val busy: Boolean, val err: String, val go: (suspend () -> Unit) -> Unit, val stop: () -> Unit)
+
+/** Runs what [Work.go] is given, busy meanwhile; what went wrong, in the app's words. */
 @Composable
-private fun rememberJob(): Triple<Boolean, String, (suspend () -> Unit) -> Unit> {
+private fun rememberJob(): Work {
     var busy by remember { mutableStateOf(false) }
     var err by remember { mutableStateOf("") }
+    var running by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     val scope = rememberCoroutineScope()
-    return Triple(busy, err) { f ->
-        scope.launch {
+    return Work(busy, err, { f ->
+        running = scope.launch {
             busy = true
-            err = runCatching { f() }.exceptionOrNull()?.message?.removePrefix("Rust error: ") ?: ""
+            err = try {
+                f()
+                ""
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                ""
+            } catch (e: Throwable) {
+                e.message?.removePrefix("Rust error: ") ?: "It failed"
+            }
             busy = false
         }
+    }) {
+        running?.cancel()
+        busy = false
     }
 }
 
 @Composable
 private fun Label(t: String) = Text(t, style = MaterialTheme.typography.labelMedium, color = muted)
 
+/** An eye, struck through while what it watches is hidden. */
+@Composable
+private fun Eye(open: Boolean, tint: Color) = Canvas(Modifier.size(22.dp)) {
+    val (w, h) = size.width to size.height
+    drawOval(tint, Offset(w * 0.06f, h * 0.26f), Size(w * 0.88f, h * 0.48f), style = Stroke(w * 0.09f))
+    drawCircle(tint, w * 0.13f, center)
+    if (!open) drawLine(tint, Offset(w * 0.15f, h * 0.85f), Offset(w * 0.85f, h * 0.15f), w * 0.09f)
+}
+
+/**
+ * A field. [secret]: hidden, with an eye to show it ([shown]). [error]: what is wrong with it, said under it.
+ * [prose]: text to spell-check and capitalise, as notes are; everything else is typed as it is.
+ * [done]: what the keyboard's Done does.
+ */
 @Composable
 private fun Field(
-    v: String, set: (String) -> Unit, label: String, secret: Boolean = false,
-    lines: Int = 1, trailing: (@Composable () -> Unit)? = null,
+    v: String, set: (String) -> Unit, label: String, secret: Boolean = false, lines: Int = 1,
+    error: String = "", prose: Boolean = false, done: (() -> Unit)? = null,
+    shown: MutableState<Boolean> = remember { mutableStateOf(false) },
+    trailing: (@Composable () -> Unit)? = null,
 ) = OutlinedTextField(
     v, set, label = { Text(label) }, singleLine = lines == 1, minLines = lines,
-    visualTransformation = if (secret) PasswordVisualTransformation() else VisualTransformation.None,
-    keyboardOptions = if (secret) KeyboardOptions(keyboardType = KeyboardType.Password) else KeyboardOptions.Default,
-    trailingIcon = trailing, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth(),
+    isError = error.isNotEmpty(),
+    supportingText = if (error.isEmpty()) null else ({ Text(error) }),
+    visualTransformation = if (secret && !shown.value) PasswordVisualTransformation() else VisualTransformation.None,
+    keyboardOptions = KeyboardOptions(
+        capitalization = if (prose) KeyboardCapitalization.Sentences else KeyboardCapitalization.None,
+        autoCorrectEnabled = prose,
+        keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
+        imeAction = if (done != null) ImeAction.Done else ImeAction.Default,
+    ),
+    keyboardActions = KeyboardActions(onDone = { done?.invoke() }),
+    trailingIcon = trailing ?: if (!secret) null else ({
+        Box(
+            Modifier.size(44.dp).clickable { shown.value = !shown.value }
+                .semantics { contentDescription = if (shown.value) "Hide" else "Show" },
+            contentAlignment = Alignment.Center,
+        ) { Eye(shown.value, muted) }
+    }),
+    shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth(),
 )
 
 @Composable
@@ -257,21 +312,33 @@ private fun grade(bits: Int) = when {
     else -> "Excellent" to Color(0xFF4FB286)
 }
 
-/** A bar that fills and turns from red to green as a password's bits grow. */
+/**
+ * A bar that fills and turns from red to green as a password's bits grow. With a [goal] (the store's own
+ * password: 256) the bar is full there, and says how far it is: a suggestion, nothing is refused.
+ */
 @Composable
-private fun Meter(bits: Int) = Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+private fun Meter(bits: Int, goal: Int = 0) = Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
     val (name, colour) = grade(bits)
+    val full = if (goal > 0) goal else 128
     Box(Modifier.fillMaxWidth().height(6.dp).background(MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(3.dp))) {
-        Box(Modifier.fillMaxWidth((bits / 128f).coerceIn(0f, 1f)).height(6.dp).background(colour, RoundedCornerShape(3.dp)))
+        Box(Modifier.fillMaxWidth((bits.toFloat() / full).coerceIn(0f, 1f)).height(6.dp).background(colour, RoundedCornerShape(3.dp)))
     }
-    Text("$name: about $bits bits", style = MaterialTheme.typography.bodySmall, color = colour)
+    val said = when {
+        goal == 0 -> "$name: about $bits bits"
+        bits >= goal -> "About $bits bits: the $goal suggested, and more"
+        else -> "About $bits bits of the $goal suggested"
+    }
+    Text(said, style = MaterialTheme.typography.bodySmall, color = colour)
 }
 
-/** The name, one card in the middle for what the app wants first, and the other way in, small, in the corner. */
+/**
+ * The name, one card in the middle for what the app wants first, and the other way in, small, in the corner.
+ * While [work] is busy the card says [wait] and offers to stop.
+ */
 @Composable
 private fun Front(
-    title: String, busy: Boolean, err: String, ask: String = "", link: String = "",
-    other: () -> Unit = {}, body: @Composable () -> Unit,
+    title: String, work: Work, ask: String = "", link: String = "", other: () -> Unit = {},
+    wait: String = "", body: @Composable () -> Unit,
 ) = Box(Modifier.fillMaxSize().padding(20.dp)) {
     Column(
         Modifier.align(Alignment.TopCenter).widthIn(max = 420.dp).verticalScroll(rememberScrollState()),
@@ -288,8 +355,7 @@ private fun Front(
         ) {
             Text(title, style = MaterialTheme.typography.titleLarge)
             body()
-            if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-            if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            Doing(work, wait)
         }
         Spacer(Modifier.height(64.dp))
     }
@@ -299,32 +365,74 @@ private fun Front(
     }
 }
 
+/** Under what was asked for: that it is being done, with a way to stop; or why it failed. */
+@Composable
+private fun Doing(work: Work, wait: String = "") {
+    if (work.busy) {
+        if (wait.isNotEmpty()) Text(wait, color = MaterialTheme.colorScheme.primary)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            LinearProgressIndicator(Modifier.weight(1f))
+            TextButton(work.stop) { Text("Cancel") }
+        }
+    }
+    if (work.err.isNotEmpty()) Text(work.err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+}
+
 @Composable
 private fun Create(host: Host, nav: Nav) {
     var pw by remember { mutableStateOf("") }
     var again by remember { mutableStateOf("") }
     var key by remember { mutableStateOf(Key.None) }
     var pin by remember { mutableStateOf("") }
-    val (busy, err, go) = rememberJob()
-    val differ = again.isNotEmpty() && pw != again
+    val shown = remember { mutableStateOf(false) }
+    // A generated password and its bits: known, where a typed one's are guessed.
+    var made by remember { mutableStateOf("" to 0) }
+    val work = rememberJob()
+    val ok = pw.isNotEmpty() && pw == again && !work.busy
+    val create = { if (ok) work.go { host.create(pw, key, pin) } }
     Front(
-        "Create your store", busy, if (differ) "The passwords differ" else err,
-        "A store on another device already?", "Join it", { nav.joining = true },
+        "Create your store", work, "A store on another device already?", "Join it", { nav.joining = true },
+        wait = if (key != Key.None) "Hold your YubiKey to the phone" else "",
     ) {
-        Field(pw, { pw = it }, "Password", secret = true)
-        if (pw.isNotEmpty()) Meter(host.strength(pw))
-        Field(again, { again = it }, "Password, again", secret = true)
+        Text(
+            "Its password opens everything, and is the way back in when all else is lost: a long one. 256 bits is the suggestion.",
+            style = MaterialTheme.typography.bodySmall, color = muted,
+        )
+        Field(pw, { pw = it }, "Password", secret = true, shown = shown)
+        if (pw.isNotEmpty()) Meter(if (pw == made.first) made.second else host.strength(pw), goal = 256)
+        OutlinedButton({
+            val g = Gen(words = true, count = 12, hyphens = true)
+            made = host.generate(g) to g.bits
+            pw = made.first
+            again = made.first
+            shown.value = true
+        }) { Text("Generate one and show it") }
+        if (pw.isNotEmpty() && pw == made.first) {
+            // In full, as the field cuts it off: four words a line.
+            Text(
+                pw.split('-').chunked(4).joinToString("-\n") { it.joinToString("-") },
+                Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background, RoundedCornerShape(10.dp)).padding(12.dp),
+                fontFamily = mono, fontSize = 13.sp,
+            )
+            Text(
+                "Twelve made-up words, ${made.second} bits. Write it down and keep it somewhere safe before going on.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        Field(
+            again, { again = it }, "Password, again", secret = true, shown = shown,
+            error = if (again.isNotEmpty() && pw != again) "The passwords differ" else "", done = create,
+        )
         Row(Modifier.fillMaxWidth().clickable { key = if (key == Key.None) Key.Quick else Key.None }, verticalAlignment = Alignment.CenterVertically) {
             Checkbox(key != Key.None, { key = if (it) Key.Quick else Key.None })
             Text("Use a hardware key (YubiKey)")
         }
         if (key != Key.None) {
-            Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost: make it long.", key == Key.Quick) { key = Key.Quick }
-            if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true)
+            Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
+            if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true, done = create)
             Choice("As a second factor", "Needed together with the password, every time.", key == Key.Both) { key = Key.Both }
         }
-        if (key != Key.None && busy) Text("Hold your YubiKey to the phone", color = MaterialTheme.colorScheme.primary)
-        Primary("Create store", enabled = pw.isNotEmpty() && pw == again && !busy) { go { host.create(pw, key, pin) } }
+        Primary("Create store", enabled = ok, go = create)
     }
 }
 
@@ -333,16 +441,18 @@ private fun Join(host: Host, nav: Nav) {
     var name by remember { mutableStateOf("home") }
     var code by remember { mutableStateOf("") }
     var pw by remember { mutableStateOf("") }
-    val (busy, err, go) = rememberJob()
-    Front("Join a store", busy, err, "No store yet?", "Create one", { nav.joining = false }) {
+    val work = rememberJob()
+    val ok = name.isNotBlank() && code.isNotBlank() && !work.busy
+    val join = { if (ok) work.go { host.join(name.trim(), code.trim(), pw) } }
+    Front("Join a store", work, "No store yet?", "Create one", { nav.joining = false }, wait = "Reaching the other device") {
         Text(
             "On the device that has it: Devices, Add a device (or pasa pair NAME). It shows a code and a password.",
             style = MaterialTheme.typography.bodySmall, color = muted,
         )
-        Field(name, { name = it }, "A name for that device")
+        Field(name, { name = it }, "A name for that device", error = if (name.isBlank()) "It needs a name" else "")
         Field(code, { code = it }, "Code") { TextButton({ host.scan { code = it } }) { Text("Scan") } }
-        Field(pw, { pw = it }, "Pairing password", secret = true)
-        Primary("Join", enabled = name.isNotBlank() && code.isNotBlank() && !busy) { go { host.join(name.trim(), code.trim(), pw) } }
+        Field(pw, { pw = it }, "Pairing password", secret = true, done = join)
+        Primary("Join", enabled = ok, go = join)
     }
 }
 
@@ -362,20 +472,23 @@ private fun Unlock(host: Host) {
     var pw by remember { mutableStateOf("") }
     var pin by remember { mutableStateOf("") }
     var byPassword by remember { mutableStateOf(false) }
-    val (busy, err, go) = rememberJob()
+    val work = rememberJob()
     val quick = host.quick
-    if (quick != null && !byPassword) return Front("Unlock", busy, err, "No key at hand?", "Use the password", { byPassword = true }) {
-        if (quick) Field(pin, { pin = it }, "PIN", secret = true)
-        Text("Then hold your YubiKey to the phone", style = MaterialTheme.typography.bodySmall, color = muted)
-        Primary("Unlock with the YubiKey", enabled = !busy) { go { host.unlockQuick(pin); pin = "" } }
+    val tap = "Hold your YubiKey to the phone"
+    if (quick != null && !byPassword) {
+        val open = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
+        return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap) {
+            if (quick) Field(pin, { pin = it }, "PIN", secret = true, done = open)
+            Primary("Unlock with the YubiKey", enabled = !work.busy, go = open)
+        }
     }
+    val open = { if (!work.busy) work.go { host.unlock(pw); pw = "" } }
     Front(
-        "Unlock", busy, err, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
-        { byPassword = false },
+        "Unlock", work, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
+        { work.stop(); byPassword = false }, wait = if (host.needsKey) tap else "",
     ) {
-        Field(pw, { pw = it }, "Password", secret = true)
-        if (host.needsKey) Text("Then hold your YubiKey to the phone", style = MaterialTheme.typography.bodySmall, color = muted)
-        Primary("Unlock", enabled = !busy) { go { host.unlock(pw); pw = "" } }
+        Field(pw, { pw = it }, "Password", secret = true, done = open)
+        Primary("Unlock", enabled = !work.busy, go = open)
     }
 }
 
@@ -602,7 +715,7 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
 private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -> Unit) {
     var name by remember { mutableStateOf(old) }
     var f by remember { mutableStateOf(if (old.isEmpty()) Form(pass = host.generate(nav.gen)) else Form()) }
-    var show by remember { mutableStateOf(old.isEmpty()) }
+    val show = remember { mutableStateOf(old.isEmpty()) }
     LaunchedEffect(old) { if (old.isNotEmpty()) f = host.form(host.get(old)) }
     var advanced by remember { mutableStateOf(false) }
     // The user names most entries have, to pick from.
@@ -616,7 +729,8 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
             Way("Advanced", advanced) { advanced = true }
         }
         if (advanced) {
-            Field(f.expires, { f = f.copy(expires = it) }, "Expires (YYYY-MM-DD; empty: never)")
+            val dated = f.expires.isEmpty() || Regex("\\d{4}-\\d{2}-\\d{2}").matches(f.expires)
+            Field(f.expires, { f = f.copy(expires = it) }, "Expires (YYYY-MM-DD; empty: never)", error = if (dated) "" else "A date as 2027-01-31")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val day = { days: Long -> java.text.SimpleDateFormat("yyyy-MM-dd").format(java.util.Date(System.currentTimeMillis() + days * 86_400_000)) }
                 OutlinedButton({ f = f.copy(expires = day(90)) }) { Text("In 90 days") }
@@ -626,7 +740,10 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
             Field(f.more, { f = f.copy(more = it) }, "Other fields: one a line, as  name: value", lines = 5)
             Text("Files are attached and removed on the entry's own screen.", style = MaterialTheme.typography.bodySmall, color = muted)
         } else {
-            Field(name, { name = it }, "Title (a / makes a group: mail/work)")
+            Field(
+                name, { name = it }, "Title (a / makes a group: mail/work)",
+                error = if (name.isBlank()) "It needs a title" else if (name.endsWith("/")) "A name goes after the /" else "",
+            )
             Field(f.user, { f = f.copy(user = it) }, "Username")
             val picks = users.filter { it != f.user && it.startsWith(f.user) }.take(4)
             if (picks.isNotEmpty()) Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -637,15 +754,13 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
-            Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = !show) {
-                TextButton({ show = !show }) { Text(if (show) "Hide" else "Show") }
-            }
+            Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = true, shown = show)
             Meter(host.strength(f.pass))
-            OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show = true }) { Text("Generate a password") }
+            OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show.value = true }) { Text("Generate a password") }
             Field(f.url, { f = f.copy(url = it) }, "URL")
             Field(f.tags, { f = f.copy(tags = it) }, "Tags (commas between)")
             Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address")
-            Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3)
+            Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3, prose = true)
         }
         Primary("Save", enabled = name.isNotBlank() && !name.endsWith("/")) {
             val (to, text) = name.trim() to host.text(f)
@@ -721,7 +836,8 @@ private fun Health(host: Host, nav: Nav) {
     val stats by produceState(listOf<Pair<String, String>>()) { value = runCatching { host.stats() }.getOrDefault(listOf()) }
     var numbers by remember { mutableStateOf(false) }
     var breached by remember { mutableStateOf<List<Pair<String, Long>>?>(null) }
-    val (busy, err, go) = rememberJob()
+    val work = rememberJob()
+    val (busy, _, go) = work
     Page("Password health", nav) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Way("Health", !numbers) { numbers = false }
@@ -759,8 +875,7 @@ private fun Health(host: Host, nav: Nav) {
             "A breach check asks haveibeenpwned.com. Of each password only the first 5 hex digits of its SHA-1 leave the phone; the site cannot tell which password was meant.",
             style = MaterialTheme.typography.bodySmall, color = muted,
         )
-        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        Doing(work, "Asking haveibeenpwned.com")
         OutlinedButton({
             go { breached = host.names().mapNotNull { n -> host.pwned(host.form(host.get(n)).pass).takeIf { it > 0 }?.let { n to it } } }
         }, enabled = !busy) { Text("Check for breaches online") }
@@ -839,7 +954,8 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
 @Composable
 private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     var pin by remember { mutableStateOf("") }
-    val (busy, err, go) = rememberJob()
+    val work = rememberJob()
+    val (busy, _, go) = work
     Text("Quick unlock", style = MaterialTheme.typography.bodyLarge)
     Text(
         "A tap of your YubiKey and a PIN open the store on this phone. The password still opens it alone: keep it long.",
@@ -848,15 +964,14 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     when (val q = host.quick) {
         null -> {
             Field(pin, { pin = it }, "PIN (empty: none)", secret = true)
-            OutlinedButton({ go { host.setQuick(pin); pin = "" } }, enabled = !busy) { Text("Turn on: hold your YubiKey to the phone") }
+            OutlinedButton({ go { host.setQuick(pin); pin = "" } }, enabled = !busy) { Text("Turn on") }
         }
         else -> Row(verticalAlignment = Alignment.CenterVertically) {
             Text(if (q) "On, with a PIN" else "On, no PIN", Modifier.weight(1f))
             TextButton({ go { host.setQuick(null) } }) { Text("Turn off") }
         }
     }
-    if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-    if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+    Doing(work, "Hold your YubiKey to the phone")
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     for ((what, how) in listOf(
         "Locking" to "The store locks whenever the app leaves the screen.",

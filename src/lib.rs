@@ -355,7 +355,12 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(self.dir.join("key.lock"))?;
-        lock.lock()?;
+        // One writer at a time, across processes. Android's std has no file
+        // lock; an app there is one process, and `loaded` orders its threads.
+        match lock.lock() {
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+            locked => locked?,
+        }
         let mut loaded = self.loaded.lock().unwrap();
         let now = fs::read(self.dir.join("key")).unwrap_or_default();
         ensure!(
