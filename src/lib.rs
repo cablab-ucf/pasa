@@ -721,20 +721,24 @@ pub fn quick(dir: &Path) -> Option<(Vec<u8>, bool)> {
     Some((f.get(..32)?.to_vec(), *f.get(32)? == 1))
 }
 
+/// One of `abc`, each as likely as the next.
+fn pick(abc: &[u8]) -> char {
+    let fair = 256 - 256 % abc.len();
+    loop {
+        let b = rand::<1>()[0] as usize;
+        if b < fair {
+            break abc[b % abc.len()] as char;
+        }
+    }
+}
+
 pub fn generate(len: usize, symbols: bool) -> String {
     let mut abc: Vec<u8> =
         (b'a'..=b'z').chain(b'A'..=b'Z').chain(b'0'..=b'9').collect();
     if symbols {
         abc.extend(b"!#$%&*+-=?@^_~.,:;");
     }
-    let fair = 256 - 256 % abc.len();
-    let pick = || loop {
-        let b = rand::<1>()[0] as usize;
-        if b < fair {
-            break abc[b % abc.len()] as char;
-        }
-    };
-    (0..len).map(|_| pick()).collect()
+    (0..len).map(|_| pick(&abc)).collect()
 }
 
 /// `pass`: line 1; `otp`: the code of an otpauth://totp/ URI; else
@@ -766,12 +770,17 @@ const ONSETS: [&str; 32] = [
 const VOWELS: [&str; 8] = ["a", "e", "i", "o", "u", "ai", "ee", "ou"];
 const CODAS: [&str; 8] = ["", "n", "m", "l", "r", "ng", "rn", "ll"];
 
+/// The symbols that may stand between speakable words: sixteen, none a
+/// letter's 1337 form.
+pub const SEPS: &str = "-_.!#%&*+=?^~,:;";
+
 /// A password to say aloud: `words` made-up words of two syllables, 22
-/// bits each (four: 88). `hyphens`: snur-deslat-genres, else
-/// SnurDeslatGenres. `leet`: a e i o s t as 4 3 1 0 5 7, digits that
-/// stand nowhere else, so nothing is lost; a capital stays a letter.
-pub fn speakable(words: usize, hyphens: bool, leet: bool) -> String {
-    let word = |_| {
+/// bits each (four: 88). Between two words stands one of `seps`, drawn
+/// anew each time (snur-deslat_genres); none: SnurDeslatGenres. `leet`:
+/// a e l o s t are, one time in two, @ 3 1 0 $ 7, which stand nowhere
+/// else, so nothing is lost; a capital stays a letter.
+pub fn speakable(words: usize, seps: &str, leet: bool) -> String {
+    let word = |i| {
         let mut w = String::new();
         for _ in 0..2 {
             let r = u16::from_be_bytes(rand()) as usize;
@@ -779,17 +788,29 @@ pub fn speakable(words: usize, hyphens: bool, leet: bool) -> String {
             w += VOWELS[r >> 5 & 7];
             w += CODAS[r >> 8 & 7];
         }
-        if !hyphens {
-            w = w[..1].to_uppercase() + &w[1..];
-        }
-        let digit = |c| match "aeiost".find(c) {
-            Some(i) if leet => b"431057"[i] as char,
+        let digit = |c| match "aelost".find(c) {
+            Some(i) if leet && rand::<1>()[0] & 1 == 1 => b"@310$7"[i] as char,
             _ => c,
         };
-        w.chars().map(digit).collect::<String>()
+        let mut w: String = match seps.is_empty() {
+            true => w[..1].to_uppercase() + &w[1..],
+            false => w,
+        }
+        .chars()
+        .map(digit)
+        .collect();
+        if i > 0 && !seps.is_empty() {
+            w.insert(0, pick(seps.as_bytes()));
+        }
+        w
     };
-    let words: Vec<String> = (0..words).map(word).collect();
-    words.join(if hyphens { "-" } else { "" })
+    (0..words).map(word).collect()
+}
+
+/// The bits of chance in [`speakable`]: its words', and its separators'.
+pub fn speakable_bits(words: usize, seps: &str) -> u32 {
+    let gaps = words.saturating_sub(1) as f64;
+    22 * words as u32 + (gaps * (seps.len().max(1) as f64).log2()) as u32
 }
 
 /// Where an entry's attachments are: entries of their own, hidden from
@@ -984,6 +1005,20 @@ impl Form {
         f
     }
 
+    /// Its fields under their names, in the order they are shown.
+    pub fn fields(&self) -> [(&'static str, &str); 8] {
+        [
+            ("Password", &self.pass),
+            ("Username", &self.user),
+            ("URL", &self.url),
+            ("One-time code", &self.otp),
+            ("Tags", &self.tags),
+            ("Expires", &self.expires),
+            ("Other fields", &self.more),
+            ("Notes", &self.notes),
+        ]
+    }
+
     /// The entry's text again: what [`Form::parse`] reads back the same.
     pub fn text(&self) -> String {
         let one = |s: &str| s.replace(['\n', '\r'], " ");
@@ -1157,12 +1192,25 @@ mod tests {
             assert!(seen.insert(format!("{o}{v}{c}")));
         }
         assert_eq!(seen.len(), 1 << 11);
-        let p = speakable(4, true, false);
+        let p = speakable(4, "-", false);
         assert_eq!(p.split('-').count(), 4);
         assert!(p.chars().all(|c| c == '-' || c.is_ascii_lowercase()));
-        let p = speakable(3, false, true);
-        assert_eq!(p.chars().filter(|c| c.is_ascii_uppercase()).count(), 3);
-        assert!(!p.contains(['a', 'e', 'i', 'o', 's', 't', '-']));
+        // Some letters as 1337, not all; what they become is no letter of
+        // a syllable and no separator, so it reads back.
+        let p = speakable(64, "", true);
+        assert_eq!(p.chars().filter(|c| c.is_ascii_uppercase()).count(), 64);
+        assert!(p.contains(['@', '3', '1', '0', '$', '7']));
+        assert!(p.contains(['a', 'e', 'l', 'o', 's', 't']));
+        assert!(!SEPS.contains(['@', '3', '1', '0', '$', '7']));
+        // Any of the separators, and their bits.
+        let p = speakable(64, SEPS, false);
+        let seps: std::collections::HashSet<char> =
+            p.chars().filter(|c| !c.is_ascii_lowercase()).collect();
+        assert!(seps.len() > 8 && seps.iter().all(|c| SEPS.contains(*c)));
+        assert_eq!(p.chars().filter(|c| SEPS.contains(*c)).count(), 63);
+        assert_eq!(speakable_bits(4, ""), 88);
+        assert_eq!(speakable_bits(4, "-_."), 88 + 4);
+        assert_eq!(speakable_bits(5, SEPS), 110 + 16);
     }
 
     #[test]
@@ -1248,7 +1296,7 @@ mod tests {
         assert_eq!(strength(""), 0);
         assert!(strength("k3Vq9xLp2mZt") >= 65);
         assert!(strength(&generate(24, true)) >= 100);
-        assert!(strength(&speakable(4, false, false)) >= 65);
+        assert!(strength(&speakable(4, "", false)) >= 65);
         // SHA-1("password") = 5BAA6 1E4C9B93F3F0682250B6CF8331B7EE68FD8.
         let (sent, kept) = pwned_key("password");
         assert_eq!(

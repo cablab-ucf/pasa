@@ -358,11 +358,12 @@ pub extern "system" fn Java_com_apasa_Native_speakable<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     words: i32,
-    hyphens: bool,
+    seps: JString<'l>,
     leet: bool,
 ) -> JString<'l> {
     run(&mut env, |e| {
-        Ok(e.new_string(pasa::speakable(words as usize, hyphens, leet))?)
+        let seps = seps.to_string().replace(|c: char| !c.is_ascii(), "");
+        Ok(e.new_string(pasa::speakable(words as usize, &seps, leet))?)
     })
 }
 

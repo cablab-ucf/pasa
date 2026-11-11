@@ -20,7 +20,9 @@ pasa cp NAME [FIELD]         to the clipboard for 45 s
 pasa set NAME                from stdin (a terminal: the password)
 pasa edit NAME               in $EDITOR
 pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: copy)
-pasa gen NAME [N] -w [-d] [-l]  ... of N speakable words (-d: dash-ed, -l: 1337)
+pasa gen NAME [N] -w [-d] [-s CHARS] [-l]
+                             ... of N speakable words (-d: dash-ed, -s: one of
+                             CHARS between them, -l: some letters as 1337)
 pasa attach NAME FILE        keep a file with an entry
 pasa files NAME [FILE]       those files, or one, to stdout
 pasa health [--pwned]        weak, reused and expired passwords; --pwned: breached ones,
@@ -319,7 +321,12 @@ fn main() -> Result<()> {
             let len = a.get(2).and_then(|l| l.parse().ok());
             let pw = match flag("-w") {
                 true => {
-                    pasa::speakable(len.unwrap_or(4), flag("-d"), flag("-l"))
+                    let at = a.iter().position(|x| *x == "-s");
+                    let seps = at.and_then(|i| a.get(i + 1)).copied();
+                    let seps =
+                        seps.unwrap_or(if flag("-d") { "-" } else { "" });
+                    ensure!(seps.is_ascii(), "-s: ASCII characters");
+                    pasa::speakable(len.unwrap_or(4), seps, flag("-l"))
                 }
                 false => pasa::generate(len.unwrap_or(24), !flag("-n")),
             };

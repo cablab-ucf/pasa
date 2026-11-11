@@ -35,6 +35,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -97,12 +98,34 @@ data class Health(
 /** A hardware key's part: none; a tap (and PIN) that opens the store beside the password; or needed with the password. */
 enum class Key { None, Quick, Both }
 
-/** How a password is made: characters, or words to say aloud (22 bits each). */
+/** The symbols that may stand between speakable words (pasa::SEPS). */
+const val SEPS = "-_.!#%&*+=?^~,:;"
+
+/**
+ * How a password is made: characters, or words to say aloud (22 bits each) with one of [seps]
+ * between two (none: CapitalWords) and, with [leet], some letters as @ 3 1 0 $ 7.
+ */
 data class Gen(
     val words: Boolean = false, val len: Int = 24, val symbols: Boolean = true,
-    val count: Int = 4, val hyphens: Boolean = false, val leet: Boolean = false,
+    val count: Int = 4, val seps: String = "", val leet: Boolean = false,
 ) {
-    val bits get() = if (words) 22 * count else (len * kotlin.math.log2(if (symbols) 80.0 else 62.0)).toInt()
+    val bits get() =
+        if (words) 22 * count + ((count - 1) * kotlin.math.log2(maxOf(seps.length, 1).toDouble())).toInt()
+        else (len * kotlin.math.log2(if (symbols) 80.0 else 62.0)).toInt()
+}
+
+/** Field by field, the lines of [was] that went (-), and those of [now]: kept ( ) or new (+). */
+fun changes(was: Form, now: Form): List<Pair<String, List<Pair<Char, String>>>> {
+    val of = { f: Form ->
+        listOf(
+            "Password" to f.pass, "Username" to f.user, "URL" to f.url, "One-time code" to f.otp,
+            "Tags" to f.tags, "Expires" to f.expires, "Other fields" to f.more, "Notes" to f.notes,
+        )
+    }
+    return of(was).zip(of(now)).filter { (w, n) -> w.second.isNotEmpty() || n.second.isNotEmpty() }.map { (w, n) ->
+        val (a, b) = w.second.lines().filter { it.isNotEmpty() } to n.second.lines().filter { it.isNotEmpty() }
+        w.first to a.filter { it !in b }.map { '-' to it } + b.map { (if (it in a) ' ' else '+') to it }
+    }
 }
 
 /** What the screens ask of the app: the store, the clipboard, the key, the camera. */
@@ -415,7 +438,7 @@ private fun Create(host: Host, nav: Nav) {
         Field(pw, { pw = it }, "Password", secret = true, shown = shown)
         if (pw.isNotEmpty()) Meter(if (pw == made.first) made.second else host.strength(pw), goal = 256)
         OutlinedButton({
-            val g = Gen(words = true, count = 12, hyphens = true)
+            val g = Gen(words = true, count = 12, seps = "-")
             made = host.generate(g) to g.bits
             pw = made.first
             again = made.first
@@ -808,32 +831,37 @@ private fun Tick(text: String, on: Boolean, set: (Boolean) -> Unit) =
 private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, close: () -> Unit) {
     val g = nav.gen
     var n by remember { mutableIntStateOf(0) }
-    val pw = remember(g, n) { host.generate(g) }
+    val made = remember(g, n) { host.generate(g) }
+    var pw by remember(made) { mutableStateOf(made) }
+    val bits = if (pw == made) g.bits else host.strength(pw)
     AlertDialog(
         close, title = { Text("Password generator") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(
-                    pw, Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background, RoundedCornerShape(10.dp)).padding(12.dp),
-                    fontFamily = mono,
+                OutlinedTextField(
+                    pw, { pw = it }, Modifier.fillMaxWidth(), textStyle = LocalTextStyle.current.copy(fontFamily = mono),
+                    shape = RoundedCornerShape(10.dp),
                 )
+                Meter(bits)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Way("Characters", !g.words) { nav.gen = g.copy(words = false) }
                     Way("Speakable", g.words) { nav.gen = g.copy(words = true) }
                 }
                 if (g.words) {
-                    Label("${g.count} words  \u00B7  ${g.bits} bits")
+                    Label("${g.count} words")
                     Slider(g.count.toFloat(), { nav.gen = g.copy(count = it.toInt()) }, valueRange = 3f..8f, steps = 4)
-                    Row {
-                        Tick("with-dashes", g.hyphens) { nav.gen = g.copy(hyphens = it) }
-                        Tick("1337", g.leet) { nav.gen = g.copy(leet = it) }
-                    }
+                    Label("BETWEEN WORDS")
+                    for (row in listOf(listOf("" to "Nothing", "-" to "-", "." to "."), listOf("_" to "_", "-_." to "- _ .", SEPS to "Any symbol")))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            for ((seps, name) in row) Way(name, g.seps == seps) { nav.gen = g.copy(seps = seps) }
+                        }
+                    Tick("1337: some letters as @ 3 1 0 \$ 7", g.leet) { nav.gen = g.copy(leet = it) }
                 } else {
-                    Label("${g.len} characters  \u00B7  ${g.bits} bits")
+                    Label("${g.len} characters")
                     Slider(g.len.toFloat(), { nav.gen = g.copy(len = it.toInt()) }, valueRange = 8f..64f)
                     Tick("Symbols", g.symbols) { nav.gen = g.copy(symbols = it) }
                 }
-                Text("New entries start with a password made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
+                Text("Change it by hand and its bits are counted again. New entries start with a password made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
             }
         },
         confirmButton = { TextButton({ copy("Generated password", pw) }) { Text("Copy") } },
@@ -904,20 +932,47 @@ private fun Health(host: Host, nav: Nav) {
 private fun History(host: Host, nav: Nav, name: String, copy: (String, String) -> Unit, go: (suspend () -> String) -> Unit) {
     val all by produceState(listOf<Pair<Long, String>>(), name) { value = runCatching { host.history(name) }.getOrDefault(listOf()) }
     val date = remember { java.text.SimpleDateFormat("yyyy-MM-dd  HH:mm") }
+    // The version looked at (none: -1), the one it is compared with, and whether passwords show.
+    var seen by remember(name) { mutableIntStateOf(-1) }
+    var with by remember(name) { mutableIntStateOf(0) }
+    var show by remember { mutableStateOf(false) }
     Page("History", nav) {
         Text(name, color = muted)
         all.forEachIndexed { i, (ms, body) ->
             val f = host.form(body)
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(date.format(java.util.Date(ms)), style = MaterialTheme.typography.bodyLarge)
+            val at = date.format(java.util.Date(ms))
+            Row(Modifier.fillMaxWidth().clickable { seen = if (seen == i) -1 else i }, verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
+                    Text(at, style = MaterialTheme.typography.bodyLarge, fontWeight = if (seen == i) FontWeight.SemiBold else null)
                     Label(if (body.isEmpty()) "deleted" else if (i == 0) "now" else f.user)
                 }
-                if (body.isNotEmpty()) TextButton({ copy("That version's password", f.pass) }) { Text("Copy") }
-                if (body.isNotEmpty() && i > 0) TextButton({ go { host.put(name, body); nav.screen = Screen.Entry(name); "$name: restored" } }) { Text("Restore") }
+                if (with == i) Label("compared with") else TextButton({ with = i }) { Text("Compare") }
+            }
+            if (seen == i) Column(
+                Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)).padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                // The older of the two is what was, whichever was tapped.
+                val other = all.getOrNull(with)?.takeIf { with != i }
+                val then = other?.let { date.format(java.util.Date(it.first)) }
+                Label(if (then == null) "AS IT WAS" else if (with < i) "$at  TO  $then" else "$then  TO  $at")
+                val was = if (other != null && with > i) host.form(other.second) else f
+                val now = if (other != null && with < i) host.form(other.second) else f
+                for ((field, lines) in changes(was, now)) {
+                    Label(field)
+                    for ((mark, line) in lines) Text(
+                        "$mark " + if (field == "Password" && !show) "\u2022".repeat(8) else line, fontFamily = mono,
+                        color = when (mark) { '-' -> MaterialTheme.colorScheme.error; '+' -> MaterialTheme.colorScheme.primary; else -> Color.Unspecified },
+                    )
+                }
+                Row {
+                    TextButton({ show = !show }) { Text(if (show) "Hide password" else "Show password") }
+                    if (body.isNotEmpty()) TextButton({ copy("That version's password", f.pass) }) { Text("Copy") }
+                    if (body.isNotEmpty() && i > 0) TextButton({ go { host.put(name, body); nav.screen = Screen.Entry(name); "$name: restored" } }) { Text("Restore") }
+                }
             }
         }
-        Text("Nothing is ever overwritten: each change is a new version.", style = MaterialTheme.typography.bodySmall, color = muted)
+        Text("Tap a version to see it; Compare sets what it is compared with. Nothing is ever overwritten.", style = MaterialTheme.typography.bodySmall, color = muted)
     }
 }
 
