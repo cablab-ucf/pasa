@@ -78,6 +78,8 @@ class MainActivity : ComponentActivity(), Host {
         super.onStop()
         keySecret?.fill(0)
         keySecret = null
+        answer?.fill(0)
+        answer = null
         if (isChangingConfigurations || picking) return
         if (setting("lock") == 0) lock() else main.postDelayed(locker, setting("lock") * 1000L)
     }
@@ -151,9 +153,19 @@ class MainActivity : ComponentActivity(), Host {
         readQuick()
     }
 
+    /** The key's answer to the quick challenge, from a tap made before the PIN was typed: gone when the app leaves the screen. */
+    private var answer: ByteArray? = null
+
+    override suspend fun tapQuick() {
+        answer = yubikey(this, Native.quick(dir)!!.copyOf(32))
+    }
+
     override suspend fun unlockQuick(pin: String) {
-        val r = yubikey(this, Native.quick(dir)!!.copyOf(32))
+        val r = answer ?: yubikey(this, Native.quick(dir)!!.copyOf(32))
+        // A wrong PIN leaves the answer for the next try; the right one ends it.
         handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
+        r.fill(0)
+        answer = null
         if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 

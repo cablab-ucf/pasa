@@ -60,9 +60,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -167,6 +170,8 @@ interface Host {
     fun nfcSettings()
     suspend fun create(pw: String, key: Key, pin: String)
     suspend fun unlock(pw: String)
+    /** Waits for the YubiKey and keeps its answer, for [unlockQuick] to open with once the PIN is typed. */
+    suspend fun tapQuick()
     suspend fun unlockQuick(pin: String)
     /** Quick unlock on with [pin] (empty: none), or off (null). */
     suspend fun setQuick(pin: String?)
@@ -389,8 +394,13 @@ private fun Field(
     shown: MutableState<Boolean> = remember { mutableStateOf(false) },
     /** A PIN of digits alone: the number pad. */
     digits: Boolean = false,
+    /** Takes the keyboard as it appears. */
+    focus: Boolean = false,
     trailing: (@Composable () -> Unit)? = null,
-) = OutlinedTextField(
+) = run {
+    val here = remember { FocusRequester() }
+    if (focus) LaunchedEffect(Unit) { runCatching { here.requestFocus() } }
+    OutlinedTextField(
     v, set, label = { Text(label) }, singleLine = lines == 1, minLines = lines,
     isError = error.isNotEmpty(),
     supportingText = if (error.isEmpty()) null else ({ Text(error) }),
@@ -409,8 +419,9 @@ private fun Field(
             contentAlignment = Alignment.Center,
         ) { Eye(shown.value, muted) }
     }),
-    shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth(),
+    shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().focusRequester(here),
 )
+}
 
 @Composable
 private fun Primary(text: String, enabled: Boolean = true, go: () -> Unit) =
@@ -616,17 +627,57 @@ private fun Unlock(host: Host) {
     val work = rememberJob()
     val quick = host.quick
     val tap = "Hold your YubiKey still against the phone, or plug it in"
+    // The app listens for a key from the moment this shows: open the app, tap the key. (While it listens,
+    // Android does not open the web address a YubiKey carries.) What the listening ran into, and a way to
+    // start it again.
+    var heard by remember { mutableStateOf("") }
+    var again by remember { mutableIntStateOf(0) }
+    val listen: suspend (suspend () -> Unit) -> Unit = { tapped ->
+        while (true) {
+            try {
+                tapped()
+                heard = ""
+                break
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                heard = e.message?.removePrefix("Rust error: ") ?: "It failed"
+                // No way to a key at all: said, with Try again; anything else, the next tap may do better.
+                if (host.nfcOff || "NFC" in heard) break
+                delay(400)
+            }
+        }
+    }
     if (quick != null && !byPassword) {
+        // The key's answer is taken at the tap and kept; the PIN, if there is one, is asked for after.
+        var tapped by remember { mutableStateOf(false) }
         val open = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
-        return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap, host = host) {
-            // The number pad, if the PIN that was set is digits alone.
-            if (quick) Field(pin, { pin = it }, "PIN", secret = true, done = open, digits = host.setting("pinDigits") == 1)
-            NfcOff(host)
-            Primary("Unlock with the YubiKey", enabled = !work.busy, go = open)
+        LaunchedEffect(work.busy, host.nfcOff, tapped, again) {
+            if (!work.busy && !tapped) listen { host.tapQuick(); tapped = true; if (!quick) open() }
+        }
+        return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = if (tapped) "" else tap, host = host) {
+            if (!tapped) {
+                Text("Hold your YubiKey to the phone, or plug it in", color = MaterialTheme.colorScheme.primary)
+                if (quick) Text("The PIN is asked for after.", style = MaterialTheme.typography.bodySmall, color = muted)
+                if (heard.isNotEmpty()) Text(heard, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                NfcOff(host)
+                if (heard.isNotEmpty()) OutlinedButton({ heard = ""; again++ }) { Text("Try again") }
+            } else if (quick) {
+                Text("The key is read. Now the PIN:", color = MaterialTheme.colorScheme.primary)
+                // The number pad, if the PIN that was set is digits alone.
+                Field(pin, { pin = it }, "PIN", secret = true, done = open, digits = host.setting("pinDigits") == 1, focus = true)
+                Primary("Unlock", enabled = !work.busy, go = open)
+            }
         }
     }
     var byKey by remember { mutableStateOf(false) }
     val open = { if (!work.busy) { byKey = false; work.go { host.unlock(pw); pw = "" } } }
+    // A security key (CTAP2) of this store's opens it at a tap; one with a PIN says so, and is tapped again.
+    val typed by rememberUpdatedState(pin)
+    val ctap = host.fidoKeys > 0 && !host.needsKey
+    if (ctap) LaunchedEffect(work.busy, host.nfcOff, again) {
+        if (!work.busy) listen { host.unlockFido(typed); pin = "" }
+    }
     Front(
         "Unlock", work, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
         { work.stop(); byPassword = false },
@@ -638,8 +689,10 @@ private fun Unlock(host: Host) {
         // A security key of this store's opens it without the password.
         if (host.fidoKeys > 0) {
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            if (host.fidoPin) Field(pin, { pin = it }, "Security key PIN, if any", secret = true)
-            OutlinedButton({ byKey = true; work.go { host.unlockFido(pin); pin = "" } }, enabled = !work.busy) { Text("Unlock with a security key") }
+            if (ctap) Text("Or hold your security key to the phone, or plug it in and touch it.", color = MaterialTheme.colorScheme.primary)
+            if (ctap && heard.isNotEmpty()) Text(heard, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            if (host.fidoPin || "PIN" in heard) Field(pin, { pin = it }, "Security key PIN, if any", secret = true, focus = "has a PIN" in heard)
+            if (!ctap || heard.isNotEmpty() && (host.nfcOff || "NFC" in heard)) OutlinedButton({ byKey = true; heard = ""; again++; work.go { host.unlockFido(pin); pin = "" } }, enabled = !work.busy) { Text("Unlock with a security key") }
         }
     }
 }
