@@ -21,7 +21,8 @@ pub fn command(dir: &Path, exe: &Path, args: &[&str]) -> Command {
     if let Some(profile) = profile(dir, exe) {
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p").arg(profile).arg(exe).args(args);
-        return c.env("PASA_SANDBOX", "1");
+        c.env("PASA_SANDBOX", "1");
+        return c;
     }
     let _ = dir;
     let mut c = Command::new(exe);
@@ -81,7 +82,7 @@ fn profile(dir: &Path, exe: &Path) -> Option<String> {
     let (v, net, exe) = (at(&own[0])?, at(&own[1])?, at(exe)?);
     let certs: String = certs()
         .iter()
-        .filter_map(|c| at(c))
+        .filter_map(|c| at(c.as_path()))
         .map(|c| format!(" (subpath {c})"))
         .collect();
     Some(format!(
