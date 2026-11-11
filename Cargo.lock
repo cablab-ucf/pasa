@@ -180,7 +180,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apasa-jni"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "jni 0.22.4",
@@ -1332,6 +1332,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2736,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "kdbx2pasa"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2818,6 +2838,17 @@ dependencies = [
  "euclid",
  "polycool",
  "smallvec",
+]
+
+[[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3938,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "pasa"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "age",
  "age-core",
@@ -3951,6 +3982,7 @@ dependencies = [
  "humantime",
  "irnet",
  "iroh",
+ "landlock",
  "pairir",
  "pushir",
  "qrcode",

@@ -24,7 +24,6 @@ pub struct View {
 
 impl View {
     pub fn new(s: Store) -> View {
-        aside(false);
         let (filter, note) = Default::default();
         let mut v = View {
             s,

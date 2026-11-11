@@ -42,9 +42,10 @@ pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
                              password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
-pasa pair NAME [--qr]        show a code (--qr: offline) for a device, called NAME
-                             here, and serve until it has synced; either may hold the store
-pasa join NAME CODE          take the code device NAME shows, and dial it
+pasa pair NAME [--qr]        for a new device, called NAME here: a code to type, or a QR
+                             code (offline) after its password; serve until it has synced
+pasa join NAME CODE          take the code device NAME shows (a QR code's: and its
+                             password), then the store's password; dial it
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 
 fn ask(p: &str) -> Result<Secret> {
@@ -405,6 +406,8 @@ fn main() -> Result<()> {
     let a: Vec<&str> = a.iter().map(String::as_str).collect();
     let flag = |f| a.contains(&f);
     match a[..] {
+        #[cfg(feature = "sync")]
+        ["--net", ..] => return net_side(&a[1..]),
         [] | ["ls"] => {
             let s = open()?;
             let e = s.entries()?;
@@ -647,7 +650,7 @@ fn main() -> Result<()> {
     }
     record();
     #[cfg(feature = "sync")]
-    if home().join("peers").exists() {
+    if pasa::sync::net(&home()).join("peers").exists() {
         sync(&["sync", "--news"])?;
     }
     Ok(())
@@ -656,18 +659,15 @@ fn main() -> Result<()> {
 /// `pasa sync` beside a view, unseen: what it brings shows as `v/` changes.
 #[cfg(any(feature = "tui", feature = "gui"))]
 fn aside(news: bool) {
-    if cfg!(feature = "sync") && home().join("peers").exists() {
+    #[cfg(feature = "sync")]
+    if pasa::sync::net(&home()).join("peers").exists() {
         let c = std::env::current_exe().map(Command::new);
         let _ = c.map(|mut c| {
             c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
             c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         });
     }
-}
-
-#[cfg(feature = "sync")]
-fn report_all(r: Vec<(String, Result<usize>)>) {
-    r.into_iter().for_each(|(w, r)| report(&w, r))
+    let _ = news;
 }
 
 #[cfg(feature = "sync")]
@@ -681,6 +681,138 @@ fn report(who: &str, r: Result<usize>) {
     }
 }
 
+/// The network side ([`net_side`]) as a child that sees `v/` and `net/`
+/// alone; it ends when its stdin closes (this process ends, or drops it).
+#[cfg(feature = "sync")]
+fn net(args: &[&str]) -> Result<std::process::Child> {
+    let dir = home();
+    pasa::sync::net(&dir); // moved beside v/ here, where the child may not
+    let a: Vec<&str> = ["--net"].iter().chain(args).copied().collect();
+    let mut c = pasa::confine::command(&dir, &std::env::current_exe()?, &a);
+    c.stdin(Stdio::piped()).stdout(Stdio::piped());
+    Ok(c.spawn()?)
+}
+
+/// A network child's lines, as they come.
+#[cfg(feature = "sync")]
+fn lines(c: &mut std::process::Child) -> impl Iterator<Item = String> + use<> {
+    use std::io::BufRead;
+    let out = c.stdout.take().map(std::io::BufReader::new);
+    out.into_iter().flat_map(|o| o.lines().map_while(Result::ok))
+}
+
+/// What a sync said of each peer, a line each: `who \t n` or `who \t !why`.
+#[cfg(feature = "sync")]
+fn results(
+    c: &mut std::process::Child,
+) -> impl Iterator<Item = (String, Result<usize>)> + use<> {
+    lines(c).filter_map(|l| {
+        let (w, r) = l.split_once('\t')?;
+        let r = match r.strip_prefix('!') {
+            Some(e) => Err(anyhow::anyhow!(e.to_string())),
+            None => r.parse().map_err(Into::into),
+        };
+        Some((w.to_string(), r))
+    })
+}
+
+/// Run a network child to its end, saying what it brought.
+#[cfg(feature = "sync")]
+fn net_run(args: &[&str]) -> Result<()> {
+    let mut c = net(args)?;
+    results(&mut c).for_each(|(w, r)| report(&w, r));
+    ensure!(c.wait()?.success(), "the network side failed");
+    Ok(())
+}
+
+/// Serve until `name` has synced once: it dials here.
+#[cfg(feature = "sync")]
+fn serve_until(name: &str) -> Result<()> {
+    eprintln!("waiting for {name} to sync (Ctrl-C: later, by pasa serve)");
+    let mut c = net(&["serve"])?;
+    for (w, r) in results(&mut c) {
+        let done = w == name && r.is_ok();
+        report(&w, r);
+        if done {
+            return Ok(());
+        }
+    }
+    bail!("not served here: {name} syncs with whatever serves this store")
+}
+
+/// The network side, first thing confined to `v/` and `net/`: a sync,
+/// serving, listening, or a short code's half of a pairing (what it
+/// carries comes on stdin, sealed). It ends when its parent does.
+#[cfg(feature = "sync")]
+fn net_side(a: &[&str]) -> Result<()> {
+    let dir = home();
+    if !pasa::confine::confine(&dir)? {
+        eprintln!("pasa: the network side is not confined: no Landlock here");
+    }
+    let mut got = String::new();
+    if a == ["give"] {
+        std::io::stdin().read_line(&mut got)?;
+    }
+    std::thread::spawn(|| {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        std::process::exit(0)
+    });
+    net_go(&dir, a, got.trim())
+}
+
+#[cfg(feature = "sync")]
+#[tokio::main]
+async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
+    use pasa::sync;
+    fn said(who: &str, r: Result<usize>) {
+        match r {
+            Ok(n) => println!("{who}\t{n}"),
+            Err(e) => {
+                println!("{who}\t!{}", format!("{e:#}").replace('\n', " "))
+            }
+        }
+    }
+    match a {
+        ["sync", ..] => {
+            let r = sync::sync(dir, a.contains(&"--news")).await?;
+            r.into_iter().for_each(|(w, r)| said(&w, r))
+        }
+        ["serve"] => sync::serve(dir, said).await?,
+        ["listen"] => sync::listen(dir, said).await?,
+        ["give"] => {
+            let (code, end) = sync::give(&B64.decode(got.as_bytes())?).await?;
+            println!("{code}");
+            println!(
+                "{}",
+                match end.await? {
+                    pairir::End::Taken => "taken",
+                    pairir::End::Expired => "expired",
+                    pairir::End::Spent => "spent",
+                }
+            );
+        }
+        ["take", code] => println!("{}", B64.encode(&sync::fetch(code).await?)),
+        _ => bail!("{USAGE}"),
+    }
+    Ok(())
+}
+
+/// A QR code's password: typed, or made here; said before the code shows,
+/// never beside it.
+#[cfg(feature = "sync")]
+fn qr_password(name: &str) -> Result<Secret> {
+    let pw = ask("QR code password (Enter: make one): ")?;
+    if !pw.is_empty() {
+        return Ok(pw);
+    }
+    let pw = pasa::speakable(2, "-", false);
+    eprint!(
+        "Its password: {pw}\nType it on {name} after scanning. Enter: the QR code "
+    );
+    std::io::stdin().read_line(&mut String::new())?;
+    Ok(Zeroizing::new(pw.into_bytes()))
+}
+
 #[cfg(feature = "sync")]
 #[tokio::main]
 async fn sync(a: &[&str]) -> Result<()> {
@@ -688,78 +820,69 @@ async fn sync(a: &[&str]) -> Result<()> {
     let dir = home();
     match a {
         ["pair", name, ..] => {
-            let (pw, qr) = (pairir::password(), a.contains(&"--qr"));
-            // A store here goes along, sealed; else it comes from there.
-            let mut s = dir.join("key").exists().then(open).transpose()?;
-            let (code, end, hand) = sync::pair(&dir, name, &pw, qr).await?;
-            if let Some(s) = &mut s {
-                sync::keep_hand(s, name, &hand)?;
-            }
-            if qr {
-                println!(
-                    "{}",
-                    qrcode::QrCode::new(&code)?
-                        .render::<qrcode::render::unicode::Dense1x2>()
-                        .build()
-                );
-            }
-            println!("{code}\npassword: {pw}\nthere: pasa join NAME {code}");
-            match end {
-                None => {}
-                Some(end) => match end.await? {
-                    pairir::End::Taken => eprintln!("{name} took it"),
-                    pairir::End::Expired => bail!("nobody came: pair again"),
-                    pairir::End::Spent => bail!(
-                        "the code was used by someone who did not prove it: \
-                         pasa forget {name}, then pair again"
-                    ),
-                },
-            }
-            // It dials here: serve until it has synced once.
-            eprintln!(
-                "waiting for {name} to sync (Ctrl-C: later, by pasa serve)"
-            );
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let me = name.to_string();
-            let log = move |w: &str, r: Result<usize>| {
-                if r.is_ok() && w == me {
-                    let _ = tx.send(());
+            // Only sealed: the key file, and the pairing's keys under the
+            // store key. The store is closed again before the code shows.
+            let got = sync::offer(&mut open()?, name)?;
+            match a.contains(&"--qr") {
+                true => {
+                    let pw = qr_password(name)?;
+                    let qr = sync::qr(&got, text(&pw)?).await?;
+                    // The password off the screen, scrollback too.
+                    if std::io::stderr().is_terminal() {
+                        eprint!("\x1b[H\x1b[2J\x1b[3J");
+                    }
+                    let c = qrcode::QrCode::new(&qr)?;
+                    println!(
+                        "{}",
+                        c.render::<qrcode::render::unicode::Dense1x2>().build()
+                    );
+                    println!("there: scan it, or pasa join NAME {qr}");
                 }
-                report(w, r)
-            };
-            tokio::select! {
-                r = sync::serve(&dir, log) => if let Err(e) = r {
-                    eprintln!("{e:#}: {name} syncs with it");
-                },
-                _ = rx.recv() => {}
+                false => {
+                    let mut c = net(&["give"])?;
+                    let mut i = c.stdin.take().context("stdin")?;
+                    writeln!(i, "{}", B64.encode(&got))?;
+                    let mut l = lines(&mut c);
+                    let code = l.next().context("no code: no relay?")?;
+                    println!("{code}\nthere: pasa join NAME {code}");
+                    match l.next().as_deref() {
+                        Some("taken") => eprintln!("{name} took it"),
+                        Some("spent") => bail!(
+                            "the code was used by someone who did not prove it: \
+                             pasa forget {name}, then pair again"
+                        ),
+                        _ => bail!("nobody came: pair again"),
+                    }
+                }
             }
-            if s.is_none() {
-                ensure!(dir.join("key").exists(), "{name} has no store either");
-                eprintln!(
-                    "Now the store's password, to keep the pairing sealed:"
-                );
-                sync::keep_hand(&mut open()?, name, &hand)?;
-            }
+            serve_until(name)?;
         }
         ["join", name, code] => {
-            let pw = String::from_utf8(ask("Pairing password: ")?.to_vec())?;
-            let hand = sync::join(&dir, name, code, &pw).await?;
-            eprintln!("Now the store's password, to keep the pairing sealed:");
-            sync::keep_hand(&mut open()?, name, &hand)?;
-            report_all(sync::sync(&dir, false).await?);
+            let got = match code.starts_with("PAIRIR1:") {
+                true => {
+                    let pw = ask("QR code password: ")?;
+                    sync::unqr(code, text(&pw)?).await?
+                }
+                false => {
+                    let mut c = net(&["take", code])?;
+                    let l = lines(&mut c).next().context("no answer")?;
+                    Zeroizing::new(B64.decode(l.as_bytes())?)
+                }
+            };
+            let t = sync::take(&dir, name, &got)?;
+            eprintln!("Now the store's password, to open the pairing:");
+            sync::taken(&mut open()?, t)?;
+            net_run(&["sync"])?;
         }
-        ["sync", ..] => {
-            report_all(sync::sync(&dir, a.contains(&"--news")).await?)
-        }
-        ["serve"] => sync::serve(&dir, report).await?,
-        ["listen"] => sync::listen(&dir, report).await?,
+        ["sync", ..] => net_run(a)?,
+        ["serve"] | ["listen"] => net_run(a)?,
         ["peers"] => {
             sync::peers(&dir).iter().for_each(|p| println!("{}", p.name))
         }
         ["forget", name] => sync::forget(&dir, name)?,
         ["revoke", name] => {
             sync::revoke(&mut open()?, name)?;
-            report_all(sync::sync(&dir, true).await?);
+            net_run(&["sync", "--news"])?;
         }
         _ => bail!("{USAGE}"),
     }

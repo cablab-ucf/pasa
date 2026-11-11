@@ -1,6 +1,6 @@
 [package]
 name = "pasa"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -11,7 +11,7 @@ members = ["kdbx2pasa", "apasa-jni"]
 
 [features]
 default = ["sync", "tui"]
-sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode"]
+sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode", "dep:landlock"]
 tui = ["dep:crossterm"]
 gui = ["dep:eframe", "dep:winit", "sync"]
 
@@ -39,6 +39,10 @@ crossterm = { version = "0.29.0", default-features = false, features = ["events"
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
 # The frame (close, minimise, maximise) that GNOME on Wayland leaves to the app.
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"], optional = true }
+
+# The network side confines itself to v/ and net/.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+landlock = { version = "0.4", optional = true }
 
 [profile.release]
 lto = true

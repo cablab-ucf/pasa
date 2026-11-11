@@ -29,6 +29,7 @@ fn screen(on: bool) -> Result<()> {
 
 pub fn run(s: pasa::Store) -> Result<()> {
     screen(true)?;
+    crate::aside(false);
     let r = browse(View::new(s));
     screen(false)?;
     r

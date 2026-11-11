@@ -27,6 +27,8 @@ use std::{fs, path::Path, path::PathBuf, time::SystemTime};
 use zeroize::Zeroizing;
 
 #[cfg(feature = "sync")]
+pub mod confine;
+#[cfg(feature = "sync")]
 pub mod sync;
 
 pub type Secret = Zeroizing<Vec<u8>>;

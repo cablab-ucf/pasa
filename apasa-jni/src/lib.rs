@@ -15,10 +15,8 @@ use std::sync::{LazyLock, Mutex};
 
 static STORES: LazyLock<Mutex<HashMap<jlong, Store>>> =
     LazyLock::new(Default::default);
-/// A joined pairing's hand-over key, in memory until the unlock that
-/// follows seals it into `dev`.
-static PENDING: Mutex<Option<(String, zeroize::Zeroizing<Vec<u8>>)>> =
-    Mutex::new(None);
+/// A pairing taken, in memory until the unlock that opens its keys.
+static PENDING: Mutex<Option<sync::Taken>> = Mutex::new(None);
 static RT: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("tokio"));
 
@@ -114,8 +112,8 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
 /// An opened store's handle: a joined pairing's hand-over key sealed into
 /// it, what peers handed over adopted.
 fn opened(mut st: Store) -> Result<jlong> {
-    if let Some((name, hand)) = PENDING.lock().unwrap().take() {
-        sync::keep_hand(&mut st, &name, &hand)?;
+    if let Some(t) = PENDING.lock().unwrap().take() {
+        sync::taken(&mut st, t)?;
     }
     sync::adopt(&mut st)?;
     let h = jlong::from_be_bytes(pasa::rand());
@@ -614,24 +612,27 @@ pub extern "system" fn Java_com_apasa_Native_forget<'l>(
     })
 }
 
-/// Let a device pair, called `name` here: its code (`qr`: an offline QR
-/// code's text), then the pairing password, a line each. It dials here.
+/// Let a device pair, called `name` here: its code. With `qr_pw` an
+/// offline QR code's text under that password; else a short code.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
     h: jlong,
     name: JString<'l>,
-    qr: bool,
+    qr_pw: JString<'l>,
 ) -> JString<'l> {
     run(&mut env, |e| {
-        let (pw, name) = (sync::password(), name.to_string());
+        let name = name.to_string();
+        let pw = (!qr_pw.is_null()).then(|| qr_pw.to_string());
         let mut stores = STORES.lock().unwrap();
-        let st = stores.get_mut(&h).context("locked")?;
-        let (code, _, hand) =
-            RT.block_on(sync::pair(&st.dir, &name, &pw, qr))?;
-        sync::keep_hand(st, &name, &hand)?;
-        Ok(e.new_string(format!("{code}\n{pw}"))?)
+        let got = sync::offer(stores.get_mut(&h).context("locked")?, &name)?;
+        drop(stores);
+        let code = match pw {
+            Some(pw) => RT.block_on(sync::qr(&got, &pw))?,
+            None => RT.block_on(sync::give(&got))?.0,
+        };
+        Ok(e.new_string(code)?)
     })
 }
 
@@ -673,17 +674,16 @@ pub extern "system" fn Java_com_apasa_Native_join<'l>(
     run(&mut env, |e| {
         let (dir, name) = (dir.to_string(), name.to_string());
         let dir = Path::new(&dir);
-        let hand = RT.block_on(sync::join(
-            dir,
-            &name,
-            &code.to_string(),
-            &pw.to_string(),
-        ))?;
-        // Into the open store at once (a phone with a store pairing a
-        // device without one), else at the unlock that follows.
+        let (code, pw) = (code.to_string(), pw.to_string());
+        let got = match code.trim().starts_with("PAIRIR1:") {
+            true => RT.block_on(sync::unqr(&code, &pw))?,
+            false => RT.block_on(sync::fetch(&code))?,
+        };
+        let t = sync::take(dir, &name, &got)?;
+        // Into the open store at once, else at the unlock that follows.
         match STORES.lock().unwrap().values_mut().next() {
-            Some(st) => sync::keep_hand(st, &name, &hand)?,
-            None => *PENDING.lock().unwrap() = Some((name, hand)),
+            Some(st) => sync::taken(st, t)?,
+            None => *PENDING.lock().unwrap() = Some(t),
         }
         Ok(e.new_string(report(RT.block_on(sync::sync(dir, false))?))?)
     })

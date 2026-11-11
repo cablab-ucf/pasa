@@ -82,10 +82,11 @@ libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 ## Files
 
 ```
-~/.pasa/v/       versions: age files, named by their hash; synced
-~/.pasa/key      store keys, sealed to the password (+ YubiKey); handed to new devices
+~/.pasa/key      store keys, sealed to the password (+ YubiKey); handed to new devices by pairing alone
 ~/.pasa/dev      this device's hand-over keys, sealed the same; never leaves
-~/.pasa/peers    pairings: transport key, endpoint, lane, device id
+~/.pasa/v/       versions: age files, named by their hash; synced
+~/.pasa/net/     what the network side sees beside v/: pairings (transport key, endpoint,
+                 lane, device id), this device's endpoint key, id and lane, hand-overs
 ```
 
 Nothing else is written: no index, no cache. A listing opens every
@@ -151,28 +152,39 @@ ciphertext, and learns when you change things. A version deleted from
 ## Sync
 
 ```sh
-pasa pair phone --qr   # here: a QR code (offline) and its password; serves until phone has synced
-pasa join home CODE    # there (the apps scan it): dials here
+pasa pair phone --qr   # here, the store open: its password first, then a QR code; serves until phone has synced
+pasa join home CODE    # there (the apps scan it): asks the QR code's password, then the store's; dials here
 pasa serve             # accept syncs; wake listening peers on news
 pasa listen            # sync when woken, through pushir's daemon (laptops)
 pasa sync              # with every peer, all at once (also after each change)
 ```
 
-One device shows a code, the other scans or types it; either may hold the
-store. The one showing it serves, the other dials. The window serves while
-it is open and the Android app while it is on the screen; a QR code never
-goes online, a short code (`pair` without `--qr`, for a device with no
-camera) meets once at the relay under a PAKE. A device without a store
-takes it at the first sync and asks for its password; a phone with the
-store so fills a new desktop by scanning what the desktop shows.
+Pairing and syncing are apart. **Pairing** is done by the device that has
+the store: it shows a QR code (offline; the app's camera or `join` takes
+it) or a short code to type (`pair` without `--qr`, for a device with no
+camera). What it hands over is sealed, all of it: the key file, to the
+password (and YubiKey); the pairing's transport and hand-over keys, to the
+store key inside it; and this device's endpoint. Nothing in it opens
+without the store's password, so a QR code's own password (typed, or two
+made-up words) only keeps it from whoever else sees the code, such as a
+reader app that keeps what it scans; it is shown before the code, never
+beside it. A short code goes once through the relay under
+[pairir](https://github.com/cablab-ucf/pairir) (CPace, then X-Wing,
+inside post-quantum TLS), one try, one minute, and needs no password.
+The device taking it asks for the store's password, which opens the
+pairing's keys; then it dials.
 
-Pairing hands over, through [pairir](https://github.com/cablab-ucf/pairir),
-this device's endpoint, fresh transport and hand-over keys, and the key
-file if there is one, still sealed to the password and YubiKey: the only
-way store keys travel, with the swap's below and the hand-overs. Each swap
-tells the other device where this one serves, so after the first, either
-dials the other. The hand-over key goes into `dev` at once, or at the
-unlock after the store arrives: it is never on disk unsealed. A device
+**Syncing** sends versions (age files) and nothing else of the keys but
+the hand-overs below. It runs in a process of its own that sees `v/` and
+`net/` alone: never `key`, `dev`, the rest of `~/.pasa` or of the
+computer. On Linux it confines itself by Landlock before it opens a
+socket (a kernel without Landlock: it says so and runs unconfined); on
+macOS its parent starts it inside the system sandbox (`sandbox-exec`),
+which keeps it out of `/Users`, `/Volumes` and the temporary directories
+but for `v/` and `net/`. The process that holds the store open (the
+window, a command) opens no socket. The window serves while it is open,
+the Android app while it is on the screen; each sync tells the other
+device where this one serves, so after the first, either dials. A device
 not met yet, or not reached in 15 s, is said, not waited on.
 
 | Layer | Holds if the others fall |
@@ -184,7 +196,8 @@ not met yet, or not reached in 15 s, is said, not waited on.
 `serve` (`contrib/pasa-serve.service` confines it) reads and writes age
 files, its endpoint key and the pairings: taking it over yields
 ciphertext. One process serves a store at a time (a lock on the endpoint
-key): the window and a daemon would take each other's place at the relay. Dialers use throwaway endpoints. Received files must match
+key): the window and a daemon would take each other's place at the
+relay. Dialers use throwaway endpoints. Received files must match
 their names, be asked for, and be under 16 MiB; strays in `v/` are
 ignored.
 
@@ -200,9 +213,8 @@ to it within a quarter of an hour, the Android app when it next starts).
 `revoke NAME` ends the pairing, marks the device's id revoked and rotates
 the store key: every entry is sealed again to a new key, which reaches the
 other peers at their next sync as an age file to their pairing's hand-over
-key hashed with the store's first key, with the revoked ids, so none passes
-it on. What a pairing carries (a QR code and its password, say) so neither
-opens nor forges a hand-over: that takes the store's password too. Revoke on every device it
+key, with the revoked ids, so none passes it on. Before a rotation there
+is no hand-over: every device has the one key, from its pairing. Revoke on every device it
 paired with. It keeps what it had: change the passwords it held.
 `forget NAME` ends a pairing alone.
 

@@ -348,5 +348,5 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun syncNow() = io { Native.sync(dir, false) }
     override suspend fun peers() = io { lines(Native.peers(dir)) }
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
-    override suspend fun pair(name: String, qr: Boolean) = io { lines(Native.pair(handle, name, qr)).let { it[0] to it[1] } }
+    override suspend fun pair(name: String, qrPw: String?) = io { Native.pair(handle, name, qrPw) }
 }
