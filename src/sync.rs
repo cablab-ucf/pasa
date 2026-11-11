@@ -135,12 +135,11 @@ pub fn revoke(s: &mut Store, name: &str) -> Result<()> {
 /// For every peer: the store keys and the revoked device ids, sealed to
 /// that pairing's hand-over key.
 pub fn hand(s: &Store) -> Result<()> {
-    let keys: Vec<u8> =
-        s.keys().iter().flat_map(|k| k.iter().copied()).collect();
+    let keys = s.records();
     let r: String =
         revoked(&s.dir).into_iter().map(|i| format!("{i}\n")).collect();
     let msg = Zeroizing::new(
-        [&[s.keys().len() as u8][..], &keys, r.as_bytes()].concat(),
+        [&(keys.len() as u32).to_be_bytes()[..], &keys, r.as_bytes()].concat(),
     );
     for (name, k) in &s.hands {
         write(&s.dir.join("give").join(name), &seal(k, &msg)?)?;
@@ -160,8 +159,8 @@ pub fn adopt(s: &mut Store) -> Result<()> {
         fs::remove_file(&p)?;
         let read = |(name, k): (&String, &crate::Secret)| {
             let m = open(k, &b)?;
-            let n = 32 * *m.first()? as usize;
-            let (keys, ids) = m[1..].split_at_checked(n)?;
+            let n = u32::from_be_bytes(m.get(..4)?.try_into().ok()?);
+            let (keys, ids) = m[4..].split_at_checked(n as usize)?;
             let ids = std::str::from_utf8(ids).ok()?.lines();
             let ids: Vec<String> =
                 ids.filter(|i| is_name(i)).map(String::from).collect();
@@ -174,12 +173,18 @@ pub fn adopt(s: &mut Store) -> Result<()> {
     }
     // Every revocation before any key: a device one hand-over revokes
     // gives no keys in another, whichever was read first.
+    let (top, had) = (s.top(), peers(&s.dir).len());
     revoke_ids(&s.dir, got.iter().flat_map(|g| g.2.clone()))?;
     s.hands.retain(|name, _| peers(&s.dir).iter().any(|p| &p.name == name));
     for (from, keys, _) in &got {
         if s.hands.contains_key(from) {
-            s.add_keys(keys)?;
+            s.take_keys(keys)?;
         }
+    }
+    // A device revoked here was offered every key this one held: unless
+    // a newer generation came with its revocation, make one.
+    if peers(&s.dir).len() < had && s.top() <= top {
+        s.rotate()?;
     }
     hand(s)
 }
@@ -243,9 +248,10 @@ async fn swap(
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| is_name(n))
         .collect();
-    tx.send(mine.iter().map(String::as_str).collect::<String>().as_bytes())
-        .await?;
-    let list = rx.recv(MAX).await?;
+    // Both lists at once: neither waits for the other to be read.
+    let names = mine.iter().map(String::as_str).collect::<String>();
+    let (sent, list) = tokio::join!(tx.send(names.as_bytes()), rx.recv(MAX));
+    let list = (sent?, list?).1;
     let other: HashSet<String> = list
         .chunks(32)
         .filter_map(|c| String::from_utf8(c.to_vec()).ok())
@@ -607,6 +613,9 @@ mod tests {
         // hand-over to b (still paired there) carries nothing new.
         let old = lane(&a).unwrap();
         revoke(&mut sa, "b").unwrap();
+        // c meanwhile, apart, under the old key: its own work is kept.
+        sc.put("x", b"1c").unwrap();
+        sc.put("w", b"c's").unwrap();
         let now = fs::read_to_string(a.join("mailbox")).unwrap();
         let now = now.parse::<Lane>().unwrap().secret;
         assert!(now != old && now == lane(&a).unwrap(), "b knew a's lane");
@@ -622,7 +631,10 @@ mod tests {
         swap_once(&b, &c, "c", "b").await;
         adopt(&mut sb).unwrap();
         assert_eq!(sb.keys().len(), 1, "b never gets the new key");
-        assert_eq!(&sc.get("x").unwrap()[..], b"1");
+        assert_eq!(&sc.get("x").unwrap()[..], b"1c");
+        assert_eq!(&sc.get("w").unwrap()[..], b"c's");
+        let now = sc.entries().unwrap();
+        assert!(now.values().all(|v| v.generation == 2), "sealed anew");
         // Nothing serve can read opens a hand-over or a version.
         let give = fs::read(a.join("give/c")).unwrap();
         for p in peers(&a) {
@@ -650,14 +662,28 @@ mod tests {
         // revokes a and gives a key b knows.
         let evil = [9; 32];
         let ida = fs::read_to_string(a.join("id")).unwrap();
-        let msg = [&[1][..], &evil, ida.as_bytes()].concat();
+        let (n, g) = (36u32.to_be_bytes(), 999u32.to_be_bytes());
+        let msg = [&n[..], &g, &evil, ida.as_bytes()].concat();
         write(&b.join("give/c"), &seal(&sb.hands["c"], &msg).unwrap()).unwrap();
         fs::write(b.join("id"), HEXLOWER.encode(&[8; 16])).unwrap();
         swap_once(&b, &c, "c", "b").await;
         adopt(&mut sc).unwrap();
-        // Each revokes the other: c trusts neither, and takes no key.
+        // Each revokes the other: c trusts neither, takes no key, and
+        // makes one b never held.
         assert!(peers(&c).is_empty() && sc.hands.is_empty());
-        assert_eq!(sc.keys().len(), 1);
+        assert_eq!((sc.keys().len(), sc.top()), (2, 2));
+        assert!(sc.keys().iter().all(|k| k[..] != evil));
+        assert!(!sb.keys().contains(&sc.keys()[0]));
+        // What b seals to the key it still holds is history on c: it
+        // changes and deletes nothing there.
+        sb.put("x", b"forged").unwrap();
+        sb.put("y", b"new").unwrap();
+        for f in fs::read_dir(b.join("v")).unwrap().flatten() {
+            fs::copy(f.path(), c.join("v").join(f.file_name())).unwrap();
+        }
+        sc.put("z", b"3").unwrap();
+        assert_eq!(&sc.get("x").unwrap()[..], b"1");
+        assert!(sc.get("y").is_err() && sc.conflicts().unwrap().is_empty());
         // A hand-over that does not read is passed over, not an error.
         keep_hand(&mut sc, "a", &[4; 32]).unwrap();
         write(&c.join("take/x"), &seal(&[4; 32], b"").unwrap()).unwrap();

@@ -14,7 +14,7 @@ use eframe::egui::{
 use pasa::{Form, Store, home, sync};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 /// The colours both apps share.
@@ -324,7 +324,8 @@ struct Pairing {
 struct App {
     v: Option<View>,
     prefs: Prefs,
-    used: Option<Instant>,
+    /// By the clock that runs while the machine sleeps.
+    used: Option<SystemTime>,
     // Before the store is open.
     pw: Zeroizing<String>,
     pw2: Zeroizing<String>,
@@ -577,10 +578,12 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
         // Left alone: locked, the store and what was typed dropped.
         if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
-            self.used = Some(Instant::now());
+            self.used = Some(SystemTime::now());
         }
         let idle = Duration::from_secs(self.prefs.lock * 60);
-        if self.v.is_some() && self.used.is_some_and(|t| t.elapsed() > idle) {
+        // A clock set back counts as left alone.
+        let left = |t: SystemTime| t.elapsed().map_or(true, |e| e > idle);
+        if self.v.is_some() && self.used.is_some_and(left) {
             self.lock();
         }
         ui.ctx().request_repaint_after(idle);

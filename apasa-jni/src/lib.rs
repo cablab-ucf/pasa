@@ -614,6 +614,22 @@ pub extern "system" fn Java_com_apasa_Native_forget<'l>(
     })
 }
 
+/// A device lost or stolen: its pairing ended and the store key changed
+/// ([`sync::revoke`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_revoke<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) {
+    run(&mut env, |_| {
+        let mut stores = STORES.lock().unwrap();
+        let st = stores.get_mut(&h).context("locked")?;
+        Ok(sync::revoke(st, &name.to_string())?)
+    })
+}
+
 /// Let a device join, called `name` here: its code, then the pairing
 /// password, a line each.
 #[unsafe(no_mangle)]

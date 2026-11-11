@@ -212,6 +212,8 @@ interface Host {
     suspend fun syncNow(): String
     suspend fun peers(): List<String>
     suspend fun forget(name: String)
+    /** A device lost or stolen: forgotten, and the store key changed, which the other devices get. */
+    suspend fun revoke(name: String)
     /** A pairing code and its password, for the device called [name]. */
     suspend fun pair(name: String): Pair<String, String>
 }
@@ -1211,6 +1213,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
         for (p in peers) Row(verticalAlignment = Alignment.CenterVertically) {
             Text(p, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
             TextButton({ go { host.forget(p); "$p: forgotten" } }) { Text("Forget") }
+            TextButton({ go { host.revoke(p); "$p: revoked; the store key is changed" } }) { Text("Revoke") }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("ADD A DEVICE")

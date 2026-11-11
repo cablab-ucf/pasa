@@ -6,8 +6,10 @@
 //! - `v/NAME`: one version of one entry, named by its hash: `ms parent
 //!   size name\n`, the body, padding. Files never change, so copies merge
 //!   by union. Size 0 deletes.
-//! - `key`: the store keys, newest first; `dev`: this device's hand-over
-//!   keys (one per pairing).
+//! - `key`: the store keys, each with its generation, newest first: a
+//!   rotation makes the next, and only versions sealed to the newest say
+//!   what an entry is now. `dev`: this device's hand-over keys (one per
+//!   pairing). `mine`: the names of the versions this device wrote.
 //!   Both sealed to Argon2id(password, YubiKey response); `dev` never
 //!   leaves the device.
 
@@ -170,6 +172,8 @@ pub struct Version {
     pub parent: String,
     /// Its file in `v/`.
     pub file: String,
+    /// The generation of the store key it is sealed to.
+    pub generation: u32,
 }
 
 impl Version {
@@ -177,7 +181,7 @@ impl Version {
         format!("{} {} {} {}", self.ms, self.parent, self.size, self.name)
     }
 
-    fn parse(l: &str, file: &str) -> Option<Version> {
+    fn parse(l: &str, file: &str, generation: u32) -> Option<Version> {
         let mut w = l.splitn(4, ' ');
         let (ms, parent, size) =
             (w.next()?.parse().ok()?, w.next()?, w.next()?.parse().ok()?);
@@ -188,6 +192,7 @@ impl Version {
             name,
             parent: parent.into(),
             file: file.into(),
+            generation,
         })
     }
 }
@@ -217,8 +222,11 @@ impl Index {
 
 pub struct Store {
     pub dir: PathBuf,
-    /// Store keys, newest first: older ones open history.
-    keys: Vec<Secret>,
+    /// Store keys with their generations, newest first. A rotation makes
+    /// the next generation; only versions sealed to the newest say what
+    /// an entry is now, so a device left with older keys (a revoked one)
+    /// writes history at most. Older keys open history.
+    keys: Vec<(u32, Secret)>,
     ids: Vec<age::scrypt::Identity>,
     newest: age::scrypt::Recipient,
     /// This device's hand-over key for each pairing.
@@ -235,7 +243,7 @@ pub struct Store {
 impl Store {
     fn new(
         dir: &Path,
-        keys: Vec<Secret>,
+        mut keys: Vec<(u32, Secret)>,
         dev: &[u8],
         kek: Secret,
         salt: Vec<u8>,
@@ -247,10 +255,12 @@ impl Store {
                 Zeroizing::new(HEXLOWER.decode(k.as_bytes()).ok()?),
             ))
         });
+        // One order on every device: by generation, then by the key.
+        keys.sort_by(|a, b| (b.0, &b.1[..]).cmp(&(a.0, &a.1[..])));
         Ok(Store {
             dir: dir.into(),
-            ids: keys.iter().map(|k| identity(k)).collect(),
-            newest: recipient(keys.first().context("no store key")?),
+            ids: keys.iter().map(|k| identity(&k.1)).collect(),
+            newest: recipient(&keys.first().context("no store key")?.1),
             keys,
             hands: hands.collect(),
             kek,
@@ -268,8 +278,13 @@ impl Store {
         yk: Option<(&[u8], &[u8])>,
     ) -> Result<Store> {
         ensure!(!dir.join("key").exists(), "{} holds a store", dir.display());
-        let mut s =
-            Store::new(dir, vec![hedged(pw)], b"", Default::default(), vec![])?;
+        let mut s = Store::new(
+            dir,
+            vec![(1, hedged(pw))],
+            b"",
+            Default::default(),
+            vec![],
+        )?;
         s.lock(pw, yk)?;
         Ok(s)
     }
@@ -366,11 +381,10 @@ impl Store {
             f.split_at_checked(33).context("not a pasa key file")?;
         let keys = open(&kek, sealed).context("the key does not open it")?;
         ensure!(
-            !keys.is_empty() && keys.len() % 32 == 0,
+            !keys.is_empty() && keys.len() % 36 == 0,
             "not a pasa key file"
         );
-        let keys =
-            keys.chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
+        let keys = records(&keys).collect();
         let dev = fs::read(dir.join("dev")).ok().and_then(|d| open(&kek, &d));
         Store::new(dir, keys, &dev.unwrap_or_default(), kek, salt.to_vec())
     }
@@ -419,53 +433,105 @@ impl Store {
             .map(|(n, k)| format!("{n} {}\n", HEXLOWER.encode(k)));
         let dev = Zeroizing::new(hands.collect::<String>().into_bytes());
         write(&self.dir.join("dev"), &seal(&self.kek, &dev)?)?;
-        let keys: Secret = Zeroizing::new(
-            self.keys.iter().flat_map(|k| k.iter().copied()).collect(),
-        );
-        let key = [&self.salt[..], &seal(&self.kek, &keys)?].concat();
+        let key = [&self.salt[..], &seal(&self.kek, &self.records())?].concat();
         write(&self.dir.join("key"), &key)?;
         *loaded = key;
         Ok(())
     }
 
-    #[cfg(any(test, feature = "sync"))]
-    pub(crate) fn keys(&self) -> &[Secret] {
-        &self.keys
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> Vec<&Secret> {
+        self.keys.iter().map(|k| &k.1).collect()
+    }
+
+    /// The store keys as they are kept and handed over: for each, its
+    /// generation (4 bytes), then the key.
+    pub(crate) fn records(&self) -> Secret {
+        let one = |k: &(u32, Secret)| [&k.0.to_be_bytes()[..], &k.1].concat();
+        Zeroizing::new(self.keys.iter().flat_map(one).collect())
+    }
+
+    /// The newest generation.
+    pub(crate) fn top(&self) -> u32 {
+        self.keys[0].0
     }
 
     /// The store keys, as `age -d` asks for them (passphrases).
     pub fn passphrases(&self) -> Zeroizing<String> {
         Zeroizing::new(
-            self.keys.iter().map(|k| HEXLOWER.encode(k) + "\n").collect(),
+            self.keys.iter().map(|k| HEXLOWER.encode(&k.1) + "\n").collect(),
         )
     }
 
-    /// Add keys a rotation made elsewhere (newest first): whether any was new.
-    pub(crate) fn add_keys(&mut self, ks: &[u8]) -> Result<bool> {
-        let new: Vec<_> = ks
-            .chunks(32)
-            .filter(|k| !self.keys.iter().any(|m| &m[..] == *k))
-            .collect();
-        for k in new.iter().rev() {
-            self.keys.insert(0, Zeroizing::new(k.to_vec()));
-            self.ids.insert(0, identity(k));
+    /// Add keys ([`Store::records`]) made elsewhere: whether any was new.
+    fn add_keys(&mut self, ks: &[u8]) -> Result<bool> {
+        let had = self.keys.len();
+        for k in records(ks) {
+            if !self.keys.iter().any(|m| m.1 == k.1) {
+                self.keys.push(k);
+            }
         }
-        if !new.is_empty() {
-            self.newest = recipient(&self.keys[0]);
-            self.save()?;
+        if self.keys.len() == had {
+            return Ok(false);
         }
-        Ok(!new.is_empty())
+        self.keys.sort_by(|a, b| (b.0, &b.1[..]).cmp(&(a.0, &a.1[..])));
+        self.ids = self.keys.iter().map(|k| identity(&k.1)).collect();
+        self.newest = recipient(&self.keys[0].1);
+        // What the new keys open, and which versions count now.
+        self.index.lock().unwrap().mtime = None;
+        self.save()?;
+        Ok(true)
     }
 
-    /// A new store key, first; every entry sealed again to it. History
-    /// stays under the keys it was written to.
+    /// The versions this device wrote that are their entries' newest,
+    /// with their bodies: what a newer generation from elsewhere would
+    /// leave behind as history.
+    fn own(&self) -> Result<Vec<(Version, Secret)>> {
+        let mine =
+            fs::read_to_string(self.dir.join("mine")).unwrap_or_default();
+        let mine: HashSet<&str> = mine.lines().collect();
+        let x = self.index()?;
+        let own = x.tips.values().filter(|t| mine.contains(&*t.1));
+        let own: Vec<Version> =
+            own.filter_map(|t| x.heads.get(&t.1).cloned()).collect();
+        drop(x);
+        own.into_iter()
+            .map(|v| Ok((self.body(&v)?, v)).map(|(b, v)| (v, b)))
+            .collect()
+    }
+
+    /// Take keys a peer handed over: whether any was new. With a newer
+    /// generation among them, what this device wrote under the old one
+    /// and the peer had not seen is written again under the new: only
+    /// this device's own (the file `mine`), never what came from others.
+    pub(crate) fn take_keys(&mut self, ks: &[u8]) -> Result<bool> {
+        let (top, own) = (self.top(), self.own()?);
+        if !self.add_keys(ks)? {
+            return Ok(false);
+        }
+        if self.top() > top {
+            // Names under the old generation: of no use from here on.
+            let _ = fs::remove_file(self.dir.join("mine"));
+            for (v, body) in own {
+                if *self.get(&v.name).unwrap_or_default() != *body {
+                    self.put(&v.name, &body)?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// A new store key of the next generation; every entry sealed again
+    /// to it. History stays under the keys it was written to.
     pub fn rotate(&mut self) -> Result<()> {
         let e = self
             .entries()?
             .into_values()
             .map(|v| Ok((v.name.clone(), self.body(&v)?)));
         let e = e.collect::<Result<Vec<_>>>()?;
-        self.add_keys(&rand::<32>())?;
+        let next = self.top().checked_add(1).context("no generation left")?;
+        self.add_keys(&[&next.to_be_bytes()[..], &rand::<32>()].concat())?;
+        let _ = fs::remove_file(self.dir.join("mine"));
         e.iter().try_for_each(|(n, b)| self.put(n, b))
     }
 
@@ -473,12 +539,16 @@ impl Store {
         reader(&self.ids, fs::File::open(self.dir.join("v").join(file))?)
     }
 
+    /// A version's head, and by the key that opens it its generation.
     fn head(&self, file: &str) -> Option<Version> {
-        let mut l = String::new();
-        std::io::BufReader::new(self.version(file).ok()?)
-            .read_line(&mut l)
-            .ok()?;
-        Version::parse(l.strip_suffix('\n')?, file)
+        let path = self.dir.join("v").join(file);
+        self.keys.iter().zip(&self.ids).find_map(|(k, id)| {
+            let f = fs::File::open(&path).ok()?;
+            let r = reader(std::slice::from_ref(id), f).ok()?;
+            let mut l = String::new();
+            std::io::BufReader::new(r).read_line(&mut l).ok()?;
+            Version::parse(l.strip_suffix('\n')?, file, k.0)
+        })
     }
 
     /// `v/` as it is now: new files' heads read, gone ones dropped. Files
@@ -487,7 +557,13 @@ impl Store {
         let mut x = self.index.lock().unwrap();
         let v = self.dir.join("v");
         let mtime = fs::metadata(&v).and_then(|m| m.modified()).ok();
-        if x.mtime.is_some() && x.mtime == mtime {
+        // A listing made within the directory's own second may be behind
+        // it (a sync writes beside us): only an older one is trusted.
+        let settled = |m: SystemTime| {
+            m.elapsed().is_ok_and(|e| e > std::time::Duration::from_secs(2))
+        };
+        if x.mtime.is_some() && x.mtime == mtime && x.mtime.is_some_and(settled)
+        {
             return Ok(x);
         }
         let names = fs::read_dir(&v)
@@ -510,7 +586,9 @@ impl Store {
         x.mtime = mtime;
         (x.tips, x.last) = Default::default();
         let heads = std::mem::take(&mut x.heads);
-        heads.values().for_each(|v| x.tip(v));
+        x.last = heads.values().map(|v| v.ms).max().unwrap_or(0);
+        let top = self.top();
+        heads.values().filter(|v| v.generation == top).for_each(|v| x.tip(v));
         x.heads = heads;
         Ok(x)
     }
@@ -536,10 +614,12 @@ impl Store {
         Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
     }
 
-    /// Each entry's newest version, deleted ones left out.
+    /// Each entry's newest version of the newest generation, deleted ones
+    /// left out.
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
-        let mut m: BTreeMap<_, _> =
-            self.versions()?.into_iter().map(|v| (v.name.clone(), v)).collect();
+        let top = self.top();
+        let now = self.versions()?.into_iter().filter(|v| v.generation == top);
+        let mut m: BTreeMap<_, _> = now.map(|v| (v.name.clone(), v)).collect();
         m.retain(|_, v| v.size > 0);
         Ok(m)
     }
@@ -673,7 +753,8 @@ impl Store {
     /// devices changed them apart. The other change is in `pasa log`.
     pub fn conflicts(&self) -> Result<Vec<String>> {
         let mut last: BTreeMap<String, (String, bool)> = BTreeMap::new();
-        for v in self.versions()? {
+        let top = self.top();
+        for v in self.versions()?.into_iter().filter(|v| v.generation == top) {
             let split = last.get(&v.name).is_some_and(|p| p.0 != v.parent);
             last.insert(v.name.clone(), (v.file, split));
         }
@@ -744,6 +825,7 @@ impl Store {
             name: name.into(),
             parent,
             file: String::new(),
+            generation: self.top(),
         };
         let mut pt = Zeroizing::new(format!("{}\n", v.line()).into_bytes());
         pt.extend_from_slice(body);
@@ -752,12 +834,26 @@ impl Store {
         let ct = encrypt(&self.newest, &pt)?;
         v.file = name_of(&ct);
         write(&self.dir.join("v").join(&v.file), &ct)?;
+        // This device's own, by name: see `take_keys`.
+        let mut mine = fs::OpenOptions::new();
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut mine, 0o600);
+        let mine = mine.append(true).create(true).open(self.dir.join("mine"));
+        writeln!(mine?, "{}", v.file)?;
         x.mtime =
             fs::metadata(self.dir.join("v")).and_then(|m| m.modified()).ok();
         x.tip(&v);
         x.heads.insert(v.file.clone(), v);
         Ok(())
     }
+}
+
+/// Store keys as [`Store::records`] wrote them.
+fn records(b: &[u8]) -> impl Iterator<Item = (u32, Secret)> + '_ {
+    b.chunks_exact(36).map(|c| {
+        let generation = u32::from_be_bytes(c[..4].try_into().expect("4"));
+        (generation, Zeroizing::new(c[4..].to_vec()))
+    })
 }
 
 /// Quick unlock on this device, if it is on: the YubiKey's challenge, and
@@ -1348,7 +1444,7 @@ mod tests {
         let v = &s.entries().unwrap()["x"];
         let ct = fs::read(d.join("v").join(&v.file)).unwrap();
         assert!(ct.starts_with(b"age-encryption.org/v1\n-> scrypt "));
-        let pt = open(&s.keys()[0], &ct).unwrap();
+        let pt = open(s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
         assert_eq!(pt.len(), 256, "padded");
     }
