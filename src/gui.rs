@@ -311,13 +311,32 @@ impl Generator {
     }
 }
 
-/// A device being added: what it must type, and how that ends.
+/// A device being added: for a QR code, its password first (never shown
+/// beside the code), then the code; and how a short code ends.
 struct Pairing {
     name: String,
+    /// The QR code's password, while it is chosen.
+    pw: Option<Zeroizing<String>>,
     code: String,
-    pw: String,
-    end: Option<tokio::task::JoinHandle<pairir::End>>,
+    /// The QR code, once shown.
+    img: Option<egui::TextureHandle>,
+    /// How a short code ended, from the network side.
+    end: Option<Arc<Mutex<Option<String>>>>,
     state: String,
+}
+
+/// `text` as a QR code, a module a pixel, with its quiet zone.
+fn qr_image(ctx: &Context, text: &str) -> Result<egui::TextureHandle> {
+    let c = qrcode::QrCode::new(text)?;
+    let (w, dark, q) = (c.width(), c.to_colors(), 4);
+    let n = w + 2 * q;
+    let at = |i: usize| {
+        let (x, y) = ((i % n).wrapping_sub(q), (i / n).wrapping_sub(q));
+        let on = x < w && y < w && dark[y * w + x] == qrcode::Color::Dark;
+        if on { 0 } else { 255 }
+    };
+    let img = egui::ColorImage::from_gray_iter([n, n], (0..n * n).map(at));
+    Ok(ctx.load_texture("pairing", img, egui::TextureOptions::NEAREST))
 }
 
 #[derive(Default)]
@@ -342,8 +361,8 @@ struct App {
     peer: String,
     code: String,
     pair_pw: Zeroizing<String>,
-    /// A joined pairing's hand-over key, until the unlock that seals it.
-    hand: Option<(String, Zeroizing<Vec<u8>>)>,
+    /// A pairing taken, until the unlock that opens its keys.
+    taken: Option<sync::Taken>,
     /// Done at the next frame, once this one has said so.
     job: Option<Job>,
     said: String,
@@ -369,7 +388,10 @@ struct App {
     generator: Generator,
     device: String,
     pairing: Option<Pairing>,
+    /// What syncs said, beside the window, until shown.
     synced: Arc<Mutex<Option<String>>>,
+    /// Whether this window serves (from the first pairing on).
+    serving: bool,
     rt: Option<tokio::runtime::Runtime>,
 }
 
@@ -572,6 +594,9 @@ fn entered(ui: &Ui, r: &Response) -> bool {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
+        if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Q)) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // Left alone: locked, the store and what was typed dropped.
         if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
             self.used = Some(Instant::now());
@@ -581,12 +606,18 @@ impl eframe::App for App {
             self.lock();
         }
         ui.ctx().request_repaint_after(idle);
+        self.serve(&ui.ctx().clone());
         if let Some(job) = self.job.take() {
+            let was = self.v.is_some();
             self.said = self
                 .work(job)
                 .err()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_default();
+            // Just opened: a sync, which shows what it brought when done.
+            if !was && self.v.is_some() {
+                self.sync_now(ui.ctx(), false);
+            }
             ui.ctx().request_repaint();
         }
         match self.v.take() {
@@ -602,6 +633,8 @@ impl App {
     fn lock(&mut self) {
         *self = App {
             prefs: self.prefs.clone(),
+            synced: self.synced.clone(),
+            serving: self.serving,
             peer: "home".into(),
             quick: true,
             ..App::default()
@@ -656,24 +689,30 @@ impl App {
             }
             Job::Unlock => {
                 let mut s = crate::unlock(self.pw.as_bytes())?;
-                if let Some((name, hand)) = self.hand.take() {
-                    sync::keep_hand(&mut s, &name, &hand)?;
+                if let Some(t) = self.taken.take() {
+                    sync::taken(&mut s, t)?;
                 }
-                self.v = Some(View::new(s));
+                (self.v, self.pairing) = (Some(View::new(s)), None);
             }
             Job::Join => {
                 let (peer, code, pw) = (
-                    self.peer.clone(),
-                    self.code.clone(),
+                    self.peer.trim().to_string(),
+                    self.code.trim().to_string(),
                     self.pair_pw.clone(),
                 );
-                let hand = self.rt()?.block_on(sync::join(
-                    &home(),
-                    peer.trim(),
-                    &code,
-                    &pw,
-                ))?;
-                self.hand = Some((peer.trim().into(), hand));
+                // A QR code opens here, offline; a short code is the
+                // network side's to take.
+                let got = match code.starts_with("PAIRIR1:") {
+                    true => self.rt()?.block_on(sync::unqr(&code, &pw))?,
+                    false => {
+                        let mut c = crate::net(&["take", &code])?;
+                        let l = crate::lines(&mut c).next();
+                        let l =
+                            l.context("no answer: is the code still shown?")?;
+                        Zeroizing::new(crate::B64.decode(l.as_bytes())?)
+                    }
+                };
+                self.taken = Some(sync::take(&home(), &peer, &got)?);
             }
         }
         (self.pw, self.pw2, self.pair_pw) = Default::default();
@@ -778,11 +817,20 @@ impl App {
         card(ui, "A small password store", "Join a store", |ui| {
             let l = look(ui);
             let how = "On the device that has it: Devices, Add a device \
-                       (or pasa pair NAME). It shows a code and a password.";
+                       (or pasa pair NAME). It shows a code to type, or a \
+                       QR code after its password.";
             ui.label(RichText::new(how).small().color(l.muted));
             field(ui, "A name for that device", &mut self.peer, false);
-            field(ui, "Code", &mut self.code, false);
-            let pw = field(ui, "Pairing password", &mut self.pair_pw, true);
+            let mut pw = field(ui, "Code", &mut self.code, false);
+            // A QR code's text asks for its password; a typed code has none.
+            if self.code.trim().starts_with("PAIRIR1:") {
+                pw = field(
+                    ui,
+                    "The QR code's password",
+                    &mut self.pair_pw,
+                    true,
+                );
+            }
             ui.add_space(6.0);
             let ok =
                 !self.peer.trim().is_empty() && !self.code.trim().is_empty();
@@ -801,7 +849,7 @@ impl App {
     fn unlock(&mut self, ui: &mut Ui) {
         let key = std::fs::read(home().join("key")).unwrap_or_default();
         let yk = pasa::challenge(&key).is_some();
-        let title = if self.hand.is_some() {
+        let title = if self.taken.is_some() {
             "Joined: now its password"
         } else {
             "Unlock"
@@ -989,7 +1037,10 @@ impl App {
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    lock |= ui.button("Lock").on_hover_text("Ctrl+L").clicked();
+                    lock |= ui
+                        .button("Lock")
+                        .on_hover_text("Ctrl+L; Ctrl+Q quits")
+                        .clicked();
                     for (name, win) in [
                         ("Settings", Win::Settings),
                         ("Devices", Win::Devices),
@@ -1933,85 +1984,165 @@ impl App {
         }
         if !peers.is_empty() && ui.button("Sync now").clicked() {
             v.note = "Syncing".into();
-            let (out, ctx) = (self.synced.clone(), ui.ctx().clone());
-            std::thread::spawn(move || {
-                let run = std::env::current_exe().and_then(|p| {
-                    std::process::Command::new(p)
-                        .arg("sync")
-                        .stdin(std::process::Stdio::null())
-                        .output()
-                });
-                let said = match run {
-                    Ok(o) => String::from_utf8_lossy(&o.stderr)
-                        .trim()
-                        .replace('\n', "   "),
-                    Err(e) => e.to_string(),
-                };
-                *out.lock().unwrap() = Some(said);
-                ctx.request_repaint();
-            });
+            self.sync_now(ui.ctx(), true);
         }
         ui.separator();
         ui.label(RichText::new("Add a device").strong());
         field(ui, "A name for it", &mut self.device, false);
-        let ok = !self.device.trim().is_empty();
-        if ui.add_enabled(ok, Button::new("Show a pairing code")).clicked() {
-            let (name, pw) =
-                (self.device.trim().to_string(), pairir::password());
-            let made = self.rt().and_then(|rt| {
-                rt.block_on(sync::pair(&mut v.s, &name, &pw, false))
-            });
-            match made {
-                Ok((code, end)) => {
-                    let state = "Waiting for it".into();
-                    self.pairing = Some(Pairing { name, code, pw, end, state });
-                }
-                Err(e) => v.note = format!("{e:#}"),
+        let (name, ok) =
+            (self.device.trim().to_string(), !self.device.trim().is_empty());
+        if let Some(qr) = self.shows(ui, ok) {
+            let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));
+            let (code, img, end, state) = Default::default();
+            self.pairing = Some(Pairing { name, pw, code, img, end, state });
+            if !qr && let Err(e) = self.show_code(ui.ctx(), v) {
+                (self.pairing, v.note) = (None, format!("{e:#}"));
             }
         }
-        let Some(p) = &mut self.pairing else { return };
-        if p.end.as_ref().is_some_and(|e| e.is_finished()) {
-            let end = p
-                .end
-                .take()
-                .zip(self.rt.as_ref())
-                .map(|(e, rt)| rt.block_on(e));
-            p.state = match end {
-                Some(Ok(pairir::End::Taken)) => {
-                    format!("{} took it: syncing", p.name)
-                }
-                Some(Ok(pairir::End::Expired)) => {
-                    "Nobody came: show a new code".into()
-                }
-                Some(Ok(pairir::End::Spent)) => {
-                    format!(
-                        "Someone used the code without the password: forget {}, pair again",
-                        p.name
-                    )
-                }
-                _ => "The pairing broke off: try again".into(),
-            };
-            crate::aside(false);
+        if let Err(e) = self.pairing(ui, v) {
+            (self.pairing, v.note) = (None, format!("{e:#}"));
         }
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// `pasa sync` beside the window: those that serve are dialed (with
+    /// `news`, those that listen woken to dial here); what it said, shown
+    /// once back.
+    fn sync_now(&self, ctx: &Context, news: bool) {
+        if !sync::net(&home()).join("peers").exists() {
+            return;
+        }
+        let (out, ctx) = (self.synced.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let run = std::env::current_exe().and_then(|p| {
+                std::process::Command::new(p)
+                    .arg("sync")
+                    .args(news.then_some("--news"))
+                    .stdin(std::process::Stdio::null())
+                    .output()
+            });
+            let said = match run {
+                Ok(o) => String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .replace('\n', "   "),
+                Err(e) => e.to_string(),
+            };
+            *out.lock().unwrap() = Some(said);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Serve while the window is open, once paired: devices dial here. The
+    /// network side is a process of its own that sees `v/` and `net/`
+    /// alone; what it brings shows at once, and is said.
+    fn serve(&mut self, ctx: &Context) {
+        if self.serving || !sync::net(&home()).join("peers").exists() {
+            return;
+        }
+        self.serving = true;
+        let (out, ctx) = (self.synced.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            // Another process may serve this store: then it does.
+            let Ok(mut c) = crate::net(&["serve"]) else { return };
+            for (who, r) in crate::results(&mut c) {
+                if let Ok(n @ 1..) = r {
+                    *out.lock().unwrap() = Some(format!("{who}: {n} new"));
+                }
+                crate::report(&who, r);
+                ctx.request_repaint();
+            }
+            let _ = c.wait();
+        });
+    }
+
+    /// The two ways to show a pairing; which was chosen: true, the QR code.
+    fn shows(&self, ui: &mut Ui, ok: bool) -> Option<bool> {
+        ui.horizontal(|ui| {
+            let qr = ui.add_enabled(ok, Button::new("Show a QR code"));
+            let code = ui.add_enabled(ok, Button::new("Show a code to type"));
+            let qr = qr.on_hover_text("Offline: nothing goes online");
+            let code = code.on_hover_text("For a device without a camera");
+            (qr.clicked() || code.clicked()).then(|| qr.clicked())
+        })
+        .inner
+    }
+
+    /// The short code, from the network side, which takes what the
+    /// pairing hands over (all of it sealed) and waits for its taker.
+    fn show_code(&mut self, ctx: &Context, v: &mut View) -> Result<()> {
+        let p = self.pairing.as_mut().context("no pairing")?;
+        let got = sync::offer(&mut v.s, &p.name)?;
+        let mut c = crate::net(&["give"])?;
+        let mut i = c.stdin.take().context("stdin")?;
+        std::io::Write::write_all(&mut i, crate::B64.encode(&got).as_bytes())?;
+        std::io::Write::write_all(&mut i, b"\n")?;
+        let mut l = crate::lines(&mut c);
+        p.code = l.next().context("no code: is the relay reachable?")?;
+        let (end, repaint) = (Arc::new(Mutex::new(None)), ctx.clone());
+        p.end = Some(end.clone());
+        std::thread::spawn(move || {
+            let said = l.next().unwrap_or_default();
+            drop((i, c));
+            *end.lock().unwrap() = Some(said);
+            repaint.request_repaint();
+        });
+        p.state = "Waiting for it".into();
+        self.serve(ctx);
+        Ok(())
+    }
+
+    /// The pairing: a QR code's password, then the code alone; or the
+    /// short code; and how it is going.
+    fn pairing(&mut self, ui: &mut Ui, v: &mut View) -> Result<()> {
+        let l = look(ui);
+        let ctx = ui.ctx().clone();
+        let Some(p) = &mut self.pairing else { return Ok(()) };
+        let mut show = false;
         let f = Frame::new().fill(l.bg).corner_radius(8).inner_margin(12);
         f.show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let how = format!("On {}: Join a store, then type", p.name);
-            ui.label(RichText::new(how).small().color(l.muted));
-            Grid::new("pairing").num_columns(2).spacing([14.0, 6.0]).show(
-                ui,
-                |ui| {
-                    ui.label(RichText::new("Code").small().color(l.muted));
-                    ui.label(RichText::new(&p.code).monospace().size(17.0));
-                    ui.end_row();
-                    ui.label(RichText::new("Password").small().color(l.muted));
-                    ui.label(RichText::new(&p.pw).monospace().size(17.0));
-                    ui.end_row();
-                },
-            );
+            let muted = |ui: &mut Ui, t: &str| {
+                ui.label(RichText::new(t).small().color(l.muted));
+            };
+            if let Some(pw) = &mut p.pw {
+                field(ui, "QR code password: type one, or keep this", pw, false);
+                let how = format!(
+                    "Remember it. The QR code comes next, without it: \
+                     on {}, type it after scanning.",
+                    p.name
+                );
+                muted(ui, &how);
+                show = !pw.is_empty() && ui.button("Show the QR code").clicked();
+                return;
+            }
+            let what = if p.img.is_some() { "scan this" } else { "type this" };
+            muted(ui, &format!("On {}: {what} where it asks for a code", p.name));
+            match &p.img {
+                Some(img) => drop(ui.image((img.id(), vec2(240.0, 240.0)))),
+                None => drop(ui.label(RichText::new(&p.code).monospace().size(17.0))),
+            }
+            if let Some(end) = p.end.as_ref().and_then(|e| e.lock().unwrap().take()) {
+                p.state = match end.as_str() {
+                    "taken" => format!("{} took it: it syncs now", p.name),
+                    "spent" => format!(
+                        "Someone used the code without proving it: forget {}, pair again",
+                        p.name
+                    ),
+                    _ => "Nobody came: show a new code".into(),
+                };
+            }
             ui.label(RichText::new(&p.state).small().color(l.accent));
         });
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+        if show {
+            let pw = p.pw.take().unwrap_or_default();
+            let got = sync::offer(&mut v.s, &p.name)?;
+            let qr = self.rt()?.block_on(sync::qr(&got, &pw))?;
+            let p = self.pairing.as_mut().context("no pairing")?;
+            (p.img, p.code) = (Some(qr_image(&ctx, &qr)?), qr);
+            p.state = "Waiting for it to sync".into();
+            self.serve(&ctx);
+        }
+        Ok(())
     }
 
     fn settings(&mut self, ui: &mut Ui) {

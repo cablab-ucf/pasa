@@ -1,6 +1,7 @@
 package com.apasa
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -9,6 +10,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -70,6 +72,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
@@ -212,8 +215,10 @@ interface Host {
     suspend fun syncNow(): String
     suspend fun peers(): List<String>
     suspend fun forget(name: String)
-    /** A pairing code and its password, for the device called [name]. */
-    suspend fun pair(name: String): Pair<String, String>
+    /** A pairing code for the device called [name], which dials here: with [qrPw], an offline QR code's text under it; else a short code. */
+    suspend fun pair(name: String, qrPw: String?): String
+    /** Bumped as syncs bring versions. */
+    val news: Int
 }
 
 sealed interface Screen {
@@ -610,12 +615,13 @@ private fun Join(host: Host, nav: Nav) {
     val join = { if (ok) work.go { host.join(name.trim(), code.trim(), pw) } }
     Front("Join a store", work, "No store yet?", "Create one", { nav.joining = false }, wait = "Reaching the other device") {
         Text(
-            "On the device that has it: Devices, Add a device (or pasa pair NAME). It shows a code and a password.",
+            "On the device that has it: Devices, Add a device (or pasa pair NAME). It shows a QR code, after its password, or a code to type.",
             style = MaterialTheme.typography.bodySmall, color = muted,
         )
         Field(name, { name = it }, "A name for that device", error = if (name.isBlank()) "It needs a name" else "")
         Field(code, { code = it }, "Code") { TextButton({ host.scan { code = it } }) { Text("Scan") } }
-        Field(pw, { pw = it }, "Pairing password", secret = true, done = join)
+        // A QR code, once scanned, asks for its password, keyboard up; a typed code has none.
+        if (code.trim().startsWith("PAIRIR1:")) Field(pw, { pw = it }, "The QR code's password", secret = true, done = join, focus = true)
         Primary("Join", enabled = ok, go = join)
     }
 }
@@ -716,6 +722,7 @@ private fun Store(host: Host, nav: Nav) {
     val said = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
     var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(host.news) { tick++ }
     var generator by remember { mutableStateOf(false) }
     val say: (String) -> Unit = { m -> if (m.isNotBlank()) scope.launch { said.currentSnackbarData?.dismiss(); said.showSnackbar(m) } }
     val go: (suspend () -> String) -> Unit = { f ->
@@ -1192,7 +1199,8 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
     var on by remember { mutableStateOf(host.sync) }
     val peers by produceState(listOf<String>(), tick) { value = host.peers() }
     var name by remember { mutableStateOf("") }
-    var pairing by remember { mutableStateOf<Triple<String, String, String>?>(null) }
+    var pairing by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var qrPw by remember { mutableStateOf<String?>(null) }
     Page("Devices and sync", nav) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -1215,20 +1223,31 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("ADD A DEVICE")
         Field(name, { name = it }, "A name for it")
-        OutlinedButton({
+        val show = { pw: String? ->
             val n = name.trim()
-            go { host.pair(n).let { pairing = Triple(n, it.first, it.second) }; host.sync = true; on = true; "" }
-        }, enabled = name.isNotBlank()) { Text("Show a pairing code") }
-        pairing?.let { (who, code, pw) ->
+            go { pairing = n to host.pair(n, pw); qrPw = null; host.sync = true; on = true; "" }
+        }
+        // A QR code's password comes first, never beside the code: a camera on the screen would read both.
+        OutlinedButton({ pairing = null; qrPw = host.generate(Gen(words = true, count = 2, seps = "-")) }, enabled = name.isNotBlank()) { Text("Show a QR code") }
+        OutlinedButton({ qrPw = null; show(null) }, enabled = name.isNotBlank()) { Text("Show a code to type") }
+        qrPw?.let { pw ->
+            Field(pw, { qrPw = it }, "QR code password: type one, or keep this")
+            Text("Remember it. The QR code comes next, without it: on ${name.trim()}, type it after scanning.", style = MaterialTheme.typography.bodySmall, color = muted)
+            OutlinedButton({ show(pw) }, enabled = pw.isNotEmpty()) { Text("Show the QR code") }
+        }
+        pairing?.let { (who, code) ->
             Column(
                 Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Text("On $who: Join a store, then type", style = MaterialTheme.typography.bodySmall, color = muted)
-                Label("Code")
-                Text(code, fontFamily = mono, fontSize = 20.sp)
-                Label("Password")
-                Text(pw, fontFamily = mono, fontSize = 20.sp)
+                val qr = code.startsWith("PAIRIR1:")
+                Text("On $who: ${if (qr) "scan this" else "type this"} where it asks for a code", style = MaterialTheme.typography.bodySmall, color = muted)
+                if (qr) {
+                    val img = remember(code) { org.pairir.Qr.bitmap(code, 720).asImageBitmap() }
+                    Image(img, "Pairing QR code", Modifier.fillMaxWidth().aspectRatio(1f))
+                } else {
+                    Text(code, fontFamily = mono, fontSize = 20.sp)
+                }
             }
         }
     }
