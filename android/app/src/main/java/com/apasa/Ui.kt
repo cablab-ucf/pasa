@@ -98,6 +98,9 @@ data class Health(
 /** A hardware key's part: none; a tap (and PIN) that opens the store beside the password; or needed with the password. */
 enum class Key { None, Quick, Both }
 
+/** How an empty key is said where it can be set up: the screens offer that on these words. */
+const val EMPTY_KEY = "Slot 2 of this YubiKey is empty."
+
 /** The symbols that may stand between speakable words (pasa::SEPS). */
 const val SEPS = "-_.!#%&*+=?^~,:;"
 
@@ -139,6 +142,11 @@ interface Host {
     val quick: Boolean?
     /** The phone has NFC and it is switched off: a key can then only be plugged in. */
     val nfcOff: Boolean
+    /**
+     * Sets up the next YubiKey tapped, if its slot 2 is empty, with a new secret; [spare]: with the secret
+     * of the key set up just before, so either opens what the other does.
+     */
+    suspend fun setUpKey(spare: Boolean)
     /** Open the phone's NFC settings. */
     fun nfcSettings()
     suspend fun create(pw: String, key: Key, pin: String)
@@ -407,6 +415,17 @@ private fun Doing(work: Work, wait: String = "", host: Host? = null) {
     if (work.err.isNotEmpty()) Text(work.err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
     // What is wrong, and where to put it right.
     if (host != null && host.nfcOff && work.err.contains("NFC")) OutlinedButton(host::nfcSettings) { Text("Open NFC settings") }
+    // A new key, taken on: set up here, and a spare with it, now or never (the secret is not kept).
+    var setUp by remember { mutableStateOf(false) }
+    if (host != null && work.err.startsWith(EMPTY_KEY)) OutlinedButton({ work.go { host.setUpKey(false); setUp = true } }) { Text("Set up this key") }
+    if (host != null && setUp && !work.busy && work.err.isEmpty()) {
+        Text("The key is set up. Now do again what you were doing, and tap the key when asked.", color = MaterialTheme.colorScheme.primary)
+        Text(
+            "A spare key can be given the same secret now, and only now: the secret is not kept. Without one, the password is the way in if the key is lost.",
+            style = MaterialTheme.typography.bodySmall, color = muted,
+        )
+        OutlinedButton({ work.go { host.setUpKey(true) } }) { Text("Set up a spare key too") }
+    }
 }
 
 /** Before a key is asked for: that NFC is off, and where to turn it on. */

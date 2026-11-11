@@ -9,6 +9,7 @@ import com.yubico.yubikit.android.transport.nfc.NfcConfiguration
 import com.yubico.yubikit.android.transport.nfc.NfcYubiKeyDevice
 import com.yubico.yubikit.android.transport.usb.UsbConfiguration
 import com.yubico.yubikit.core.YubiKeyDevice
+import com.yubico.yubikit.yubiotp.HmacSha1SlotConfiguration
 import com.yubico.yubikit.yubiotp.Slot
 import com.yubico.yubikit.yubiotp.YubiOtpSession
 import java.util.concurrent.atomic.AtomicInteger
@@ -42,7 +43,24 @@ private val waits = AtomicInteger()
  * the app listens, Android does not open the web address a YubiKey carries. (Ending the listening as soon
  * as the key was seen lost the key mid-answer, "Tag was lost", and let that page open.)
  */
-suspend fun yubikey(a: Activity, challenge: ByteArray): ByteArray {
+suspend fun yubikey(a: Activity, challenge: ByteArray, enroll: Boolean = false): ByteArray = withKey(a) { s ->
+    // Asked first where the key can say: an empty slot answers with nothing, which reads as nonsense.
+    if (runCatching { !s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(false)) throw Empty(enroll)
+    s.calculateHmacSha1(Slot.TWO, challenge, null)
+}
+
+/**
+ * Writes [secret] (20 bytes) to the key's slot 2 as its HMAC-SHA1 challenge-response secret: only to a slot
+ * the key says is empty, never over what one holds, and not where the key cannot say.
+ */
+suspend fun writeKey(a: Activity, secret: ByteArray): Unit = withKey(a) { s ->
+    if (runCatching { s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(true))
+        throw InUse()
+    s.putConfiguration(Slot.TWO, HmacSha1SlotConfiguration(secret), null, null)
+}
+
+/** What [use] makes of the next YubiKey tapped or plugged in. */
+private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T {
     val nfc = nfcOn(a)
     if (!nfc && !plugged(a)) throw NoKey(nfcOff(a))
     val mine = waits.incrementAndGet()
@@ -56,12 +74,7 @@ suspend fun yubikey(a: Activity, challenge: ByteArray): ByteArray {
         }
         val answer = { d: YubiKeyDevice ->
             YubiOtpSession.create(d) { session ->
-                val r = runCatching {
-                    val s = session.value
-                    // Asked first where the key can say: an empty slot answers with nothing, which reads as nonsense.
-                    if (runCatching { !s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(false)) throw Empty()
-                    s.calculateHmacSha1(Slot.TWO, challenge, null)
-                }
+                val r = runCatching { use(session.value) }
                 if (d is NfcYubiKeyDevice) d.remove { stop() } else stop()
                 if (k.isActive) r.onSuccess { k.resume(it) }.onFailure { k.resumeWithException(Exception(said(it))) }
             }
@@ -77,15 +90,18 @@ suspend fun yubikey(a: Activity, challenge: ByteArray): ByteArray {
     }
 }
 
-private class Empty : Exception()
+/** Slot 2 holds nothing; said while a key is being taken on ([enroll]), it can be set up here. */
+private class Empty(val enroll: Boolean) : Exception()
+private class InUse : Exception()
 
 /** What went wrong with the key, for someone holding it. */
 private fun said(e: Throwable) = when {
     e is android.nfc.TagLostException || e.message?.contains("Tag was lost") == true ->
         "The key moved away too soon: hold it still against the phone until this is done."
     e is java.io.IOException -> "The key did not answer: hold it still against the phone, or plug it in. (${e.message})"
-    e is Empty ->
-        "Slot 2 of this YubiKey is empty. Set it to HMAC-SHA1 challenge-response first (Yubico Authenticator, or: ykman otp chalresp --generate 2), then try again."
+    e is Empty && e.enroll -> "$EMPTY_KEY It can be set up here: a new secret is written to it."
+    e is Empty -> "Slot 2 of this YubiKey is empty: it is not a key this store was made with."
+    e is InUse -> "Slot 2 of this YubiKey is in use, or the key cannot say: nothing was written to it."
     e is com.yubico.yubikit.core.application.BadResponseException ->
         "Slot 2 of this YubiKey holds something other than an HMAC-SHA1 challenge-response secret (a Yubico OTP or a static password?): its answer was not 20 bytes. (${e.message})"
     else -> "The key refused: is its slot 2 set to HMAC-SHA1 challenge-response? (${e.message})"
