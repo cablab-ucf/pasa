@@ -19,6 +19,11 @@ object Native {
     external fun files(h: Long, name: String): String
     external fun bytes(h: Long, name: String): ByteArray
     external fun keep(h: Long, name: String, body: ByteArray)
+    external fun strength(pw: String): Int
+    external fun times(h: Long, name: String): String
+    external fun health(h: Long): String
+    external fun pwnedKey(pw: String): String
+    external fun pwnedCount(kept: String, text: String): Long
     external fun form(body: String): String
     external fun text(form: String): String
     external fun peers(dir: String): String

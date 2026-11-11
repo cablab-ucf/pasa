@@ -39,6 +39,15 @@ theme). An entry is still the text `pass` reads: the form writes `user:`
 and `url:` lines. Both also show an entry's history (each version, with a
 way back) and its files.
 
+Both also have: a `tags: a, b` line to filter by; a search through names,
+users, addresses and tags; when an entry was made and changed; a bar that
+fills and turns from red to green as a typed password's bits grow (an
+estimate: under 40 poor, under 65 weak, under 100 good); and a health
+check for weak and shared passwords (`pasa health`). `--pwned`, or the
+button, also asks haveibeenpwned.com which passwords breaches hold: of
+each, only the first 5 hex digits of its SHA-1 leave the machine, and
+the answer is padded. Nothing is asked unless you ask.
+
 A file kept with an entry (`pasa attach NAME FILE`, or dropped on the
 window) is an entry of its own, `NAME/.files/FILE`, hidden from listings:
 it syncs, keeps its history, and goes when its entry is removed or moved.

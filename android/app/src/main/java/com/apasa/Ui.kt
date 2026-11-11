@@ -3,6 +3,7 @@ package com.apasa
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -69,7 +70,7 @@ import kotlinx.coroutines.launch
 /** An entry as its form: the same fields the desktop window shows. */
 data class Form(
     val pass: String = "", val user: String = "", val url: String = "",
-    val otp: String = "", val notes: String = "",
+    val otp: String = "", val notes: String = "", val tags: String = "",
 )
 
 /** How a password is made: characters, or words to say aloud (22 bits each). */
@@ -108,6 +109,15 @@ interface Host {
     fun text(f: Form): String
     fun code(body: String): String
     fun generate(g: Gen): String
+    /** A guess at a typed password's bits. */
+    fun strength(pw: String): Int
+    /** When [name] was made and last changed (ms). */
+    suspend fun times(name: String): Pair<Long, Long>?
+    /** Entries with a weak password and its bits; and those sharing one. */
+    suspend fun health(): Pair<List<Pair<String, Int>>, List<List<String>>>
+    /** How often known breaches hold [pw]: asks haveibeenpwned.com. */
+    suspend fun pwned(pw: String): Long
+    fun open(url: String)
     fun copy(text: String)
     suspend fun syncNow(): String
     suspend fun peers(): List<String>
@@ -122,6 +132,7 @@ sealed interface Screen {
     data class Edit(val name: String) : Screen
     data class History(val name: String) : Screen
     data object Devices : Screen
+    data object Health : Screen
     data object Settings : Screen
 }
 
@@ -218,6 +229,24 @@ private fun Primary(text: String, enabled: Boolean = true, go: () -> Unit) =
         Text(text, fontWeight = FontWeight.SemiBold)
     }
 
+/** What so many bits are called, and their colour: under 40 poor, under 65 weak, under 100 good. */
+private fun grade(bits: Int) = when {
+    bits < 40 -> "Poor" to Color(0xFFE5604F)
+    bits < 65 -> "Weak" to Color(0xFFE0A040)
+    bits < 100 -> "Good" to Color(0xFF9CC25A)
+    else -> "Excellent" to Color(0xFF4FB286)
+}
+
+/** A bar that fills and turns from red to green as a password's bits grow. */
+@Composable
+private fun Meter(bits: Int) = Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    val (name, colour) = grade(bits)
+    Box(Modifier.fillMaxWidth().height(6.dp).background(MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(3.dp))) {
+        Box(Modifier.fillMaxWidth((bits / 128f).coerceIn(0f, 1f)).height(6.dp).background(colour, RoundedCornerShape(3.dp)))
+    }
+    Text("$name: about $bits bits", style = MaterialTheme.typography.bodySmall, color = colour)
+}
+
 /** The name, one card in the middle for what the app wants first, and the other way in, small, in the corner. */
 @Composable
 private fun Front(
@@ -262,6 +291,7 @@ private fun Create(host: Host, nav: Nav) {
         "A store on another device already?", "Join it", { nav.joining = true },
     ) {
         Field(pw, { pw = it }, "Password", secret = true)
+        if (pw.isNotEmpty()) Meter(host.strength(pw))
         Field(again, { again = it }, "Password, again", secret = true)
         Row(Modifier.fillMaxWidth().clickable { key = !key }, verticalAlignment = Alignment.CenterVertically) {
             Checkbox(key, { key = it })
@@ -352,6 +382,7 @@ private fun Store(host: Host, nav: Nav) {
                 is Screen.Edit -> Edit(host, nav, s.name, go)
                 is Screen.History -> History(host, nav, s.name, copy, go)
                 Screen.Devices -> Devices(host, nav, tick, go)
+                Screen.Health -> Health(host, nav)
                 Screen.Settings -> Settings(host, nav)
             }
         }
@@ -364,7 +395,17 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
     var q by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
     val names by produceState(listOf<String>(), tick) { value = host.names() }
-    val shown = names.filter { n -> q.split(' ').all { n.contains(it, ignoreCase = true) } }
+    var tag by remember { mutableStateOf("") }
+    val forms by produceState(mapOf<String, Form>(), names, tick) {
+        value = names.associateWith { runCatching { host.form(host.get(it)) }.getOrDefault(Form()) }
+    }
+    val tagsOf = { n: String -> forms[n]?.tags.orEmpty().split(',').map { it.trim() }.filter { it.isNotEmpty() } }
+    val tags = names.flatMap(tagsOf).distinct().sorted()
+    val shown = names.filter { n ->
+        val f = forms[n] ?: Form()
+        val hay = "$n ${f.user} ${f.url} ${f.tags}"
+        (tag.isEmpty() || tag in tagsOf(n)) && q.split(' ').all { hay.contains(it, ignoreCase = true) }
+    }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
@@ -378,10 +419,24 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                     if (host.sync) item("Sync now") { go { host.syncNow() } }
                     item("Devices and sync") { nav.screen = Screen.Devices }
                     item("Password generator", generator)
+                    item("Password health") { nav.screen = Screen.Health }
                     item("Settings") { nav.screen = Screen.Settings }
                     item("Lock") { host.lock() }
                 }
             }
+        }
+        if (tags.isNotEmpty()) Row(
+            Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            for (t in tags) Text(
+                t, Modifier.background(
+                    if (t == tag) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface, RoundedCornerShape(16.dp),
+                ).border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(16.dp))
+                    .clickable { tag = if (t == tag) "" else t }.padding(horizontal = 12.dp, vertical = 6.dp),
+                style = MaterialTheme.typography.labelLarge,
+                color = if (t == tag) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
+            )
         }
         if (shown.isEmpty()) Text(
             if (names.isEmpty()) "No entries yet. New adds the first." else "Nothing matches.",
@@ -396,7 +451,7 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                     )
                 }
                 for (n in of) item(key = n) {
-                    val user by produceState("", n, tick) { value = runCatching { host.form(host.get(n)).user }.getOrDefault("") }
+                    val user = forms[n]?.user.orEmpty()
                     Column(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }.padding(horizontal = 20.dp, vertical = 10.dp)) {
                         Text(n.substringAfterLast('/'), style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         if (user.isNotEmpty()) Text(user, style = MaterialTheme.typography.bodyMedium, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -437,7 +492,11 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
             "One-time code", code.chunked((code.length + 1) / 2).joinToString(" "), mono = true,
             more = { Text("${30 - now % 30} s", Modifier.padding(end = 4.dp), style = MaterialTheme.typography.bodySmall, color = muted) },
         ) { copy("Code", code) }
-        if (f.url.isNotEmpty()) Shown("URL", f.url) { copy("URL", f.url) }
+        if (f.url.isNotEmpty()) Shown(
+            "URL", f.url,
+            more = { if (f.url.startsWith("http")) TextButton({ host.open(f.url) }) { Text("Open") } },
+        ) { copy("URL", f.url) }
+        if (f.tags.isNotEmpty()) Shown("Tags", f.tags)
         if (f.notes.isNotEmpty()) Shown("Notes", f.notes)
         val files by produceState(listOf<String>(), name, tick) { value = runCatching { host.files(name) }.getOrDefault(listOf()) }
         for (file in files) Shown(
@@ -448,6 +507,14 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton({ host.attach(name) { m -> go { m } } }) { Text("Attach a file") }
             OutlinedButton({ nav.screen = Screen.History(name) }) { Text("History") }
+        }
+        val times by produceState<Pair<Long, Long>?>(null, name, tick) { value = runCatching { host.times(name) }.getOrNull() }
+        times?.let { (made, changed) ->
+            val date = remember { java.text.SimpleDateFormat("yyyy-MM-dd HH:mm") }
+            Text(
+                "Changed ${date.format(java.util.Date(changed))}   \u00B7   Made ${date.format(java.util.Date(made))}",
+                style = MaterialTheme.typography.bodySmall, color = muted,
+            )
         }
         TextButton({ sure = true }) { Text("Delete this entry", color = MaterialTheme.colorScheme.error) }
     }
@@ -471,8 +538,10 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
         Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = !show) {
             TextButton({ show = !show }) { Text(if (show) "Hide" else "Show") }
         }
+        Meter(host.strength(f.pass))
         OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show = true }) { Text("Generate a password") }
         Field(f.url, { f = f.copy(url = it) }, "URL")
+        Field(f.tags, { f = f.copy(tags = it) }, "Tags (commas between)")
         Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address")
         Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3)
         Primary("Save", enabled = name.isNotBlank() && !name.endsWith("/")) {
@@ -540,6 +609,43 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, clos
             }
         },
     )
+}
+
+/** Weak, shared and, if asked, breached passwords. */
+@Composable
+private fun Health(host: Host, nav: Nav) {
+    val found by produceState<Pair<List<Pair<String, Int>>, List<List<String>>>?>(null) { value = runCatching { host.health() }.getOrNull() }
+    var breached by remember { mutableStateOf<List<Pair<String, Long>>?>(null) }
+    val (busy, err, go) = rememberJob()
+    Page("Password health", nav) {
+        val (weak, reused) = found ?: (listOf<Pair<String, Int>>() to listOf())
+        Label("WEAK: ${weak.size}")
+        for ((n, bits) in weak) Row(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, verticalAlignment = Alignment.CenterVertically) {
+            Text(n, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+            Text("about $bits bits", style = MaterialTheme.typography.bodySmall, color = grade(bits).second)
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Label("SHARED BY SEVERAL ENTRIES: ${reused.size}")
+        for (g in reused) Text(g.joinToString(",  "), style = MaterialTheme.typography.bodyLarge)
+        breached?.let { hits ->
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Label("IN KNOWN BREACHES: ${hits.size}")
+            for ((n, times) in hits) Row(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, verticalAlignment = Alignment.CenterVertically) {
+                Text(n, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                Text("seen $times times", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+            }
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Text(
+            "A breach check asks haveibeenpwned.com. Of each password only the first 5 hex digits of its SHA-1 leave the phone; the site cannot tell which password was meant.",
+            style = MaterialTheme.typography.bodySmall, color = muted,
+        )
+        if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+        if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        OutlinedButton({
+            go { breached = host.names().mapNotNull { n -> host.pwned(host.form(host.get(n)).pass).takeIf { it > 0 }?.let { n to it } } }
+        }, enabled = !busy) { Text("Check for breaches online") }
+    }
 }
 
 /** What an entry was, version by version, and a way back. */

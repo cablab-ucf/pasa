@@ -475,6 +475,36 @@ impl Store {
         self.remove(from)
     }
 
+    /// When entry `name` was made and last changed, in milliseconds.
+    pub fn times(&self, name: &str) -> Result<Option<(u64, u64)>> {
+        let ms = self.versions()?.into_iter().filter(|v| v.name == name);
+        let ms: Vec<u64> = ms.map(|v| v.ms).collect();
+        Ok(ms.first().copied().zip(ms.last().copied()))
+    }
+
+    /// The entries whose password is weak (under 65 bits by [`strength`]),
+    /// with those bits; and those sharing a password, group by group.
+    pub fn health(&self) -> Result<Health> {
+        let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut weak = vec![];
+        for name in self.entries()?.into_keys() {
+            if name.split('/').any(|c| c.starts_with('.')) {
+                continue;
+            }
+            let pw =
+                Form::parse(&String::from_utf8_lossy(&self.get(&name)?)).pass;
+            if pw.is_empty() {
+                continue;
+            }
+            match strength(&pw) {
+                b if b < 65 => weak.push((name.clone(), b)),
+                _ => {}
+            }
+            by.entry(pw).or_default().push(name);
+        }
+        Ok((weak, by.into_values().filter(|n| n.len() > 1).collect()))
+    }
+
     /// Entry `name`'s versions and their bodies, newest first.
     pub fn history(&self, name: &str) -> Result<Vec<(u64, Secret)>> {
         let mut vs = self.versions()?;
@@ -610,6 +640,90 @@ pub fn speakable(words: usize, hyphens: bool, leet: bool) -> String {
 /// listings, so they sync, keep their history and are deleted as any other.
 pub const FILES: &str = "/.files/";
 
+/// Entries with a weak password and its bits; and those sharing one.
+pub type Health = (Vec<(String, u32)>, Vec<Vec<String>>);
+
+/// What a guesser tries first, whatever the alphabet.
+const COMMON: [&str; 36] = [
+    "password",
+    "passwort",
+    "qwerty",
+    "qwertz",
+    "azerty",
+    "letmein",
+    "welcome",
+    "admin",
+    "login",
+    "iloveyou",
+    "dragon",
+    "monkey",
+    "master",
+    "sunshine",
+    "princess",
+    "football",
+    "baseball",
+    "shadow",
+    "superman",
+    "michael",
+    "123456789",
+    "1q2w3e",
+    "asdf",
+    "zxcv",
+    "secret",
+    "changeme",
+    "default",
+    "test",
+    "hello",
+    "trustno1",
+    "starwars",
+    "summer",
+    "winter",
+    "spring",
+    "autumn",
+    "pass",
+];
+
+/// A guess at the bits in a typed password: each character counts for the
+/// alphabets used, unless it repeats or follows its neighbour (abc, 321);
+/// a common word counts as 4 bits. An estimate: only a generated password's bits are
+/// known. Under 40 is poor, under 65 weak, under 100 good.
+pub fn strength(pw: &str) -> u32 {
+    let has = |f: fn(&char) -> bool| pw.chars().any(|c| f(&c));
+    let pool = [
+        (has(char::is_ascii_lowercase), 26),
+        (has(char::is_ascii_uppercase), 26),
+        (has(char::is_ascii_digit), 10),
+        (has(char::is_ascii_punctuation), 33),
+        (has(|c| !c.is_ascii_graphic()), 64),
+    ];
+    let pool: u32 = pool.iter().filter(|p| p.0).map(|p| p.1).sum();
+    let each = (pool.max(1) as f64).log2();
+    let low = pw.to_lowercase();
+    let known: Vec<&str> =
+        COMMON.iter().copied().filter(|w| low.contains(w)).collect();
+    let known_len: usize = known.iter().map(|w| w.len()).max().unwrap_or(0);
+    let cs: Vec<i64> = pw.chars().map(|c| c as i64).collect();
+    let fresh = |w: &[i64]| (w[1] - w[0]).abs() > 1;
+    let fresh = 1 + cs.windows(2).filter(|w| fresh(w)).count();
+    let free = fresh.min(cs.len()).saturating_sub(known_len) as f64;
+    (free * each + 4.0 * known.len().min(1) as f64) as u32
+}
+
+/// For haveibeenpwned's range search: the 5 hex digits of the password's
+/// SHA-1 that are sent, and the 35 that are not.
+pub fn pwned_key(pw: &str) -> (String, String) {
+    use sha1::Digest;
+    let h = data_encoding::HEXUPPER.encode(&sha1::Sha1::digest(pw.as_bytes()));
+    (h[..5].into(), h[5..].into())
+}
+
+/// How many breaches' worth of `rest` the range's answer `text` lists.
+pub fn pwned_count(rest: &str, text: &str) -> u64 {
+    let hit =
+        |l: &str| l.trim().strip_prefix(rest)?.strip_prefix(':')?.parse().ok();
+    text.lines().find_map(hit).unwrap_or(0)
+}
+
 /// An entry's text as the fields a form shows: the password (line 1),
 /// `user:`, `url:`, the otpauth URI's line, and every other line.
 #[derive(Default, Clone, PartialEq, Debug)]
@@ -618,6 +732,8 @@ pub struct Form {
     pub user: String,
     pub url: String,
     pub otp: String,
+    /// The `tags:` line: names, commas between.
+    pub tags: String,
     pub notes: String,
 }
 
@@ -633,9 +749,10 @@ impl Form {
             let key = |k: &str| {
                 Some(l.strip_prefix(k)?.strip_prefix(':')?.trim().to_string())
             };
-            match (key("user"), key("url")) {
-                (Some(u), _) if f.user.is_empty() => f.user = u,
-                (_, Some(u)) if f.url.is_empty() => f.url = u,
+            match (key("user"), key("url"), key("tags")) {
+                (Some(u), ..) if f.user.is_empty() => f.user = u,
+                (_, Some(u), _) if f.url.is_empty() => f.url = u,
+                (.., Some(t)) if f.tags.is_empty() => f.tags = t,
                 _ if l.contains("otpauth://") && f.otp.is_empty() => {
                     f.otp = l.trim().into()
                 }
@@ -650,9 +767,12 @@ impl Form {
     pub fn text(&self) -> String {
         let one = |s: &str| s.replace(['\n', '\r'], " ");
         let mut t = one(&self.pass) + "\n";
-        for (k, v) in
-            [("user: ", &self.user), ("url: ", &self.url), ("", &self.otp)]
-        {
+        for (k, v) in [
+            ("user: ", &self.user),
+            ("url: ", &self.url),
+            ("tags: ", &self.tags),
+            ("", &self.otp),
+        ] {
             if !v.trim().is_empty() {
                 t += &format!("{k}{}\n", one(v.trim()));
             }
@@ -838,8 +958,45 @@ mod tests {
     }
 
     #[test]
+    fn strength_and_breaches() {
+        for (pw, most) in [
+            ("password1", 20),
+            ("aaaaaaaaaaaa", 5),
+            ("abcdefgh", 12),
+            ("Summer2024", 30),
+        ] {
+            assert!(strength(pw) <= most, "{pw}: {}", strength(pw));
+        }
+        assert_eq!(strength(""), 0);
+        assert!(strength("k3Vq9xLp2mZt") >= 65);
+        assert!(strength(&generate(24, true)) >= 100);
+        assert!(strength(&speakable(4, false, false)) >= 65);
+        // SHA-1("password") = 5BAA6 1E4C9B93F3F0682250B6CF8331B7EE68FD8.
+        let (sent, kept) = pwned_key("password");
+        assert_eq!(
+            (&*sent, &*kept),
+            ("5BAA6", "1E4C9B93F3F0682250B6CF8331B7EE68FD8")
+        );
+        let text = "0018A45C4D1DEF81644B54AB7F969B88D65:1\r\n1E4C9B93F3F0682250B6CF8331B7EE68FD8:52256179\r\n";
+        assert_eq!(pwned_count(&kept, text), 52256179);
+        assert_eq!(pwned_count("FFFF", text), 0);
+        let s = Store::create(&dir("health"), b"pw", None).unwrap();
+        s.put("a", b"hunter2\nuser: x\n").unwrap();
+        s.put("b", b"hunter2\n").unwrap();
+        s.put("c", generate(24, true).as_bytes()).unwrap();
+        let (weak, reused) = s.health().unwrap();
+        let weak: Vec<&str> = weak.iter().map(|w| &*w.0).collect();
+        assert_eq!(
+            (weak, reused),
+            (vec!["a", "b"], vec![vec!["a".to_string(), "b".into()]])
+        );
+        let (made, changed) = s.times("a").unwrap().unwrap();
+        assert!(made <= changed && s.times("nope").unwrap().is_none());
+    }
+
+    #[test]
     fn forms_round_trip() {
-        let t = "pw\nuser: ada\nfree line\nurl: https://x.org\notpauth://totp/x?secret=JBSWY3DP\nlast\n";
+        let t = "pw\nuser: ada\nfree line\nurl: https://x.org\ntags: work, mail\notpauth://totp/x?secret=JBSWY3DP\nlast\n";
         let f = Form::parse(t);
         assert_eq!(
             (&*f.pass, &*f.user, &*f.url),
@@ -849,6 +1006,7 @@ mod tests {
             (&*f.otp, &*f.notes),
             ("otpauth://totp/x?secret=JBSWY3DP", "free line\nlast")
         );
+        assert_eq!(f.tags, "work, mail");
         assert_eq!(Form::parse(&f.text()), f);
         assert_eq!(field(&f.text(), "user").as_deref(), Some("ada"));
         assert!(field(&f.text(), "otp").is_some());

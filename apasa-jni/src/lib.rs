@@ -195,6 +195,73 @@ pub extern "system" fn Java_com_apasa_Native_generate<'l>(
     run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, symbols))?))
 }
 
+/// A guess at a typed password's bits ([`pasa::strength`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_strength<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+    pw: JString<'l>,
+) -> i32 {
+    pasa::strength(&pw.to_string()) as i32
+}
+
+/// When an entry was made and last changed: milliseconds, a line each;
+/// empty if there is none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_times<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let t = with(h, |s| s.times(&name.to_string()))?;
+        let t = t.map(|(made, changed)| format!("{made}\n{changed}"));
+        Ok(e.new_string(t.unwrap_or_default())?)
+    })
+}
+
+/// Weak passwords as `weak`, tab, name, tab, bits; shared ones as
+/// `reused`, then the names, tabs between: a line each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_health<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let (weak, reused) = with(h, |s| s.health())?;
+        let weak = weak.iter().map(|(n, b)| format!("weak\t{n}\t{b}"));
+        let reused = reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
+        Ok(e.new_string(weak.chain(reused).collect::<Vec<_>>().join("\n"))?)
+    })
+}
+
+/// For a breach lookup: what of the password's SHA-1 is sent, then what
+/// is kept, a line each ([`pasa::pwned_key`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_pwnedKey<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    pw: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let (sent, kept) = pasa::pwned_key(&pw.to_string());
+        Ok(e.new_string(format!("{sent}\n{kept}"))?)
+    })
+}
+
+/// How often the lookup's answer lists what was kept.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_pwnedCount<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+    kept: JString<'l>,
+    text: JString<'l>,
+) -> jlong {
+    pasa::pwned_count(&kept.to_string(), &text.to_string()) as jlong
+}
+
 /// A password to say aloud ([`pasa::speakable`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_speakable<'l>(
@@ -294,8 +361,8 @@ pub extern "system" fn Java_com_apasa_Native_keep<'l>(
     })
 }
 
-/// An entry's text as its form: password, user, url, otpauth URI and
-/// notes, U+001F between them.
+/// An entry's text as its form: password, user, url, otpauth URI, tags
+/// and notes, U+001F between them.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_form<'l>(
     mut env: EnvUnowned<'l>,
@@ -304,9 +371,8 @@ pub extern "system" fn Java_com_apasa_Native_form<'l>(
 ) -> JString<'l> {
     run(&mut env, |e| {
         let f = pasa::Form::parse(&body.to_string());
-        Ok(e.new_string(
-            [f.pass, f.user, f.url, f.otp, f.notes].join("\u{1f}"),
-        )?)
+        let all = [f.pass, f.user, f.url, f.otp, f.tags, f.notes];
+        Ok(e.new_string(all.join("\u{1f}"))?)
     })
 }
 
@@ -319,13 +385,14 @@ pub extern "system" fn Java_com_apasa_Native_text<'l>(
 ) -> JString<'l> {
     run(&mut env, |e| {
         let s = form.to_string();
-        let mut p = s.splitn(5, '\u{1f}').map(String::from);
+        let mut p = s.splitn(6, '\u{1f}').map(String::from);
         let mut next = || p.next().unwrap_or_default();
         let f = pasa::Form {
             pass: next(),
             user: next(),
             url: next(),
             otp: next(),
+            tags: next(),
             notes: next(),
         };
         Ok(e.new_string(f.text())?)

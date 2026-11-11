@@ -138,6 +138,9 @@ impl Prefs {
     }
 }
 
+/// Entries whose password breaches hold, and how often.
+type Breached = Vec<(String, u64)>;
+
 enum Job {
     Create,
     Unlock,
@@ -150,6 +153,7 @@ enum Win {
     None,
     Generator,
     History,
+    Health,
     Devices,
     Settings,
 }
@@ -229,7 +233,13 @@ struct App {
     said: String,
     // The open store.
     group: Option<String>,
-    users: HashMap<String, String>,
+    /// Each version's user, address and tags, read once: what rows show
+    /// and a search looks through.
+    meta: HashMap<String, [String; 3]>,
+    tag: Option<String>,
+    /// What a breach check found, entry by entry, once it is back.
+    breached: Arc<Mutex<Option<Breached>>>,
+    health: Option<pasa::Health>,
     shown: bool,
     armed: bool,
     edit: Option<Edit>,
@@ -285,6 +295,37 @@ fn saved(file: &str, body: &[u8]) -> Result<String> {
     let to = (0..1000).find_map(|i| free(&i)).context("no free name")?;
     pasa::write(&to, body)?;
     Ok(format!("{file}: saved as {}", to.display()))
+}
+
+/// A time in milliseconds, as a date and a minute.
+fn date(ms: u64) -> String {
+    let at = UNIX_EPOCH + Duration::from_millis(ms);
+    let at = humantime::format_rfc3339_seconds(at).to_string();
+    at[..16].replace('T', " ")
+}
+
+/// What so many bits are called, and their colour: under 40 poor, under
+/// 65 weak, under 100 good.
+fn grade(bits: u32) -> (&'static str, Color32) {
+    match bits {
+        0..40 => ("Poor", rgb(0xE5604F)),
+        40..65 => ("Weak", rgb(0xE0A040)),
+        65..100 => ("Good", rgb(0x9CC25A)),
+        _ => ("Excellent", rgb(0x4FB286)),
+    }
+}
+
+/// A bar that fills and turns from red to green as a password's bits grow.
+fn meter(ui: &mut Ui, bits: u32) {
+    let (name, colour) = grade(bits);
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+    ui.painter().rect_filled(rect, 3, look(ui).line);
+    let mut filled = rect;
+    filled.set_width(rect.width() * (bits as f32 / 128.0).min(1.0));
+    ui.painter().rect_filled(filled, 3, colour);
+    let said = format!("{name}: about {bits} bits");
+    ui.label(RichText::new(said).small().color(colour));
 }
 
 /// A dialog's frame: the window's, with room around what it holds.
@@ -444,6 +485,7 @@ impl App {
             if ui.memory(|m| m.focused().is_none()) {
                 first.request_focus();
             }
+            meter(ui, pasa::strength(&self.pw));
             let again = field(ui, "Password, again", &mut self.pw2, true);
             ui.add_space(4.0);
             ui.checkbox(&mut self.yk, "Require a hardware key (YubiKey)");
@@ -527,13 +569,14 @@ impl App {
         });
     }
 
-    /// The entry's user name, read once per version.
-    fn user(&mut self, v: &View, i: usize) -> String {
+    /// The entry's user name, address and tags, read once per version.
+    fn meta(&mut self, v: &View, i: usize) -> &[String; 3] {
         let read = || {
             let b = v.s.get(&v.names[i]).unwrap_or_default();
-            Form::parse(&String::from_utf8_lossy(&b)).user
+            let f = Form::parse(&String::from_utf8_lossy(&b));
+            [f.user, f.url, f.tags]
         };
-        self.users.entry(v.files[i].clone()).or_insert_with(read).clone()
+        self.meta.entry(v.files[i].clone()).or_insert_with(read)
     }
 
     fn store(&mut self, ui: &mut Ui, mut v: View) {
@@ -542,16 +585,43 @@ impl App {
         if let Some(s) = self.synced.lock().unwrap().take() {
             v.note = s;
         }
+        // The search looks through names, users, addresses and tags; View's
+        // own filter (names alone, for the terminal) is left empty here.
+        let query = std::mem::take(&mut v.filter);
         v.load();
+        v.filter = query;
         let dir = |n: &str| n.rsplit_once('/').map(|d| d.0.to_string());
         let groups: BTreeSet<String> =
             v.names.iter().filter_map(|n| dir(n)).collect();
         if self.group.as_ref().is_some_and(|g| !groups.contains(g)) {
             self.group = None;
         }
-        let within = |n: &String| self.group.is_none() || dir(n) == self.group;
-        let rows: Vec<usize> =
-            (0..v.names.len()).filter(|i| within(&v.names[*i])).collect();
+        let words: Vec<String> = v
+            .filter
+            .to_lowercase()
+            .split_whitespace()
+            .map(Into::into)
+            .collect();
+        let mut tags = BTreeSet::new();
+        let mut rows = vec![];
+        for i in 0..v.names.len() {
+            let name = v.names[i].clone();
+            let m = self.meta(&v, i).clone();
+            let of: Vec<&str> = m[2].split(',').map(str::trim).collect();
+            tags.extend(
+                of.iter().filter(|t| !t.is_empty()).map(|t| t.to_string()),
+            );
+            let hay =
+                format!("{name} {} {} {}", m[0], m[1], m[2]).to_lowercase();
+            let tagged = self.tag.as_ref().is_none_or(|t| of.contains(&&**t));
+            let within = self.group.is_none() || dir(&name) == self.group;
+            if tagged && within && words.iter().all(|w| hay.contains(w)) {
+                rows.push(i);
+            }
+        }
+        if self.tag.as_ref().is_some_and(|t| !tags.contains(t)) {
+            self.tag = None;
+        }
         let was = v.at;
         if !rows.contains(&v.at) {
             v.at = rows.first().copied().unwrap_or(0);
@@ -615,6 +685,7 @@ impl App {
                     for (name, win) in [
                         ("Settings", Win::Settings),
                         ("Devices", Win::Devices),
+                        ("Health", Win::Health),
                         ("Generator", Win::Generator),
                     ] {
                         if ui.button(name).clicked() {
@@ -670,6 +741,16 @@ impl App {
                     let on = self.group.as_ref() == Some(g);
                     if ui.selectable_label(on, g).clicked() {
                         self.group = Some(g.clone());
+                    }
+                }
+                if !tags.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("TAGS").small().color(l.muted));
+                }
+                for t in &tags {
+                    let on = self.tag.as_ref() == Some(t);
+                    if ui.selectable_label(on, t).clicked() {
+                        self.tag = (!on).then(|| t.clone());
                     }
                 }
             })
@@ -734,7 +815,7 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for i in shown {
                         let at = rows[i];
-                        let user = self.user(&v, at);
+                        let user = self.meta(&v, at)[0].clone();
                         let (rect, r, mid) = cols(ui, 30.0);
                         let fill = match (at == v.at, r.hovered()) {
                             (true, _) => l.accent.gamma_multiply(0.28),
@@ -851,6 +932,11 @@ impl App {
                 }
             });
         });
+        if let Ok(Some((made, changed))) = v.s.times(name) {
+            let when =
+                format!("Changed {}   ·   Made {}", date(changed), date(made));
+            ui.label(RichText::new(when).small().color(l.muted));
+        }
         ScrollArea::vertical().show(ui, |ui| {
             Grid::new("fields").num_columns(3).spacing([14.0, 8.0]).show(
                 ui,
@@ -909,9 +995,28 @@ impl App {
                     if !f.url.is_empty() {
                         label(ui, "URL");
                         ui.label(&f.url);
-                        if ui.small_button("Copy").clicked() {
-                            v.copy("url");
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Copy").clicked() {
+                                v.copy("url");
+                            }
+                            let web = f.url.starts_with("https://")
+                                || f.url.starts_with("http://");
+                            if web && ui.small_button("Open").clicked() {
+                                let with = if cfg!(target_os = "macos") {
+                                    "open"
+                                } else {
+                                    "xdg-open"
+                                };
+                                let _ = std::process::Command::new(with)
+                                    .arg(&f.url)
+                                    .spawn();
+                            }
+                        });
+                        ui.end_row();
+                    }
+                    if !f.tags.is_empty() {
+                        label(ui, "Tags");
+                        ui.label(&f.tags);
                         ui.end_row();
                     }
                     if !f.notes.is_empty() {
@@ -941,6 +1046,82 @@ impl App {
             let hint = "Drop a file on the window to keep it with this entry.";
             ui.label(RichText::new(hint).small().color(l.muted));
         });
+    }
+
+    /// Weak, shared and, if asked, breached passwords.
+    fn health(&mut self, ui: &mut Ui, v: &mut View) {
+        let l = look(ui);
+        ui.heading("Password health");
+        if self.health.is_none() {
+            self.health = v.s.health().ok();
+        }
+        let (weak, reused) = self.health.clone().unwrap_or_default();
+        let part = |ui: &mut Ui, t: String| {
+            ui.add_space(4.0);
+            ui.label(RichText::new(t).small().color(l.muted));
+        };
+        ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            part(ui, format!("WEAK: {}", weak.len()));
+            for (name, bits) in &weak {
+                ui.horizontal(|ui| {
+                    ui.label(name);
+                    ui.label(
+                        RichText::new(format!("about {bits} bits"))
+                            .small()
+                            .color(grade(*bits).1),
+                    );
+                });
+            }
+            part(ui, format!("SHARED BY SEVERAL ENTRIES: {}", reused.len()));
+            for group in &reused {
+                ui.label(group.join(",  "));
+            }
+            if let Some(found) = &*self.breached.lock().unwrap() {
+                part(ui, format!("IN KNOWN BREACHES: {}", found.len()));
+                for (name, times) in found {
+                    ui.horizontal(|ui| {
+                        ui.label(name);
+                        ui.label(
+                            RichText::new(format!("seen {times} times"))
+                                .small()
+                                .color(l.bad),
+                        );
+                    });
+                }
+            }
+        });
+        ui.separator();
+        let how = "A breach check asks haveibeenpwned.com. Of each password \
+                   only the first 5 hex digits of its SHA-1 leave this \
+                   machine; the site cannot tell which password was meant.";
+        ui.label(RichText::new(how).small().color(l.muted));
+        if ui.button("Check for breaches online").clicked() {
+            v.note = "Asking haveibeenpwned.com".into();
+            let pws: Vec<(String, String)> = v
+                .names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        Form::parse(&String::from_utf8_lossy(
+                            &v.s.get(n).unwrap_or_default(),
+                        ))
+                        .pass,
+                    )
+                })
+                .collect();
+            let (out, ctx) = (self.breached.clone(), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let hit = |(n, pw): &(String, String)| match crate::pwned(pw) {
+                    Ok(0) | Err(_) => None,
+                    Ok(times) => Some((n.clone(), times)),
+                };
+                *out.lock().unwrap() =
+                    Some(pws.iter().filter_map(hit).collect());
+                ctx.request_repaint();
+            });
+        }
     }
 
     /// The chosen entry's versions: what it was, and a way back.
@@ -1030,7 +1211,9 @@ impl App {
                             .margin(Margin::symmetric(8, 6)),
                     );
                 });
+                meter(ui, pasa::strength(&e.f.pass));
                 field(ui, "URL", &mut e.f.url, false);
+                field(ui, "Tags (commas between)", &mut e.f.tags, false);
                 field(
                     ui,
                     "One-time code: its otpauth:// address",
@@ -1084,6 +1267,7 @@ impl App {
                 match self.win {
                     Win::Generator => self.generate(ui, v),
                     Win::History => self.history(ui, v),
+                    Win::Health => self.health(ui, v),
                     Win::Devices => self.devices(ui, v),
                     _ => self.settings(ui),
                 }
@@ -1096,6 +1280,7 @@ impl App {
         if close || r.should_close() {
             self.prefs.save();
             self.win = Win::None;
+            self.health = None;
         }
     }
 
@@ -1108,6 +1293,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(&**g.pw).monospace().size(16.0));
         });
+        meter(ui, g.bits());
         let mut again = false;
         ui.horizontal(|ui| {
             again |= ui

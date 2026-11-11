@@ -3,6 +3,7 @@ package com.apasa
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -19,6 +20,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.security.SecureRandom
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -116,11 +119,36 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun put(name: String, body: String) = changed { Native.put(handle, name, body) }
 
-    override fun form(body: String) = Native.form(body).split('\u001f', limit = 5).let {
-        Form(it[0], it.getOrElse(1) { "" }, it.getOrElse(2) { "" }, it.getOrElse(3) { "" }, it.getOrElse(4) { "" })
+    override fun form(body: String) = Native.form(body).split('\u001f', limit = 6).let {
+        val at = { i: Int -> it.getOrElse(i) { "" } }
+        Form(at(0), at(1), at(2), at(3), at(5), at(4))
     }
 
-    override fun text(f: Form) = Native.text(listOf(f.pass, f.user, f.url, f.otp, f.notes).joinToString("\u001f"))
+    override fun text(f: Form) = Native.text(listOf(f.pass, f.user, f.url, f.otp, f.tags, f.notes).joinToString("\u001f"))
+    override fun strength(pw: String) = Native.strength(pw)
+
+    override suspend fun times(name: String) = io {
+        lines(Native.times(handle, name)).map { it.toLong() }.let { if (it.size == 2) it[0] to it[1] else null }
+    }
+
+    override suspend fun health() = io {
+        val rows = lines(Native.health(handle)).map { it.split('\t') }
+        rows.filter { it[0] == "weak" }.map { it[1] to it[2].toInt() } to rows.filter { it[0] == "reused" }.map { it.drop(1) }
+    }
+
+    /** Only 5 hex digits of the password's SHA-1 leave the phone; the answer is padded. */
+    override suspend fun pwned(pw: String) = io {
+        val (sent, kept) = lines(Native.pwnedKey(pw))
+        val c = URL("https://api.pwnedpasswords.com/range/$sent").openConnection() as HttpURLConnection
+        c.setRequestProperty("Add-Padding", "true")
+        c.connectTimeout = 15_000
+        c.readTimeout = 15_000
+        try { Native.pwnedCount(kept, c.inputStream.bufferedReader().readText()) } finally { c.disconnect() }
+    }
+
+    override fun open(url: String) {
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+    }
     override fun code(body: String) = Native.field(body, "otp")
     override fun generate(g: Gen) =
         if (g.words) Native.speakable(g.count, g.hyphens, g.leet) else Native.generate(g.len, g.symbols)

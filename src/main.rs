@@ -23,6 +23,8 @@ pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: c
 pasa gen NAME [N] -w [-d] [-l]  ... of N speakable words (-d: dash-ed, -l: 1337)
 pasa attach NAME FILE        keep a file with an entry
 pasa files NAME [FILE]       those files, or one, to stdout
+pasa health [--pwned]        weak and reused passwords; --pwned: and breached ones,
+                             asking haveibeenpwned.com by 5 hex digits of each SHA-1
 pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
@@ -151,6 +153,19 @@ fn generate(s: &Store, n: &str, pw: String) -> Result<String> {
     Ok(pw)
 }
 
+/// How often haveibeenpwned.com has seen `pw` in breaches. Only 5 hex
+/// digits of its SHA-1 leave, with curl; the answer is padded.
+fn pwned(pw: &str) -> Result<u64> {
+    let (sent, kept) = pasa::pwned_key(pw);
+    let url = format!("https://api.pwnedpasswords.com/range/{sent}");
+    let o = Command::new("curl")
+        .args(["-sf", "--max-time", "15", "-H", "Add-Padding: true", &url])
+        .output()
+        .context("curl")?;
+    ensure!(o.status.success(), "haveibeenpwned.com did not answer");
+    Ok(pasa::pwned_count(&kept, &String::from_utf8_lossy(&o.stdout)))
+}
+
 /// `git` in `v/`, where the user made that a repository: its output.
 fn git(a: &[&str]) -> Option<Vec<u8>> {
     let v = home().join("v");
@@ -271,6 +286,22 @@ fn main() -> Result<()> {
             s.remove(n)?
         }
         ["mv", from, to] => open()?.rename(from, to)?,
+        ["health", ..] => {
+            let s = open()?;
+            let (weak, reused) = s.health()?;
+            weak.iter()
+                .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
+            reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
+            for n in s.entries()?.into_keys().filter(|_| flag("--pwned")) {
+                let pw =
+                    pasa::Form::parse(text(&s.get(&n)?).unwrap_or("")).pass;
+                match pwned(&pw)? {
+                    0 => {}
+                    times => println!("pwned   {n}: in breaches {times} times"),
+                }
+            }
+            return Ok(());
+        }
         ["attach", n, file] => {
             let s = open()?;
             s.get(n)?;

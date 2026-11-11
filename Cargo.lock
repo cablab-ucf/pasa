@@ -3947,6 +3947,7 @@ dependencies = [
  "pushir",
  "qrcode",
  "rpassword",
+ "sha1",
  "sha2 0.11.1",
  "tar",
  "tokio",
