@@ -60,9 +60,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -153,7 +156,6 @@ interface Host {
     val fidoPin: Boolean
     /** The key tapped opens the open store from now on (its [pin], if it has one); a spare is added the same way, at any time. */
     suspend fun fidoAdd(pin: String)
-    suspend fun unlockFido(pin: String)
     fun fidoOff()
     /** A setting kept on this phone: "clip" and "lock", seconds; "theme": 0 the phone's, 1 dark, 2 light. */
     fun setting(name: String): Int
@@ -167,6 +169,11 @@ interface Host {
     fun nfcSettings()
     suspend fun create(pw: String, key: Key, pin: String)
     suspend fun unlock(pw: String)
+    /**
+     * Waits for a key and opens the store with whatever it is good for here: true once it is open; false
+     * if it is the quick-unlock key and a PIN is set, its answer kept for [unlockQuick]. [pin]: a CTAP2 key's own.
+     */
+    suspend fun tapKey(pin: String): Boolean
     suspend fun unlockQuick(pin: String)
     /** Quick unlock on with [pin] (empty: none), or off (null). */
     suspend fun setQuick(pin: String?)
@@ -221,12 +228,22 @@ sealed interface Screen {
 
 /** Where the app is; [back] says whether it had somewhere to go back to. */
 class Nav {
+    /** Edit holds changes not saved; and whether leaving it is being asked about. */
+    var unsaved by mutableStateOf(false)
+    var asking by mutableStateOf(false)
     var screen by mutableStateOf<Screen>(Screen.List)
     var joining by mutableStateOf(false)
     var gen by mutableStateOf(Gen())
     val atTop get() = screen == Screen.List && !joining
 
     fun back() {
+        // Not thrown away without a word.
+        if (screen is Screen.Edit && unsaved && !asking) {
+            asking = true
+            return
+        }
+        unsaved = false
+        asking = false
         screen = when (val s = screen) {
             is Screen.Edit -> if (s.name.isEmpty()) Screen.List else Screen.Entry(s.name)
             is Screen.History -> Screen.Entry(s.name)
@@ -387,8 +404,15 @@ private fun Field(
     v: String, set: (String) -> Unit, label: String, secret: Boolean = false, lines: Int = 1,
     error: String = "", prose: Boolean = false, done: (() -> Unit)? = null,
     shown: MutableState<Boolean> = remember { mutableStateOf(false) },
+    /** A PIN of digits alone: the number pad. */
+    digits: Boolean = false,
+    /** Takes the keyboard as it appears. */
+    focus: Boolean = false,
     trailing: (@Composable () -> Unit)? = null,
-) = OutlinedTextField(
+) = run {
+    val here = remember { FocusRequester() }
+    if (focus) LaunchedEffect(Unit) { runCatching { here.requestFocus() } }
+    OutlinedTextField(
     v, set, label = { Text(label) }, singleLine = lines == 1, minLines = lines,
     isError = error.isNotEmpty(),
     supportingText = if (error.isEmpty()) null else ({ Text(error) }),
@@ -396,7 +420,7 @@ private fun Field(
     keyboardOptions = KeyboardOptions(
         capitalization = if (prose) KeyboardCapitalization.Sentences else KeyboardCapitalization.None,
         autoCorrectEnabled = prose,
-        keyboardType = if (secret) KeyboardType.Password else KeyboardType.Text,
+        keyboardType = if (digits) KeyboardType.NumberPassword else if (secret) KeyboardType.Password else KeyboardType.Text,
         imeAction = if (done != null) ImeAction.Done else ImeAction.Default,
     ),
     keyboardActions = KeyboardActions(onDone = { done?.invoke() }),
@@ -407,8 +431,9 @@ private fun Field(
             contentAlignment = Alignment.Center,
         ) { Eye(shown.value, muted) }
     }),
-    shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth(),
+    shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().focusRequester(here),
 )
+}
 
 @Composable
 private fun Primary(text: String, enabled: Boolean = true, go: () -> Unit) =
@@ -606,38 +631,68 @@ private fun Choice(title: String, about: String, on: Boolean, pick: () -> Unit) 
         }
     }
 
+/**
+ * Every way in at once: the password, always; and any key of this store's (the quick-unlock YubiKey, a
+ * CTAP2 key), tapped at any time with nothing pressed first. While the app listens, Android does not
+ * open the web address a YubiKey carries.
+ */
 @Composable
 private fun Unlock(host: Host) {
     var pw by remember { mutableStateOf("") }
     var pin by remember { mutableStateOf("") }
-    var byPassword by remember { mutableStateOf(false) }
     val work = rememberJob()
-    val quick = host.quick
+    val keys = host.quick != null || host.fidoKeys > 0
     val tap = "Hold your YubiKey still against the phone, or plug it in"
-    if (quick != null && !byPassword) {
-        val open = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
-        return Front("Unlock", work, "No key at hand?", "Use the password", { work.stop(); byPassword = true }, wait = tap, host = host) {
-            if (quick) Field(pin, { pin = it }, "PIN", secret = true, done = open)
-            NfcOff(host)
-            Primary("Unlock with the YubiKey", enabled = !work.busy, go = open)
+    // What the listening ran into, and a way to start it again.
+    var heard by remember { mutableStateOf("") }
+    var again by remember { mutableIntStateOf(0) }
+    // After a tap. 1: the quick-unlock key is read, its answer kept, and the PIN is wanted. 2: a CTAP2 key
+    // wants its own PIN before it answers, so it is typed and the key tapped again.
+    var stage by remember { mutableIntStateOf(0) }
+    val typed by rememberUpdatedState(pin)
+    val stuck = heard.isNotEmpty() && (host.nfcOff || "NFC" in heard)
+    if (keys) LaunchedEffect(work.busy, host.nfcOff, again, stage == 1) {
+        if (work.busy || stage == 1) return@LaunchedEffect
+        while (true) {
+            try {
+                if (!host.tapKey(typed)) { stage = 1; pin = "" }
+                heard = ""
+                break
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                heard = e.message?.removePrefix("Rust error: ") ?: "It failed"
+                if ("has a PIN" in heard) stage = 2
+                // No way to a key at all: said, with Try again; anything else, the next tap may do better.
+                if (host.nfcOff || "NFC" in heard) break
+                delay(400)
+            }
         }
     }
-    var byKey by remember { mutableStateOf(false) }
-    val open = { if (!work.busy) { byKey = false; work.go { host.unlock(pw); pw = "" } } }
-    Front(
-        "Unlock", work, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
-        { work.stop(); byPassword = false },
-        wait = if (byKey) "Hold your security key still against the phone, or plug it in and touch it" else if (host.needsKey) tap else "", host = host,
-    ) {
-        Field(pw, { pw = it }, "Password", secret = true, done = open)
-        if (host.needsKey) NfcOff(host)
-        Primary("Unlock", enabled = !work.busy, go = open)
-        // A security key of this store's opens it without the password.
-        if (host.fidoKeys > 0) {
+    val open = { if (!work.busy) work.go { host.unlock(pw); pw = "" } }
+    val byPin = { if (!work.busy) work.go { host.unlockQuick(pin); pin = "" } }
+    Front("Unlock", work, wait = if (host.needsKey || stage == 1) tap else "", host = host) {
+        if (keys) {
+            if (stage == 1) {
+                Text("The key is read. Now the PIN:", color = MaterialTheme.colorScheme.primary)
+                // The number pad, if the PIN that was set is digits alone.
+                Field(pin, { pin = it }, "PIN", secret = true, done = byPin, digits = host.setting("pinDigits") == 1, focus = true)
+                Primary("Unlock", enabled = !work.busy, go = byPin)
+                TextButton({ stage = 0; pin = ""; again++ }) { Text("Tap another key") }
+            } else {
+                Text("Tap your key on the phone, or plug it in", color = MaterialTheme.colorScheme.primary)
+                if (heard.isNotEmpty()) Text(heard, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+                if (stage == 2) Field(pin, { pin = it }, "Security key PIN", secret = true, focus = true)
+                NfcOff(host)
+                if (stuck) OutlinedButton({ heard = ""; again++ }) { Text("Try again") }
+            }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-            if (host.fidoPin) Field(pin, { pin = it }, "Security key PIN, if any", secret = true)
-            OutlinedButton({ byKey = true; work.go { host.unlockFido(pin); pin = "" } }, enabled = !work.busy) { Text("Unlock with a security key") }
+            Label("OR THE PASSWORD")
         }
+        Field(pw, { pw = it }, "Password", secret = true, done = open)
+        if (host.needsKey && !keys) NfcOff(host)
+        if (keys) OutlinedButton(open, Modifier.fillMaxWidth(), enabled = !work.busy && pw.isNotEmpty()) { Text("Unlock with the password") }
+        else Primary("Unlock", enabled = !work.busy, go = open)
     }
 }
 
@@ -889,7 +944,16 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     var name by remember { mutableStateOf(old) }
     var f by remember { mutableStateOf(if (old.isEmpty()) Form(pass = host.generate(nav.gen)) else Form()) }
     val show = remember { mutableStateOf(old.isEmpty()) }
-    LaunchedEffect(old) { if (old.isNotEmpty()) f = host.form(host.get(old)) }
+    // As it was when this opened: leaving with something changed is asked about first.
+    var was by remember { mutableStateOf(name to f) }
+    LaunchedEffect(old) { if (old.isNotEmpty()) { f = host.form(host.get(old)); was = name to f } }
+    nav.unsaved = (name to f) != was
+    if (nav.asking) AlertDialog(
+        { nav.asking = false }, title = { Text("Leave without saving?") },
+        text = { Text("What you changed here is not saved yet.") },
+        confirmButton = { TextButton({ nav.back() }) { Text("Discard") } },
+        dismissButton = { TextButton({ nav.asking = false }) { Text("Keep editing") } },
+    )
     var advanced by remember { mutableStateOf(false) }
     var making by remember { mutableStateOf(false) }
     val wrong = host.problem(f)
@@ -950,6 +1014,7 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
             go {
                 if (old.isNotEmpty() && old != to) host.rename(old, to)
                 host.put(to, text)
+                nav.unsaved = false
                 nav.screen = Screen.Entry(to)
                 "$to: saved"
             }
@@ -976,7 +1041,8 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
     var n by remember { mutableIntStateOf(0) }
     val made = remember(g, n) { host.generate(g) }
     var pw by remember(made) { mutableStateOf(made) }
-    val bits = if (pw == made) g.bits else host.strength(pw)
+    // Of the password as it stands, at every change of it.
+    val bits = host.strength(pw)
     AlertDialog(
         close, title = { Text("Password generator") },
         text = {
@@ -991,7 +1057,7 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
                     Way("Speakable", g.words) { nav.gen = g.copy(words = true) }
                 }
                 if (g.words) {
-                    Label("${g.count} words")
+                    Label("${g.count} words  \u00B7  made of ${g.bits} bits")
                     Slider(g.count.toFloat(), { nav.gen = g.copy(count = it.toInt()) }, valueRange = 3f..8f, steps = 4)
                     Label("BETWEEN WORDS")
                     for (row in listOf(listOf("" to "Nothing", "-" to "-", "." to "."), listOf("_" to "_", "-_." to "- _ .", SEPS to "Any symbol")))
@@ -1000,11 +1066,11 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
                         }
                     Tick("1337: some letters as @ 3 1 0 \$ 7", g.leet) { nav.gen = g.copy(leet = it) }
                 } else {
-                    Label("${g.len} characters")
+                    Label("${g.len} characters  \u00B7  made of ${g.bits} bits")
                     Slider(g.len.toFloat(), { nav.gen = g.copy(len = it.toInt()) }, valueRange = 8f..64f)
                     Tick("Symbols", g.symbols) { nav.gen = g.copy(symbols = it) }
                 }
-                Text("Change it by hand and its bits are counted again. New entries start with a password made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
+                Text("The bar estimates the password as it stands, at every change. New entries start with one made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
             }
         },
         confirmButton = {

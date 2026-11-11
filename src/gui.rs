@@ -222,8 +222,6 @@ struct Generator {
     seps: &'static str,
     leet: bool,
     pw: Zeroizing<String>,
-    /// `pw` as it was made: changed by hand, its bits are an estimate.
-    made: Zeroizing<String>,
 }
 
 impl Default for Generator {
@@ -231,8 +229,7 @@ impl Default for Generator {
         let pw = Zeroizing::new(pasa::generate(24, true));
         let (len, count) = (24, 4);
         let (words, symbols, seps, leet) = (false, true, "", false);
-        let made = pw.clone();
-        Generator { words, len, symbols, count, seps, leet, pw, made }
+        Generator { words, len, symbols, count, seps, leet, pw }
     }
 }
 
@@ -256,7 +253,7 @@ impl Generator {
                 .selectable_value(&mut g.words, true, "Speakable words")
                 .clicked();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let bits = format!("{} bits", g.bits());
+                let bits = format!("made of {} bits", g.bits());
                 ui.label(RichText::new(bits).small().color(l.muted));
             });
         });
@@ -304,12 +301,10 @@ impl Generator {
         again
     }
 
-    /// The bits of chance in the password: as made, what went into it;
-    /// changed by hand, an estimate.
+    /// The bits of chance that go into a password made this way.
     fn bits(&self) -> u32 {
         let abc: f64 = if self.symbols { 80.0 } else { 62.0 };
         match self.words {
-            _ if *self.pw != *self.made => pasa::strength(&self.pw),
             true => pasa::speakable_bits(self.count, self.seps),
             false => (self.len as f64 * abc.log2()) as u32,
         }
@@ -343,7 +338,6 @@ struct App {
     /// The store's password as generated here, and its bits.
     made: (Zeroizing<String>, u32),
     /// At the unlock: the password, though quick unlock is on.
-    by_password: bool,
     joining: bool,
     peer: String,
     code: String,
@@ -815,14 +809,6 @@ impl App {
         } else {
             "Unlock"
         };
-        let quick = pasa::quick(&home()).filter(|_| !self.by_password);
-        if let Some((_, pin)) = quick {
-            return self.unlock_quick(ui, pin);
-        }
-        let back = pasa::quick(&home()).is_some();
-        if back && corner(ui, "Quick unlock is on.", "Use the YubiKey") {
-            (self.by_password, self.said) = (false, String::new());
-        }
         card(ui, "A small password store", title, |ui| {
             let pw = field(ui, "Password", &mut self.pw, true);
             let enter = entered(ui, &pw);
@@ -842,45 +828,34 @@ impl App {
                 let say = if yk { "Touch your YubiKey" } else { "Unlocking" };
                 self.begin(ui, Job::Unlock, say);
             }
-            // A security key of this store's opens it without the password.
-            if let Some(f) = pasa::fido(&home()) {
+            // Every other way in is here too: the quick-unlock YubiKey, a
+            // security key (CTAP2). One PIN field serves whichever is used.
+            let (quick, keys) = (pasa::quick(&home()), pasa::fido(&home()));
+            if quick.is_some() || keys.is_some() {
                 ui.separator();
-                if f.keys.iter().any(|k| k.1) {
-                    field(
-                        ui,
-                        "The security key's PIN, if it has one",
-                        &mut self.pin,
-                        true,
-                    );
+                let l = look(ui);
+                ui.label(RichText::new("Or a key").small().color(l.muted));
+                let pin = quick.as_ref().is_some_and(|q| q.1);
+                if pin
+                    || keys.as_ref().is_some_and(|f| f.keys.iter().any(|k| k.1))
+                {
+                    field(ui, "PIN", &mut self.pin, true);
                 }
-                if ui.button("Unlock with a security key").clicked() {
-                    self.begin(ui, Job::Fido, "Touch your security key");
-                }
+                ui.horizontal_wrapped(|ui| {
+                    if quick.is_some()
+                        && ui.button("Unlock with the YubiKey").clicked()
+                    {
+                        self.begin(ui, Job::Quick, "Touch your YubiKey");
+                    }
+                    if keys.is_some()
+                        && ui.button("Unlock with a security key").clicked()
+                    {
+                        self.begin(ui, Job::Fido, "Touch your security key");
+                    }
+                });
             }
             self.said(ui);
         });
-    }
-
-    /// A tap, and the PIN if one is set; the password is the other way in.
-    fn unlock_quick(&mut self, ui: &mut Ui, pin: bool) {
-        card(ui, "A small password store", "Unlock", |ui| {
-            let mut enter = false;
-            if pin {
-                let p = field(ui, "PIN", &mut self.pin, true);
-                enter = entered(ui, &p);
-                if ui.memory(|m| m.focused().is_none()) {
-                    p.request_focus();
-                }
-            }
-            ui.add_space(6.0);
-            if primary(ui, "Unlock with the YubiKey", true).clicked() || enter {
-                self.begin(ui, Job::Quick, "Touch your YubiKey");
-            }
-            self.said(ui);
-        });
-        if corner(ui, "No key at hand?", "Use the password") {
-            (self.by_password, self.said) = (true, String::new());
-        }
     }
 
     /// What a row shows of the entry, read once per version.
@@ -1918,7 +1893,8 @@ impl App {
                 t.font(FontId::monospace(16.0)).desired_width(f32::INFINITY),
             );
         });
-        meter(ui, g.bits());
+        // Of the password as it stands, at every change of it.
+        meter(ui, pasa::strength(&g.pw));
         let mut again = g.options(ui);
         ui.horizontal(|ui| {
             again |= ui.button("Another").clicked();
@@ -1933,10 +1909,9 @@ impl App {
         });
         if again {
             g.pw = Zeroizing::new(g.make());
-            g.made = g.pw.clone();
         }
-        let note = "Change it by hand and its bits are counted again. New \
-                    entries start with a password made this way.";
+        let note = "The bar estimates the password as it stands, at every \
+                    change. New entries start with one made this way.";
         ui.label(RichText::new(note).small().color(l.muted));
     }
 

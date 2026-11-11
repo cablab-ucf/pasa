@@ -934,12 +934,23 @@ static WORDS: LazyLock<HashMap<&'static str, f64>> = LazyLock::new(|| {
     m
 });
 
+/// The syllables [`speakable`] builds its words of: 2,048, 11 bits each.
+static SYLLABLES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    let mut all = HashSet::new();
+    for (o, v) in ONSETS.iter().flat_map(|o| VOWELS.map(|v| (o, v))) {
+        all.extend(CODAS.iter().map(|c| format!("{o}{v}{c}")));
+    }
+    all
+});
+
 /// A guess at the bits in a typed password: the cheapest way to spell it
 /// from common passwords (by rank), dictionary words (13 bits; a capital
-/// or 1337 costs a little more) and single characters (by the alphabets
-/// used; one next to its neighbour, as in abc or 111, costs one bit). An
-/// estimate: only a generated password's bits are known. Under 40 is
-/// poor, under 65 weak, under 100 good.
+/// or 1337 costs a little more), the syllables of [`speakable`] (11 bits:
+/// a made-up word is worth what went into it, not its letters) and single
+/// characters (by the alphabets used; one next to its neighbour, as in abc
+/// or 111, costs one bit; a separator at most four). An estimate, made
+/// from the password as it stands: only a generator knows the bits it
+/// used. Under 40 is poor, under 65 weak, under 100 good.
 pub fn strength(pw: &str) -> u32 {
     let cs: Vec<char> = pw.chars().collect();
     let has = |f: fn(&char) -> bool| cs.iter().any(f);
@@ -964,7 +975,28 @@ pub fn strength(pw: &str) -> u32 {
     let mut best = vec![0.0f64; cs.len() + 1];
     for i in 1..=cs.len() {
         let near = i >= 2 && (cs[i - 1] as i64 - cs[i - 2] as i64).abs() <= 1;
-        best[i] = best[i - 1] + if near { 1.0 } else { each };
+        // Between two letters: what words are held apart with.
+        let letter =
+            |j: usize| cs.get(j).is_some_and(char::is_ascii_alphabetic);
+        let sep =
+            SEPS.contains(cs[i - 1]) && i >= 2 && letter(i - 2) && letter(i);
+        let one = if sep { each.min(4.0) } else { each };
+        best[i] = best[i - 1] + if near { 1.0 } else { one };
+        // A syllable, spelt as `speakable` spells it: a capital or a
+        // 1337 letter is one bit more.
+        for len in 2..=i.min(6) {
+            let part = &cs[i - len..i];
+            let (mut plain, mut odd) = (String::new(), 0.0);
+            for c in part {
+                let at = "@310$7".find(*c);
+                odd += (at.is_some() || c.is_ascii_uppercase()) as u8 as f64;
+                let c = at.map_or(*c, |i| "aelost".as_bytes()[i] as char);
+                plain.push(c.to_ascii_lowercase());
+            }
+            if SYLLABLES.contains(&plain) {
+                best[i] = best[i].min(best[i - len] + 11.0 + odd);
+            }
+        }
         for len in 3..=i.min(24) {
             let part = &cs[i - len..i];
             let low: String =
@@ -1445,7 +1477,22 @@ mod tests {
         assert_eq!(strength(""), 0);
         assert!(strength("k3Vq9xLp2mZt") >= 65);
         assert!(strength(&generate(24, true)) >= 100);
-        assert!(strength(&speakable(4, "", false)) >= 65);
+        // A made password is worth about what went into it, as it stands.
+        for _ in 0..100 {
+            let near = |pw: String, bits: u32| {
+                let got = strength(&pw);
+                // Chance repeats and runs cost a random one some: never
+                // most.
+                assert!(got * 5 >= bits * 3, "{pw}: {got} for {bits}");
+                assert!(got <= bits + 28, "{pw}: {got} for {bits}");
+            };
+            near(speakable(4, "", false), 88);
+            near(speakable(5, "-", false), 110);
+            near(speakable(4, SEPS, false), speakable_bits(4, SEPS));
+            near(speakable(3, "", true), 66 + 6);
+            near(generate(24, true), 151);
+            near(generate(16, false), 95);
+        }
         // SHA-1("password") = 5BAA6 1E4C9B93F3F0682250B6CF8331B7EE68FD8.
         let (sent, kept) = pwned_key("password");
         assert_eq!(
