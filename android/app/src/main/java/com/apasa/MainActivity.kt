@@ -3,15 +3,18 @@ package com.apasa
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PersistableBundle
+import android.provider.OpenableColumns
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -35,6 +38,12 @@ class MainActivity : ComponentActivity(), Host {
     private var scanned: (String) -> Unit = {}
     private val scanner = registerForActivityResult(ScanQr()) { it?.let { t -> scanned(t) } }
 
+    /** A file is being picked: the store stays open under the picker. */
+    private var picking = false
+    private var picked: (Uri?) -> Unit = {}
+    private val opener = registerForActivityResult(ActivityResultContracts.OpenDocument()) { picking = false; picked(it) }
+    private val saver = registerForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { picking = false; picked(it) }
+
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
         enableEdgeToEdge()
@@ -49,7 +58,7 @@ class MainActivity : ComponentActivity(), Host {
 
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) lock()
+        if (!isChangingConfigurations && !picking) lock()
     }
 
     override val hasStore get() = stored
@@ -98,11 +107,14 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun names() = io { lines(Native.names(handle)) }
     override suspend fun get(name: String) = io { Native.get(handle, name) }
 
-    override suspend fun put(name: String, body: String) = io {
-        Native.put(handle, name, body)
+    /** A change, then the news to the other devices. */
+    private suspend fun changed(f: () -> Unit) = io {
+        f()
         if (sync) runCatching { Native.sync(dir, true) }
         Unit
     }
+
+    override suspend fun put(name: String, body: String) = changed { Native.put(handle, name, body) }
 
     override fun form(body: String) = Native.form(body).split('\u001f', limit = 5).let {
         Form(it[0], it.getOrElse(1) { "" }, it.getOrElse(2) { "" }, it.getOrElse(3) { "" }, it.getOrElse(4) { "" })
@@ -110,7 +122,44 @@ class MainActivity : ComponentActivity(), Host {
 
     override fun text(f: Form) = Native.text(listOf(f.pass, f.user, f.url, f.otp, f.notes).joinToString("\u001f"))
     override fun code(body: String) = Native.field(body, "otp")
-    override fun generate(len: Int, symbols: Boolean) = Native.generate(len, symbols)
+    override fun generate(g: Gen) =
+        if (g.words) Native.speakable(g.count, g.hyphens, g.leet) else Native.generate(g.len, g.symbols)
+
+    override suspend fun remove(name: String) = changed { Native.remove(handle, name) }
+    override suspend fun rename(from: String, to: String) = changed { Native.rename(handle, from, to) }
+
+    override suspend fun history(name: String) = io {
+        Native.history(handle, name).split('\u001e').filter { it.isNotEmpty() }.map {
+            it.substringBefore('\u001f').toLong() to it.substringAfter('\u001f')
+        }
+    }
+
+    override suspend fun files(name: String) = io { lines(Native.files(handle, name)) }
+
+    override fun attach(name: String, done: (String) -> Unit) {
+        picked = { uri ->
+            if (uri != null) done(runCatching {
+                val file = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: "file"
+                val body = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                Native.keep(handle, "$name/.files/$file", body)
+                "$file: kept with $name"
+            }.getOrElse { it.message ?: "It failed" })
+        }
+        picking = true
+        opener.launch(arrayOf("*/*"))
+    }
+
+    override fun save(name: String, file: String, done: (String) -> Unit) {
+        picked = { uri ->
+            if (uri != null) done(runCatching {
+                contentResolver.openOutputStream(uri)!!.use { it.write(Native.bytes(handle, "$name/.files/$file")) }
+                "$file: saved"
+            }.getOrElse { it.message ?: "It failed" })
+        }
+        picking = true
+        saver.launch(file)
+    }
 
     override fun copy(text: String) {
         val cm = getSystemService(ClipboardManager::class.java)

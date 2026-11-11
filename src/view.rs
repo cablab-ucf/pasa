@@ -78,13 +78,23 @@ impl View {
         })
     }
 
-    pub fn generate(&mut self, name: &str) {
+    /// `pw` as `name`'s new password, copied.
+    pub fn generate(&mut self, name: &str, pw: String) {
         self.act(|v| {
             ensure!(!name.trim().is_empty(), "type a name first");
-            let pw = crate::generate(&v.s, name.trim(), 24, true)?;
+            let pw = crate::generate(&v.s, name.trim(), pw)?;
             news();
             clip(&pw)?;
             Ok(format!("{name}: new password copied, cleared in 45 s"))
+        })
+    }
+
+    /// Something done to the store: said, recorded, the peers told.
+    pub fn change(&mut self, f: impl FnOnce(&pasa::Store) -> Result<String>) {
+        self.act(|v| {
+            let said = f(&v.s)?;
+            news();
+            Ok(said)
         })
     }
 }

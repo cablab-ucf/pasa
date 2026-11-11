@@ -12,6 +12,13 @@ object Native {
     external fun put(h: Long, name: String, body: String)
     external fun field(body: String, f: String): String
     external fun generate(len: Int, symbols: Boolean): String
+    external fun speakable(words: Int, hyphens: Boolean, leet: Boolean): String
+    external fun remove(h: Long, name: String)
+    external fun rename(h: Long, from: String, to: String)
+    external fun history(h: Long, name: String): String
+    external fun files(h: Long, name: String): String
+    external fun bytes(h: Long, name: String): ByteArray
+    external fun keep(h: Long, name: String, body: ByteArray)
     external fun form(body: String): String
     external fun text(form: String): String
     external fun peers(dir: String): String

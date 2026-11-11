@@ -19,7 +19,10 @@ pasa [show] NAME [FIELD]     entry, or a field: pass, user, otp, ...
 pasa cp NAME [FIELD]         to the clipboard for 45 s
 pasa set NAME                from stdin (a terminal: the password)
 pasa edit NAME               in $EDITOR
-pasa gen NAME [LEN] [-n] [-c] new password (-n: no symbols, -c: copy)
+pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: copy)
+pasa gen NAME [N] -w [-d] [-l]  ... of N speakable words (-d: dash-ed, -l: 1337)
+pasa attach NAME FILE        keep a file with an entry
+pasa files NAME [FILE]       those files, or one, to stdout
 pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
@@ -140,9 +143,8 @@ fn edit(old: &[u8]) -> Result<Secret> {
     Ok(new?)
 }
 
-/// A new password for `n`, its other lines kept.
-fn generate(s: &Store, n: &str, len: usize, symbols: bool) -> Result<String> {
-    let pw = pasa::generate(len, symbols);
+/// `pw` as the new password of `n`, its other lines kept.
+fn generate(s: &Store, n: &str, pw: String) -> Result<String> {
     let old = s.get(n).unwrap_or_default();
     let rest = text(&old)?.split_once('\n').map_or("", |r| r.1);
     s.put(n, format!("{pw}\n{rest}").as_bytes())?;
@@ -250,8 +252,14 @@ fn main() -> Result<()> {
             s.put(n, &new)?
         }
         ["gen", n, ..] => {
-            let len = a.get(2).and_then(|l| l.parse().ok()).unwrap_or(24);
-            let pw = generate(&open()?, n, len, !flag("-n"))?;
+            let len = a.get(2).and_then(|l| l.parse().ok());
+            let pw = match flag("-w") {
+                true => {
+                    pasa::speakable(len.unwrap_or(4), flag("-d"), flag("-l"))
+                }
+                false => pasa::generate(len.unwrap_or(24), !flag("-n")),
+            };
+            let pw = generate(&open()?, n, pw)?;
             match flag("-c") {
                 true => clip(&pw)?,
                 false => println!("{pw}"),
@@ -260,13 +268,24 @@ fn main() -> Result<()> {
         ["rm", n] => {
             let s = open()?;
             s.get(n)?;
-            s.put(n, b"")?
+            s.remove(n)?
         }
-        ["mv", from, to] => {
+        ["mv", from, to] => open()?.rename(from, to)?,
+        ["attach", n, file] => {
             let s = open()?;
-            ensure!(s.get(to).is_err(), "{to} exists");
-            s.put(to, &s.get(from)?)?;
-            s.put(from, b"")?
+            s.get(n)?;
+            let f =
+                std::path::Path::new(file).file_name().context("no file")?;
+            let to = format!("{n}{}{}", pasa::FILES, f.to_string_lossy());
+            s.put(&to, &Zeroizing::new(std::fs::read(file)?))?
+        }
+        ["files", n] => {
+            open()?.files(n)?.iter().for_each(|f| println!("{f}"));
+            return Ok(());
+        }
+        ["files", n, f] => {
+            let b = open()?.get(&format!("{n}{}{f}", pasa::FILES))?;
+            return Ok(std::io::stdout().write_all(&b)?);
         }
         ["log", n] => {
             let s = open()?;

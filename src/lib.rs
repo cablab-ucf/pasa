@@ -449,6 +449,39 @@ impl Store {
         Ok(m)
     }
 
+    /// The names of the files attached to entry `name`.
+    pub fn files(&self, name: &str) -> Result<Vec<String>> {
+        let at = format!("{name}{FILES}");
+        let all = self.entries()?.into_keys();
+        Ok(all.filter_map(|n| n.strip_prefix(&at).map(String::from)).collect())
+    }
+
+    /// Delete entry `name` and what is attached to it.
+    pub fn remove(&self, name: &str) -> Result<()> {
+        for f in self.files(name)? {
+            self.put(&format!("{name}{FILES}{f}"), b"")?;
+        }
+        self.put(name, b"")
+    }
+
+    /// Entry `from` and what is attached to it, as `to`.
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        ensure!(self.get(to).is_err(), "{to} exists");
+        for f in self.files(from)? {
+            let body = self.get(&format!("{from}{FILES}{f}"))?;
+            self.put(&format!("{to}{FILES}{f}"), &body)?;
+        }
+        self.put(to, &self.get(from)?)?;
+        self.remove(from)
+    }
+
+    /// Entry `name`'s versions and their bodies, newest first.
+    pub fn history(&self, name: &str) -> Result<Vec<(u64, Secret)>> {
+        let mut vs = self.versions()?;
+        vs.retain(|v| v.name == name);
+        vs.iter().rev().map(|v| Ok((v.ms, self.body(v)?))).collect()
+    }
+
     /// Entries whose newest version did not follow the one before it: two
     /// devices changed them apart. The other change is in `pasa log`.
     pub fn conflicts(&self) -> Result<Vec<String>> {
@@ -534,6 +567,48 @@ pub fn field(body: &str, f: &str) -> Option<String> {
         }),
     }
 }
+
+// A syllable is an onset, a vowel and a coda: 5 + 3 + 3 bits. The
+// consonants between two vowels split into a coda and an onset one way
+// only (tested), so a password reads back as one sequence: the bits
+// counted are the bits there.
+const ONSETS: [&str; 32] = [
+    "b", "c", "d", "f", "g", "h", "j", "k", "p", "s", "t", "v", "bl", "br",
+    "ch", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "pl", "pr", "sh", "sk",
+    "sl", "sn", "sp", "st", "th", "tr",
+];
+const VOWELS: [&str; 8] = ["a", "e", "i", "o", "u", "ai", "ee", "ou"];
+const CODAS: [&str; 8] = ["", "n", "m", "l", "r", "ng", "rn", "ll"];
+
+/// A password to say aloud: `words` made-up words of two syllables, 22
+/// bits each (four: 88). `hyphens`: snur-deslat-genres, else
+/// SnurDeslatGenres. `leet`: a e i o s t as 4 3 1 0 5 7, digits that
+/// stand nowhere else, so nothing is lost; a capital stays a letter.
+pub fn speakable(words: usize, hyphens: bool, leet: bool) -> String {
+    let word = |_| {
+        let mut w = String::new();
+        for _ in 0..2 {
+            let r = u16::from_be_bytes(rand()) as usize;
+            w += ONSETS[r & 31];
+            w += VOWELS[r >> 5 & 7];
+            w += CODAS[r >> 8 & 7];
+        }
+        if !hyphens {
+            w = w[..1].to_uppercase() + &w[1..];
+        }
+        let digit = |c| match "aeiost".find(c) {
+            Some(i) if leet => b"431057"[i] as char,
+            _ => c,
+        };
+        w.chars().map(digit).collect::<String>()
+    };
+    let words: Vec<String> = (0..words).map(word).collect();
+    words.join(if hyphens { "-" } else { "" })
+}
+
+/// Where an entry's attachments are: entries of their own, hidden from
+/// listings, so they sync, keep their history and are deleted as any other.
+pub const FILES: &str = "/.files/";
 
 /// An entry's text as the fields a form shows: the password (line 1),
 /// `user:`, `url:`, the otpauth URI's line, and every other line.
@@ -715,6 +790,51 @@ mod tests {
         let pt = open(&s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
         assert_eq!(pt.len(), 256, "padded");
+    }
+
+    #[test]
+    fn speakable_passwords_keep_their_bits() {
+        // Between two vowels stand a coda and an onset: no two such pairs
+        // spell the same, so the syllables read back one way.
+        let runs =
+            CODAS.iter().flat_map(|c| ONSETS.iter().map(move |o| (c, o)));
+        let runs: std::collections::HashSet<String> =
+            runs.map(|(c, o)| format!("{c}{o}")).collect();
+        assert_eq!(runs.len(), CODAS.len() * ONSETS.len());
+        let vowel = |s: &&str| s.contains(['a', 'e', 'i', 'o', 'u']);
+        assert!(!ONSETS.iter().chain(&CODAS).any(vowel));
+        let mut seen = std::collections::HashSet::new();
+        for (o, v, c) in ONSETS
+            .iter()
+            .flat_map(|o| VOWELS.iter().map(move |v| (o, v)))
+            .flat_map(|(o, v)| CODAS.iter().map(move |c| (o, v, c)))
+        {
+            assert!(seen.insert(format!("{o}{v}{c}")));
+        }
+        assert_eq!(seen.len(), 1 << 11);
+        let p = speakable(4, true, false);
+        assert_eq!(p.split('-').count(), 4);
+        assert!(p.chars().all(|c| c == '-' || c.is_ascii_lowercase()));
+        let p = speakable(3, false, true);
+        assert_eq!(p.chars().filter(|c| c.is_ascii_uppercase()).count(), 3);
+        assert!(!p.contains(['a', 'e', 'i', 'o', 's', 't', '-']));
+    }
+
+    #[test]
+    fn files_and_history() {
+        let s = Store::create(&dir("files"), b"pw", None).unwrap();
+        s.put("mail", b"one\n").unwrap();
+        s.put("mail", b"two\n").unwrap();
+        s.put(&format!("mail{FILES}key.pem"), &[0, 159, 255]).unwrap();
+        assert_eq!(s.files("mail").unwrap(), ["key.pem"]);
+        assert_eq!(*s.get("mail/.files/key.pem").unwrap(), [0, 159, 255]);
+        let h = s.history("mail").unwrap();
+        let bodies: Vec<&[u8]> = h.iter().map(|v| &v.1[..]).collect();
+        assert_eq!(bodies, [&b"two\n"[..], b"one\n"]);
+        s.rename("mail", "post").unwrap();
+        assert_eq!(s.files("post").unwrap(), ["key.pem"]);
+        s.remove("post").unwrap();
+        assert!(s.entries().unwrap().is_empty());
     }
 
     #[test]

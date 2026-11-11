@@ -36,7 +36,18 @@ the corner; then groups, entries with their user names, the chosen entry's
 fields each with its copy, a form to edit them, a password generator,
 devices (pair, forget, sync) and settings (`~/.pasa/ui`: when to lock, the
 theme). An entry is still the text `pass` reads: the form writes `user:`
-and `url:` lines.
+and `url:` lines. Both also show an entry's history (each version, with a
+way back) and its files.
+
+A file kept with an entry (`pasa attach NAME FILE`, or dropped on the
+window) is an entry of its own, `NAME/.files/FILE`, hidden from listings:
+it syncs, keeps its history, and goes when its entry is removed or moved.
+
+`pasa gen NAME -w` makes a password to say aloud: made-up words of two
+syllables, 22 bits each (four: 88), `SnouldengThollglirPeemtaimCerdul`
+or, with `-d`, `blongder-hilfloum-gainghung-paircairn`; `-l` writes
+a e i o s t as 4 3 1 0 5 7. A password reads back as one sequence of
+syllables only, so the bits counted are the bits there.
 
 Both browsers lock when left alone (5 minutes; the window's is a setting),
 sync as the command line does, and copy through `wl-copy`, `xclip` or

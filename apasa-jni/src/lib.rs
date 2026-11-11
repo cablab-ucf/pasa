@@ -195,6 +195,105 @@ pub extern "system" fn Java_com_apasa_Native_generate<'l>(
     run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, symbols))?))
 }
 
+/// A password to say aloud ([`pasa::speakable`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_speakable<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    words: i32,
+    hyphens: bool,
+    leet: bool,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        Ok(e.new_string(pasa::speakable(words as usize, hyphens, leet))?)
+    })
+}
+
+/// Delete an entry and what is attached to it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_remove<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) {
+    run(&mut env, |_| with(h, |s| s.remove(&name.to_string())))
+}
+
+/// An entry and what is attached to it, under a new name.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_rename<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    from: JString<'l>,
+    to: JString<'l>,
+) {
+    run(&mut env, |_| with(h, |s| s.rename(&from.to_string(), &to.to_string())))
+}
+
+/// An entry's versions, newest first: milliseconds, U+001F, the text;
+/// U+001E between versions.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_history<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let all = with(h, |s| s.history(&name.to_string()))?;
+        let one = |(ms, b): &(u64, pasa::Secret)| {
+            format!("{ms}\u{1f}{}", String::from_utf8_lossy(b))
+        };
+        let all: Vec<String> = all.iter().map(one).collect();
+        Ok(e.new_string(all.join("\u{1e}"))?)
+    })
+}
+
+/// The names of the files attached to an entry, one a line.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_files<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let f = with(h, |s| s.files(&name.to_string()))?;
+        Ok(e.new_string(f.join("\n"))?)
+    })
+}
+
+/// An entry's bytes as they are: an attached file's.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_bytes<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+) -> JByteArray<'l> {
+    run(&mut env, |e| {
+        let b = with(h, |s| s.get(&name.to_string()))?;
+        Ok(e.byte_array_from_slice(&b)?)
+    })
+}
+
+/// Keep bytes as an entry: an attached file.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_keep<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+    body: JByteArray<'l>,
+) {
+    run(&mut env, |e| {
+        let b = zeroize::Zeroizing::new(bytes(e, &body)?.unwrap_or_default());
+        with(h, |s| s.put(&name.to_string(), &b))
+    })
+}
+
 /// An entry's text as its form: password, user, url, otpauth URI and
 /// notes, U+001F between them.
 #[unsafe(no_mangle)]

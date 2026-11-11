@@ -72,6 +72,14 @@ data class Form(
     val otp: String = "", val notes: String = "",
 )
 
+/** How a password is made: characters, or words to say aloud (22 bits each). */
+data class Gen(
+    val words: Boolean = false, val len: Int = 24, val symbols: Boolean = true,
+    val count: Int = 4, val hyphens: Boolean = false, val leet: Boolean = false,
+) {
+    val bits get() = if (words) 22 * count else (len * kotlin.math.log2(if (symbols) 80.0 else 62.0)).toInt()
+}
+
 /** What the screens ask of the app: the store, the clipboard, the key, the camera. */
 interface Host {
     val hasStore: Boolean
@@ -87,10 +95,19 @@ interface Host {
     suspend fun names(): List<String>
     suspend fun get(name: String): String
     suspend fun put(name: String, body: String)
+    suspend fun remove(name: String)
+    suspend fun rename(from: String, to: String)
+    /** Each version of [name], newest first: when (ms) and its text. */
+    suspend fun history(name: String): List<Pair<Long, String>>
+    suspend fun files(name: String): List<String>
+    /** Pick a file and keep it with [name]; [done] says how it went. */
+    fun attach(name: String, done: (String) -> Unit)
+    /** Write [name]'s file [file] where the user says. */
+    fun save(name: String, file: String, done: (String) -> Unit)
     fun form(body: String): Form
     fun text(f: Form): String
     fun code(body: String): String
-    fun generate(len: Int, symbols: Boolean): String
+    fun generate(g: Gen): String
     fun copy(text: String)
     suspend fun syncNow(): String
     suspend fun peers(): List<String>
@@ -103,6 +120,7 @@ sealed interface Screen {
     data object List : Screen
     data class Entry(val name: String) : Screen
     data class Edit(val name: String) : Screen
+    data class History(val name: String) : Screen
     data object Devices : Screen
     data object Settings : Screen
 }
@@ -111,11 +129,13 @@ sealed interface Screen {
 class Nav {
     var screen by mutableStateOf<Screen>(Screen.List)
     var joining by mutableStateOf(false)
+    var gen by mutableStateOf(Gen())
     val atTop get() = screen == Screen.List && !joining
 
     fun back() {
         screen = when (val s = screen) {
             is Screen.Edit -> if (s.name.isEmpty()) Screen.List else Screen.Entry(s.name)
+            is Screen.History -> Screen.Entry(s.name)
             else -> Screen.List
         }
         joining = false
@@ -330,12 +350,13 @@ private fun Store(host: Host, nav: Nav) {
                 Screen.List -> Entries(host, nav, tick, go) { generator = true }
                 is Screen.Entry -> Entry(host, nav, s.name, tick, copy, go)
                 is Screen.Edit -> Edit(host, nav, s.name, go)
+                is Screen.History -> History(host, nav, s.name, copy, go)
                 Screen.Devices -> Devices(host, nav, tick, go)
                 Screen.Settings -> Settings(host, nav)
             }
         }
     }
-    if (generator) Generator(host, copy) { generator = false }
+    if (generator) Generator(host, nav, copy) { generator = false }
 }
 
 @Composable
@@ -388,14 +409,14 @@ private fun Entries(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
 
 /** One field of an entry: what it is, its value, its copy. */
 @Composable
-private fun Shown(label: String, value: String, mono: Boolean = false, more: @Composable () -> Unit = {}, copy: (() -> Unit)? = null) =
+private fun Shown(label: String, value: String, mono: Boolean = false, act: String = "Copy", more: @Composable () -> Unit = {}, copy: (() -> Unit)? = null) =
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Column(Modifier.weight(1f)) {
             Label(label)
             Text(value, style = MaterialTheme.typography.bodyLarge, fontFamily = if (mono) FontFamily.Monospace else null)
         }
         more()
-        if (copy != null) TextButton(copy) { Text("Copy") }
+        if (copy != null) TextButton(copy) { Text(act) }
     }
 
 @Composable
@@ -418,13 +439,22 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
         ) { copy("Code", code) }
         if (f.url.isNotEmpty()) Shown("URL", f.url) { copy("URL", f.url) }
         if (f.notes.isNotEmpty()) Shown("Notes", f.notes)
-        Spacer(Modifier.height(8.dp))
+        val files by produceState(listOf<String>(), name, tick) { value = runCatching { host.files(name) }.getOrDefault(listOf()) }
+        for (file in files) Shown(
+            "File", file, act = "Save",
+            more = { TextButton({ go { host.put("$name/.files/$file", ""); "$file: removed" } }) { Text("Remove") } },
+        ) { host.save(name, file) { m -> go { m } } }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton({ host.attach(name) { m -> go { m } } }) { Text("Attach a file") }
+            OutlinedButton({ nav.screen = Screen.History(name) }) { Text("History") }
+        }
         TextButton({ sure = true }) { Text("Delete this entry", color = MaterialTheme.colorScheme.error) }
     }
     if (sure) AlertDialog(
         { sure = false }, title = { Text("Delete $name?") },
         text = { Text("Its earlier versions stay in the store's history.") },
-        confirmButton = { TextButton({ sure = false; go { host.put(name, ""); nav.screen = Screen.List; "$name: deleted" } }) { Text("Delete", color = MaterialTheme.colorScheme.error) } },
+        confirmButton = { TextButton({ sure = false; go { host.remove(name); nav.screen = Screen.List; "$name: deleted" } }) { Text("Delete", color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton({ sure = false }) { Text("Cancel") } },
     )
 }
@@ -432,7 +462,7 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
 @Composable
 private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -> Unit) {
     var name by remember { mutableStateOf(old) }
-    var f by remember { mutableStateOf(if (old.isEmpty()) Form(pass = host.generate(24, true)) else Form()) }
+    var f by remember { mutableStateOf(if (old.isEmpty()) Form(pass = host.generate(nav.gen)) else Form()) }
     var show by remember { mutableStateOf(old.isEmpty()) }
     LaunchedEffect(old) { if (old.isNotEmpty()) f = host.form(host.get(old)) }
     Page(if (old.isEmpty()) "New entry" else "Edit entry", nav) {
@@ -441,15 +471,15 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
         Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = !show) {
             TextButton({ show = !show }) { Text(if (show) "Hide" else "Show") }
         }
-        OutlinedButton({ f = f.copy(pass = host.generate(24, true)); show = true }) { Text("Generate a password") }
+        OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show = true }) { Text("Generate a password") }
         Field(f.url, { f = f.copy(url = it) }, "URL")
         Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address")
         Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3)
         Primary("Save", enabled = name.isNotBlank() && !name.endsWith("/")) {
             val (to, text) = name.trim() to host.text(f)
             go {
+                if (old.isNotEmpty() && old != to) host.rename(old, to)
                 host.put(to, text)
-                if (old.isNotEmpty() && old != to) host.put(old, "")
                 nav.screen = Screen.Entry(to)
                 "$to: saved"
             }
@@ -457,12 +487,24 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     }
 }
 
+/** One of two ways, the chosen one filled. */
 @Composable
-private fun Generator(host: Host, copy: (String, String) -> Unit, close: () -> Unit) {
-    var len by remember { mutableIntStateOf(24) }
-    var symbols by remember { mutableStateOf(true) }
+private fun Way(text: String, on: Boolean, pick: () -> Unit) =
+    if (on) Button(pick, shape = RoundedCornerShape(10.dp)) { Text(text) }
+    else OutlinedButton(pick, shape = RoundedCornerShape(10.dp)) { Text(text) }
+
+@Composable
+private fun Tick(text: String, on: Boolean, set: (Boolean) -> Unit) =
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { set(!on) }) {
+        Checkbox(on, set)
+        Text(text)
+    }
+
+@Composable
+private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, close: () -> Unit) {
+    val g = nav.gen
     var n by remember { mutableIntStateOf(0) }
-    val pw = remember(len, symbols, n) { host.generate(len, symbols) }
+    val pw = remember(g, n) { host.generate(g) }
     AlertDialog(
         close, title = { Text("Password generator") },
         text = {
@@ -471,12 +513,23 @@ private fun Generator(host: Host, copy: (String, String) -> Unit, close: () -> U
                     pw, Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background, RoundedCornerShape(10.dp)).padding(12.dp),
                     fontFamily = mono,
                 )
-                Label("$len characters")
-                Slider(len.toFloat(), { len = it.toInt() }, valueRange = 8f..64f)
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.clickable { symbols = !symbols }) {
-                    Checkbox(symbols, { symbols = it })
-                    Text("Symbols")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Way("Characters", !g.words) { nav.gen = g.copy(words = false) }
+                    Way("Speakable", g.words) { nav.gen = g.copy(words = true) }
                 }
+                if (g.words) {
+                    Label("${g.count} words  \u00B7  ${g.bits} bits")
+                    Slider(g.count.toFloat(), { nav.gen = g.copy(count = it.toInt()) }, valueRange = 3f..8f, steps = 4)
+                    Row {
+                        Tick("with-dashes", g.hyphens) { nav.gen = g.copy(hyphens = it) }
+                        Tick("1337", g.leet) { nav.gen = g.copy(leet = it) }
+                    }
+                } else {
+                    Label("${g.len} characters  \u00B7  ${g.bits} bits")
+                    Slider(g.len.toFloat(), { nav.gen = g.copy(len = it.toInt()) }, valueRange = 8f..64f)
+                    Tick("Symbols", g.symbols) { nav.gen = g.copy(symbols = it) }
+                }
+                Text("New entries start with a password made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
             }
         },
         confirmButton = { TextButton({ copy("Generated password", pw) }) { Text("Copy") } },
@@ -487,6 +540,28 @@ private fun Generator(host: Host, copy: (String, String) -> Unit, close: () -> U
             }
         },
     )
+}
+
+/** What an entry was, version by version, and a way back. */
+@Composable
+private fun History(host: Host, nav: Nav, name: String, copy: (String, String) -> Unit, go: (suspend () -> String) -> Unit) {
+    val all by produceState(listOf<Pair<Long, String>>(), name) { value = runCatching { host.history(name) }.getOrDefault(listOf()) }
+    val date = remember { java.text.SimpleDateFormat("yyyy-MM-dd  HH:mm") }
+    Page("History", nav) {
+        Text(name, color = muted)
+        all.forEachIndexed { i, (ms, body) ->
+            val f = host.form(body)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(date.format(java.util.Date(ms)), style = MaterialTheme.typography.bodyLarge)
+                    Label(if (body.isEmpty()) "deleted" else if (i == 0) "now" else f.user)
+                }
+                if (body.isNotEmpty()) TextButton({ copy("That version's password", f.pass) }) { Text("Copy") }
+                if (body.isNotEmpty() && i > 0) TextButton({ go { host.put(name, body); nav.screen = Screen.Entry(name); "$name: restored" } }) { Text("Restore") }
+            }
+        }
+        Text("Nothing is ever overwritten: each change is a new version.", style = MaterialTheme.typography.bodySmall, color = muted)
+    }
 }
 
 @Composable

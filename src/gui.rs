@@ -149,6 +149,7 @@ enum Win {
     #[default]
     None,
     Generator,
+    History,
     Devices,
     Settings,
 }
@@ -162,17 +163,39 @@ struct Edit {
 }
 
 struct Generator {
+    /// Speakable words, else characters.
+    words: bool,
     len: usize,
     symbols: bool,
+    count: usize,
+    hyphens: bool,
+    leet: bool,
     pw: Zeroizing<String>,
 }
 
 impl Default for Generator {
     fn default() -> Generator {
-        Generator {
-            len: 24,
-            symbols: true,
-            pw: Zeroizing::new(pasa::generate(24, true)),
+        let pw = Zeroizing::new(pasa::generate(24, true));
+        let (len, count) = (24, 4);
+        let (words, symbols, hyphens, leet) = (false, true, false, false);
+        Generator { words, len, symbols, count, hyphens, leet, pw }
+    }
+}
+
+impl Generator {
+    fn make(&self) -> String {
+        match self.words {
+            true => pasa::speakable(self.count, self.hyphens, self.leet),
+            false => pasa::generate(self.len, self.symbols),
+        }
+    }
+
+    /// The bits of chance in what [`Generator::make`] gives.
+    fn bits(&self) -> u32 {
+        let abc: f64 = if self.symbols { 80.0 } else { 62.0 };
+        match self.words {
+            true => 22 * self.count as u32,
+            false => (self.len as f64 * abc.log2()) as u32,
         }
     }
 }
@@ -247,6 +270,21 @@ fn field(
         .password(secret)
         .desired_width(f32::INFINITY);
     ui.add(t.margin(Margin::symmetric(8, 6)))
+}
+
+/// `body` as `file` in the downloads folder, under a name not yet there.
+fn saved(file: &str, body: &[u8]) -> Result<String> {
+    let dir =
+        std::env::var_os("XDG_DOWNLOAD_DIR").map(std::path::PathBuf::from);
+    let home = || std::env::home_dir().unwrap_or_default().join("Downloads");
+    let dir = dir.unwrap_or_else(home);
+    let free = |i: &u32| {
+        let name = if *i == 0 { file.into() } else { format!("{i}-{file}") };
+        Some(dir.join(name)).filter(|p| !p.exists())
+    };
+    let to = (0..1000).find_map(|i| free(&i)).context("no free name")?;
+    pasa::write(&to, body)?;
+    Ok(format!("{file}: saved as {}", to.display()))
 }
 
 /// A dialog's frame: the window's, with room around what it holds.
@@ -743,6 +781,18 @@ impl App {
         if v.at != was {
             (self.shown, self.armed) = (false, false);
         }
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for (path, name) in
+            dropped.iter().map(|f| f.path()).zip(chosen.iter().cycle())
+        {
+            v.change(|s| {
+                let file = path.file_name().context("not a file")?;
+                let file = file.to_string_lossy();
+                let body = Zeroizing::new(std::fs::read(path)?);
+                s.put(&format!("{name}{}{file}", pasa::FILES), &body)?;
+                Ok(format!("{file}: kept with {name}"))
+            });
+        }
         self.form(&ctx, &mut v);
         self.windows(&ctx, &mut v);
         match lock {
@@ -754,10 +804,7 @@ impl App {
     fn new_entry(&mut self) {
         let name =
             self.group.as_ref().map(|g| format!("{g}/")).unwrap_or_default();
-        let f = Form {
-            pass: pasa::generate(self.generator.len, self.generator.symbols),
-            ..Form::default()
-        };
+        let f = Form { pass: self.generator.make(), ..Form::default() };
         self.edit = Some(Edit { old: String::new(), name, f, show: false });
     }
 
@@ -789,9 +836,15 @@ impl App {
                 let del = if self.armed { "Really delete" } else { "Delete" };
                 if ui.button(RichText::new(del).color(l.bad)).clicked() {
                     if self.armed {
-                        v.put(name, b"");
+                        v.change(|s| {
+                            s.remove(name)?;
+                            Ok(format!("{name}: deleted; its history stays"))
+                        });
                     }
                     self.armed ^= true;
+                }
+                if ui.button("History").clicked() {
+                    self.win = Win::History;
                 }
                 if ui.button("Edit").clicked() {
                     self.edit_entry(v);
@@ -866,9 +919,76 @@ impl App {
                         ui.label(&f.notes);
                         ui.end_row();
                     }
+                    for file in v.s.files(name).unwrap_or_default() {
+                        let at = format!("{name}{}{file}", pasa::FILES);
+                        label(ui, "File");
+                        ui.label(&file);
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Save").clicked() {
+                                v.change(|s| saved(&file, &s.get(&at)?));
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                v.change(|s| {
+                                    s.put(&at, b"")?;
+                                    Ok(format!("{file}: removed"))
+                                });
+                            }
+                        });
+                        ui.end_row();
+                    }
+                },
+            );
+            let hint = "Drop a file on the window to keep it with this entry.";
+            ui.label(RichText::new(hint).small().color(l.muted));
+        });
+    }
+
+    /// The chosen entry's versions: what it was, and a way back.
+    fn history(&mut self, ui: &mut Ui, v: &mut View) {
+        let l = look(ui);
+        let name = v.name().unwrap_or_default().to_string();
+        ui.heading("History");
+        ui.label(RichText::new(&name).color(l.muted));
+        let all = v.s.history(&name).unwrap_or_default();
+        ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            Grid::new("history").num_columns(3).spacing([14.0, 8.0]).show(
+                ui,
+                |ui| {
+                    for (i, (ms, body)) in all.iter().enumerate() {
+                        let at = UNIX_EPOCH + Duration::from_millis(*ms);
+                        let at = humantime::format_rfc3339_seconds(at);
+                        let at = at.to_string().replace('T', "  ");
+                        let f = Form::parse(&String::from_utf8_lossy(body));
+                        ui.label(at.trim_end_matches('Z'));
+                        let what = match (i, body.is_empty()) {
+                            (0, false) => "now".into(),
+                            (_, true) => "deleted".into(),
+                            _ => f.user.clone(),
+                        };
+                        ui.label(RichText::new(what).color(l.muted));
+                        ui.horizontal(|ui| {
+                            if body.is_empty() {
+                                return;
+                            }
+                            if ui.small_button("Copy password").clicked() {
+                                v.note = match crate::clip(&f.pass) {
+                                    Ok(()) => "That version's password \
+                                               copied, cleared in 45 s"
+                                        .into(),
+                                    Err(e) => format!("{e:#}"),
+                                };
+                            }
+                            if i > 0 && ui.small_button("Restore").clicked() {
+                                v.put(&name, body);
+                            }
+                        });
+                        ui.end_row();
+                    }
                 },
             );
         });
+        let note = "Nothing is ever overwritten: each change is a new version.";
+        ui.label(RichText::new(note).small().color(l.muted));
     }
 
     /// The entry being made or changed.
@@ -897,10 +1017,7 @@ impl App {
                 ui.label(RichText::new("Password").small().color(l.muted));
                 ui.horizontal(|ui| {
                     if ui.button("Generate").clicked() {
-                        e.f.pass = pasa::generate(
-                            self.generator.len,
-                            self.generator.symbols,
-                        );
+                        e.f.pass = self.generator.make();
                     }
                     if ui.button(if e.show { "Hide" } else { "Show" }).clicked()
                     {
@@ -939,9 +1056,11 @@ impl App {
             });
         if save {
             let (name, old) = (e.name.trim().to_string(), e.old.clone());
-            v.put(&name, e.f.text().as_bytes());
             if !old.is_empty() && old != name {
-                v.put(&old, b"");
+                v.change(|s| s.rename(&old, &name).map(|_| String::new()));
+            }
+            if v.note.is_empty() || old.is_empty() || old == name {
+                v.put(&name, e.f.text().as_bytes());
             }
             v.filter.clear();
             v.load();
@@ -964,6 +1083,7 @@ impl App {
                 ui.set_width(420.0);
                 match self.win {
                     Win::Generator => self.generate(ui, v),
+                    Win::History => self.history(ui, v),
                     Win::Devices => self.devices(ui, v),
                     _ => self.settings(ui),
                 }
@@ -981,17 +1101,42 @@ impl App {
 
     fn generate(&mut self, ui: &mut Ui, v: &mut View) {
         let g = &mut self.generator;
+        let l = look(ui);
         ui.heading("Password generator");
-        let f =
-            Frame::new().fill(look(ui).bg).corner_radius(8).inner_margin(12);
+        let f = Frame::new().fill(l.bg).corner_radius(8).inner_margin(12);
         f.show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(&**g.pw).monospace().size(16.0));
         });
-        let mut again = ui
-            .add(Slider::new(&mut g.len, 8..=64).text("characters"))
-            .changed();
-        again |= ui.checkbox(&mut g.symbols, "Symbols").changed();
+        let mut again = false;
+        ui.horizontal(|ui| {
+            again |= ui
+                .selectable_value(&mut g.words, false, "Characters")
+                .clicked();
+            again |= ui
+                .selectable_value(&mut g.words, true, "Speakable words")
+                .clicked();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let bits = format!("{} bits", g.bits());
+                ui.label(RichText::new(bits).small().color(l.muted));
+            });
+        });
+        match g.words {
+            true => {
+                let n = Slider::new(&mut g.count, 3..=8).text("words");
+                again |= ui.add(n).changed();
+                ui.horizontal(|ui| {
+                    again |=
+                        ui.checkbox(&mut g.hyphens, "with-dashes").changed();
+                    again |= ui.checkbox(&mut g.leet, "1337").changed();
+                });
+            }
+            false => {
+                let n = Slider::new(&mut g.len, 8..=64).text("characters");
+                again |= ui.add(n).changed();
+                again |= ui.checkbox(&mut g.symbols, "Symbols").changed();
+            }
+        }
         ui.horizontal(|ui| {
             again |= ui.button("Another").clicked();
             if primary(ui, "Copy", false).clicked() {
@@ -1004,10 +1149,10 @@ impl App {
             }
         });
         if again {
-            g.pw = Zeroizing::new(pasa::generate(g.len, g.symbols));
+            g.pw = Zeroizing::new(g.make());
         }
-        let note = "New entries start with a password of this length.";
-        ui.label(RichText::new(note).small().color(look(ui).muted));
+        let note = "New entries start with a password made this way.";
+        ui.label(RichText::new(note).small().color(l.muted));
     }
 
     fn devices(&mut self, ui: &mut Ui, v: &mut View) {
