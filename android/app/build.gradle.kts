@@ -33,13 +33,28 @@ android {
 
 // libapasa.so from apasa-jni, cross-compiled by cargo-ndk (ANDROID_NDK_HOME,
 // rustup's Android targets) into jniLibs, which the app packs.
+//
+// -Ppasa.fast=true, to try a change and never for a release: phones' ABI
+// alone and no link-time optimisation, so a change to the Rust costs seconds
+// where the release's whole-program pass costs minutes.
+val fast = providers.gradleProperty("pasa.fast").isPresent
 val cargoBuild by tasks.registering(Exec::class) {
     workingDir = rootDir.parentFile
+    val abis = if (fast) listOf("arm64-v8a") else listOf("arm64-v8a", "x86_64")
     commandLine(
-        "cargo", "ndk", "-t", "arm64-v8a", "-t", "x86_64", "--platform", "26",
-        "-o", file("src/main/jniLibs").path,
-        "build", "--release", "--locked", "--package", "apasa-jni",
+        listOf("cargo", "ndk") + abis.flatMap { listOf("-t", it) } + listOf(
+            "--platform", "26", "-o", file("src/main/jniLibs").path,
+            "build", "--release", "--locked", "--package", "apasa-jni",
+        ),
     )
+    if (fast) {
+        environment("CARGO_PROFILE_RELEASE_LTO", "false")
+        environment("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")
+    }
+    // CI says so when a cache gave the library back for these very Rust
+    // sources: then there is nothing to build.
+    val cached = System.getenv("PASA_SO") == "cached"
+    onlyIf { !cached }
 }
 
 tasks.matching { it.name.matches(Regex("merge[A-Za-z]+JniLibFolders")) }.configureEach {

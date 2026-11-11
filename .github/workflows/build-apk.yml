@@ -121,9 +121,28 @@ jobs:
           grep -qx "version = \"${TAG#v}\"" Cargo.toml
           grep -q "versionName = \"${TAG#v}\"" android/app/build.gradle.kts
 
-      - name: Build debug APK and unsigned release APK
+      # Not for a release: the native library as an earlier run built it
+      # from these very Rust sources, so a change to the Kotlin alone
+      # compiles no Rust.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: so
+        if: env.TAG == ''
+        with:
+          path: android/app/src/main/jniLibs
+          key: so-${{ env.NDK_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**', 'apasa-jni/**', '.cargo/**', 'android/app/build.gradle.kts') }}
+
+      # A release: both APKs, both ABIs, optimised as a whole. Otherwise the
+      # debug APK alone, for phones, quickly (-Ppasa.fast).
+      - name: Build the APKs
         working-directory: android
-        run: ./gradlew --no-daemon assembleDebug assembleRelease
+        env:
+          PASA_SO: ${{ steps.so.outputs.cache-hit == 'true' && 'cached' || '' }}
+        run: |
+          if [ -n "$TAG" ]; then
+            ./gradlew --no-daemon assembleDebug assembleRelease
+          else
+            ./gradlew --no-daemon assembleDebug -Ppasa.fast=true
+          fi
 
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: env.MAIN == 'true' && steps.gradle.outputs.cache-hit != 'true'

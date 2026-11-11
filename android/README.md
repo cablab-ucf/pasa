@@ -25,4 +25,5 @@ rustup target add aarch64-linux-android x86_64-linux-android
 cargo install --locked cargo-ndk
 git submodule update --init
 cd android && ./gradlew assembleDebug   # ANDROID_HOME, ANDROID_NDK_HOME (NDK 30)
+./gradlew installDebug -Ppasa.fast=true # to try a change: seconds, not minutes
 ```
