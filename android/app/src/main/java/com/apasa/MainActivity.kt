@@ -78,6 +78,8 @@ class MainActivity : ComponentActivity(), Host {
         super.onStop()
         keySecret?.fill(0)
         keySecret = null
+        answer?.fill(0)
+        answer = null
         if (isChangingConfigurations || picking) return
         if (setting("lock") == 0) lock() else main.postDelayed(locker, setting("lock") * 1000L)
     }
@@ -129,6 +131,8 @@ class MainActivity : ComponentActivity(), Host {
         val c = fresh()
         val r = yubikey(this, c, enroll = true)
         io { Native.quickOn(h, pin.toByteArray(), c, r) }
+        // Kept, so that unlocking shows the number pad for a PIN of digits alone.
+        set("pinDigits", if (pin.isNotEmpty() && pin.all { it in '0'..'9' }) 1 else 0)
         readQuick()
     }
 
@@ -149,9 +153,33 @@ class MainActivity : ComponentActivity(), Host {
         readQuick()
     }
 
+    /** The key's answer to the quick challenge, from a tap made before the PIN was typed: gone when the app leaves the screen. */
+    private var answer: ByteArray? = null
+
+    override suspend fun tapKey(pin: String): Boolean {
+        val quick = Native.quick(dir)
+        val keys = fidoHere()
+        return when (val t = anyKey(this, quick?.copyOf(32), keys?.first, keys?.second.orEmpty(), pin)) {
+            is Tapped.Slot2 -> {
+                answer = t.answer
+                // No PIN was set: the tap is all of it.
+                (quick!![32].toInt() != 1).also { if (it) unlockQuick("") }
+            }
+            is Tapped.Ctap -> {
+                handle = io { Native.openFido(dir, t.cred, t.secret) }
+                t.secret.fill(0)
+                if (sync) io { runCatching { Native.sync(dir, false) } }
+                true
+            }
+        }
+    }
+
     override suspend fun unlockQuick(pin: String) {
-        val r = yubikey(this, Native.quick(dir)!!.copyOf(32))
+        val r = answer ?: yubikey(this, Native.quick(dir)!!.copyOf(32))
+        // A wrong PIN leaves the answer for the next try; the right one ends it.
         handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
+        r.fill(0)
+        answer = null
         if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
@@ -171,14 +199,6 @@ class MainActivity : ComponentActivity(), Host {
         io { Native.fidoAdd(handle, salt, cred, uv, secret) }
         secret.fill(0)
         readFido()
-    }
-
-    override suspend fun unlockFido(pin: String) {
-        val (salt, keys) = fidoHere() ?: throw Exception("No security key opens this store")
-        val (cred, secret) = fidoSecret(this, keys, salt, pin)
-        handle = io { Native.openFido(dir, cred, secret) }
-        secret.fill(0)
-        if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
     override fun fidoOff() {
