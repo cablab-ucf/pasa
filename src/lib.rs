@@ -968,8 +968,9 @@ impl Form {
             pass: l.next().unwrap_or_default().into(),
             ..Form::default()
         };
-        // `key: value`, the key short, whatever it is spelt with: a
-        // field of its own. (`https://...` has no space after its colon.)
+        // `key: value`, the key short, however it is spelt: what is in
+        // the store already is read with a free hand ([`Form::problem`]
+        // is strict with what is saved). `https://x` has no space there.
         let named = |l: &str| {
             l.split_once(':').is_some_and(|(k, v)| {
                 k.starts_with(char::is_alphanumeric)
@@ -978,18 +979,23 @@ impl Form {
             })
         };
         let (mut notes, mut more, mut within) = (vec![], vec![], false);
+        // After an empty line all is notes, as written: no line of
+        // theirs is ever taken for a field.
+        let mut head = true;
         for l in l {
             let key = |k: &str| {
                 Some(l.strip_prefix(k)?.strip_prefix(':')?.trim().to_string())
             };
             let was = std::mem::take(&mut within);
+            head &= !l.trim().is_empty();
             match (key("user"), key("url"), key("tags"), key("expires")) {
+                _ if !head => notes.push(l),
                 (Some(u), ..) if f.user.is_empty() => f.user = u,
                 (_, Some(u), ..) if f.url.is_empty() => f.url = u,
                 (_, _, Some(t), _) if f.tags.is_empty() => f.tags = t,
                 (.., Some(e)) if f.expires.is_empty() => f.expires = e,
                 _ if l.contains("otpauth://") && f.otp.is_empty() => {
-                    f.otp = l.trim().into()
+                    f.otp = l[l.find("otpauth://").unwrap_or(0)..].trim().into()
                 }
                 // A field, or the rest of one that runs over lines.
                 _ if named(l) || was && l.starts_with("  ") => {
@@ -1000,8 +1006,57 @@ impl Form {
             }
         }
         f.more = more.join("\n");
-        f.notes = notes.join("\n").trim_end().into();
+        f.notes = notes.join("\n").trim_matches('\n').trim_end().into();
         f
+    }
+
+    /// Why this may not be saved as it is, if so: every part must read
+    /// back as the part it was written as, and no other.
+    pub fn problem(&self) -> Option<String> {
+        let date = |d: &str| {
+            let digits =
+                d.split('-').all(|p| p.bytes().all(|b| b.is_ascii_digit()));
+            d.len() == 10 && digits && d.split('-').count() == 3
+        };
+        if !self.otp.trim().is_empty()
+            && !self.otp.trim().starts_with("otpauth://")
+        {
+            return Some(
+                "One-time code: its address starts with otpauth://".into(),
+            );
+        }
+        if !self.expires.trim().is_empty() && !date(self.expires.trim()) {
+            return Some("Expires: a date as 2027-01-31".into());
+        }
+        let mut within = false;
+        for (i, l) in self.more.lines().enumerate() {
+            let at = format!("Other fields, line {}", i + 1);
+            if std::mem::take(&mut within) && l.starts_with("  ")
+                || l.is_empty()
+            {
+                within = !l.is_empty();
+                continue;
+            }
+            let name = |k: &str| {
+                k.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            };
+            let Some((k, v)) = l.split_once(": ").filter(|(k, _)| name(k))
+            else {
+                return Some(format!(
+                    "{at}: write it as name: value, the name of letters, \
+                     digits and _, one space after the colon"
+                ));
+            };
+            if v.is_empty() || v.starts_with(' ') || l.contains("otpauth://") {
+                return Some(format!("{at}: one space, then the value"));
+            }
+            if ["user", "url", "tags", "expires", "otp"].contains(&k) {
+                return Some(format!("{at}: {k} has a box of its own"));
+            }
+            within = true;
+        }
+        None
     }
 
     /// Its fields under their names, in the order they are shown.
@@ -1033,19 +1088,14 @@ impl Form {
                 t += &format!("{k}{}\n", one(v.trim()));
             }
         }
-        // A field typed as `key:value`, or with a wide colon, is one all
-        // the same: written as [`Form::parse`] knows it.
-        for l in self.more.trim_end().lines().filter(|l| !l.trim().is_empty()) {
-            let l = l.replace('\u{ff1a}', ":");
-            t += &match l.split_once(':') {
-                Some((k, v)) if !l.starts_with("  ") => {
-                    format!("{}: {}\n", k.trim(), v.trim())
-                }
-                _ => format!("{l}\n"),
-            };
+        for l in self.more.lines().filter(|l| !l.is_empty()) {
+            t += &format!("{l}\n");
         }
-        if !self.notes.trim().is_empty() {
-            t += &format!("{}\n", self.notes.trim_end());
+        // An empty line, then the notes: read back as notes, whatever
+        // they say.
+        let notes = self.notes.trim_matches('\n').trim_end();
+        if !notes.is_empty() {
+            t += &format!("\n{notes}\n");
         }
         t
     }
@@ -1385,16 +1435,37 @@ mod tests {
         let bare = Form { pass: "a\nb".into(), ..Form::default() };
         assert_eq!(bare.text(), "a b\n");
         assert_eq!(Form::parse(""), Form::default());
-        // Fields as people type them stay fields, and notes stay notes.
-        let typed =
-            "Card #:1234\nacct.no : 5\n2nd e-mail\u{ff1a}a@b.c\nQ&A (old): x";
-        let f =
-            Form { more: typed.into(), notes: "see https://a.b".into(), ..f };
-        let back = Form::parse(&f.text());
-        let fields =
-            "Card #: 1234\nacct.no: 5\n2nd e-mail: a@b.c\nQ&A (old): x";
-        assert_eq!((&*back.more, &*back.notes), (fields, "see https://a.b"));
-        assert_eq!(Form::parse(&back.text()), back);
+        // What is saved reads back the same, part by part: notes are
+        // notes whatever they say, and a field no parser would know as
+        // one is refused, not moved.
+        let notes =
+            "user: eve\notpauth://totp/z?secret=AA\nkey: v\n\n  x\npin: 1";
+        let more = "card_no: 1234\nq2: a: b\n  more of it";
+        let f = Form { more: more.into(), notes: notes.into(), ..f };
+        assert_eq!(f.problem(), None);
+        assert_eq!(Form::parse(&f.text()), f);
+        let bare = Form { notes: "todo: x".into(), ..Form::default() };
+        assert_eq!(Form::parse(&bare.text()), bare);
+        for bad in [
+            "Card #: 1",
+            "acct.no: 5",
+            "key:value",
+            "key:  v",
+            "key:",
+            "no colon",
+            "2fa: x",
+            "user: eve",
+            "otp: x",
+            "a b: c",
+            "k: otpauth://totp/x",
+            "  orphan",
+        ] {
+            let f = Form { more: bad.into(), ..Form::default() };
+            assert!(f.problem().is_some(), "{bad}");
+        }
+        let odd = |f: Form| f.problem().is_some();
+        assert!(odd(Form { otp: "JBSWY3DP".into(), ..Form::default() }));
+        assert!(odd(Form { expires: "soon".into(), ..Form::default() }));
     }
 
     #[test]

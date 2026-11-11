@@ -163,8 +163,9 @@ class MainActivity : ComponentActivity(), Host {
         Form(at(0), at(1), at(2), at(3), at(7), at(4), at(5), at(6))
     }
 
-    override fun text(f: Form) =
-        Native.text(listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f"))
+    private fun joined(f: Form) = listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f")
+    override fun text(f: Form) = Native.text(joined(f))
+    override fun problem(f: Form) = Native.problem(joined(f))
     override fun strength(pw: String) = Native.strength(pw)
 
     override suspend fun times(name: String) = io {

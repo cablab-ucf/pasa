@@ -56,7 +56,12 @@ suspend fun yubikey(a: Activity, challenge: ByteArray): ByteArray {
         }
         val answer = { d: YubiKeyDevice ->
             YubiOtpSession.create(d) { session ->
-                val r = runCatching { session.value.calculateHmacSha1(Slot.TWO, challenge, null) }
+                val r = runCatching {
+                    val s = session.value
+                    // Asked first where the key can say: an empty slot answers with nothing, which reads as nonsense.
+                    if (runCatching { !s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(false)) throw Empty()
+                    s.calculateHmacSha1(Slot.TWO, challenge, null)
+                }
                 if (d is NfcYubiKeyDevice) d.remove { stop() } else stop()
                 if (k.isActive) r.onSuccess { k.resume(it) }.onFailure { k.resumeWithException(Exception(said(it))) }
             }
@@ -72,10 +77,16 @@ suspend fun yubikey(a: Activity, challenge: ByteArray): ByteArray {
     }
 }
 
+private class Empty : Exception()
+
 /** What went wrong with the key, for someone holding it. */
 private fun said(e: Throwable) = when {
     e is android.nfc.TagLostException || e.message?.contains("Tag was lost") == true ->
         "The key moved away too soon: hold it still against the phone until this is done."
     e is java.io.IOException -> "The key did not answer: hold it still against the phone, or plug it in. (${e.message})"
+    e is Empty ->
+        "Slot 2 of this YubiKey is empty. Set it to HMAC-SHA1 challenge-response first (Yubico Authenticator, or: ykman otp chalresp --generate 2), then try again."
+    e is com.yubico.yubikit.core.application.BadResponseException ->
+        "Slot 2 of this YubiKey holds something other than an HMAC-SHA1 challenge-response secret (a Yubico OTP or a static password?): its answer was not 20 bytes. (${e.message})"
     else -> "The key refused: is its slot 2 set to HMAC-SHA1 challenge-response? (${e.message})"
 }

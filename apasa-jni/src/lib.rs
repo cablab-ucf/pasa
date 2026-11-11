@@ -468,29 +468,41 @@ pub extern "system" fn Java_com_apasa_Native_form<'l>(
     })
 }
 
-/// The entry's text of a form as [`Java_com_apasa_Native_form`] gives it.
+/// A form as [`Java_com_apasa_Native_form`] gives it.
+fn form(form: &JString) -> pasa::Form {
+    let s = form.to_string();
+    let mut p = s.splitn(8, '\u{1f}').map(String::from);
+    let mut next = || p.next().unwrap_or_default();
+    pasa::Form {
+        pass: next(),
+        user: next(),
+        url: next(),
+        otp: next(),
+        tags: next(),
+        expires: next(),
+        more: next(),
+        notes: next(),
+    }
+}
+
+/// The entry's text of a form.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_text<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
-    form: JString<'l>,
+    f: JString<'l>,
 ) -> JString<'l> {
-    run(&mut env, |e| {
-        let s = form.to_string();
-        let mut p = s.splitn(8, '\u{1f}').map(String::from);
-        let mut next = || p.next().unwrap_or_default();
-        let f = pasa::Form {
-            pass: next(),
-            user: next(),
-            url: next(),
-            otp: next(),
-            tags: next(),
-            expires: next(),
-            more: next(),
-            notes: next(),
-        };
-        Ok(e.new_string(f.text())?)
-    })
+    run(&mut env, |e| Ok(e.new_string(form(&f).text())?))
+}
+
+/// Why a form may not be saved as it is ([`pasa::Form::problem`]), or "".
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_problem<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    f: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| Ok(e.new_string(form(&f).problem().unwrap_or_default())?))
 }
 
 /// The paired devices' names, one a line.
