@@ -6,6 +6,10 @@ object Native {
 
     external fun challenge(dir: String): ByteArray?
     external fun open(dir: String, pw: ByteArray, chal: ByteArray?, resp: ByteArray?, create: Boolean): Long
+    external fun quick(dir: String): ByteArray?
+    external fun openQuick(dir: String, pin: ByteArray, resp: ByteArray): Long
+    external fun quickOn(h: Long, pin: ByteArray, chal: ByteArray, resp: ByteArray)
+    external fun quickOff(dir: String)
     external fun close(h: Long)
     external fun names(h: Long): String
     external fun get(h: Long, name: String): String

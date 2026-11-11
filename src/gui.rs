@@ -144,6 +144,10 @@ type Breached = Vec<(String, u64)>;
 enum Job {
     Create,
     Unlock,
+    /// By the YubiKey and the PIN.
+    Quick,
+    /// Quick unlock on for the open store, or off.
+    SetQuick(bool),
     Join,
 }
 
@@ -222,6 +226,12 @@ struct App {
     pw: Zeroizing<String>,
     pw2: Zeroizing<String>,
     yk: bool,
+    /// The key opens the store quickly, beside the password; else it is
+    /// needed with the password, every time.
+    quick: bool,
+    pin: Zeroizing<String>,
+    /// At the unlock: the password, though quick unlock is on.
+    by_password: bool,
     joining: bool,
     peer: String,
     code: String,
@@ -260,7 +270,7 @@ pub fn run() -> Result<()> {
     let o = eframe::NativeOptions { viewport: view, ..Default::default() };
     let app = |c: &eframe::CreationContext<'_>| {
         style(&c.egui_ctx);
-        let a = App { peer: "home".into(), ..App::default() };
+        let a = App { peer: "home".into(), quick: true, ..App::default() };
         c.egui_ctx.set_theme(a.prefs.theme);
         Ok(Box::new(a) as Box<dyn eframe::App>)
     };
@@ -348,20 +358,28 @@ fn primary(ui: &mut Ui, text: &str, wide: bool) -> Response {
 fn card(ui: &mut Ui, about: &str, title: &str, body: impl FnOnce(&mut Ui)) {
     let l = look(ui);
     CentralPanel::default().show(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.14).max(20.0));
-            ui.label(RichText::new("pasa").size(36.0).strong().color(l.accent));
-            ui.label(RichText::new(about).color(l.muted));
-            ui.add_space(16.0);
-            let f = Frame::new().fill(l.card).stroke(Stroke::new(1.0, l.line));
-            f.corner_radius(12).inner_margin(22).show(ui, |ui| {
-                ui.set_width(360.0);
-                ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                    ui.label(RichText::new(title).size(18.0).strong());
-                    ui.add_space(4.0);
-                    body(ui);
+        let top = (ui.available_height() * 0.14).max(20.0);
+        let scroll = ScrollArea::vertical().auto_shrink(false);
+        scroll.show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(top);
+                ui.label(
+                    RichText::new("pasa").size(36.0).strong().color(l.accent),
+                );
+                ui.label(RichText::new(about).color(l.muted));
+                ui.add_space(16.0);
+                let f =
+                    Frame::new().fill(l.card).stroke(Stroke::new(1.0, l.line));
+                f.corner_radius(12).inner_margin(22).show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.label(RichText::new(title).size(18.0).strong());
+                        ui.add_space(4.0);
+                        body(ui);
+                    });
                 });
-            });
+                ui.add_space(40.0);
+            })
         });
     });
 }
@@ -416,6 +434,7 @@ impl App {
         *self = App {
             prefs: self.prefs.clone(),
             peer: "home".into(),
+            quick: true,
             ..App::default()
         };
     }
@@ -436,13 +455,27 @@ impl App {
         match job {
             Job::Create => {
                 let c = pasa::rand::<32>();
-                let r = self.yk.then(|| crate::yubikey(&c)).transpose()?;
+                let both = self.yk && !self.quick;
+                let r = both.then(|| crate::yubikey(&c)).transpose()?;
                 let yk = r.as_ref().map(|r| (&c[..], &r[..]));
-                self.v = Some(View::new(Store::create(
-                    &home(),
-                    self.pw.as_bytes(),
-                    yk,
-                )?));
+                let s = Store::create(&home(), self.pw.as_bytes(), yk)?;
+                if self.yk && self.quick {
+                    crate::quick_on(&s, self.pin.as_bytes())?;
+                }
+                self.v = Some(View::new(s));
+            }
+            Job::Quick => {
+                let (c, _) =
+                    pasa::quick(&home()).context("quick unlock is off")?;
+                let s = crate::unlock_quick(&c, self.pin.as_bytes())?;
+                self.v = Some(View::new(s));
+            }
+            Job::SetQuick(on) => {
+                let v = self.v.as_ref().context("locked")?;
+                match on {
+                    true => crate::quick_on(&v.s, self.pin.as_bytes())?,
+                    false => std::fs::remove_file(home().join("quick"))?,
+                }
             }
             Job::Unlock => {
                 let mut s = crate::unlock(self.pw.as_bytes())?;
@@ -467,6 +500,7 @@ impl App {
             }
         }
         (self.pw, self.pw2, self.pair_pw) = Default::default();
+        self.pin = Default::default();
         Ok(())
     }
 
@@ -485,13 +519,32 @@ impl App {
             if ui.memory(|m| m.focused().is_none()) {
                 first.request_focus();
             }
-            meter(ui, pasa::strength(&self.pw));
+            if !self.pw.is_empty() {
+                meter(ui, pasa::strength(&self.pw));
+            }
             let again = field(ui, "Password, again", &mut self.pw2, true);
             ui.add_space(4.0);
-            ui.checkbox(&mut self.yk, "Require a hardware key (YubiKey)");
-            let why = "Its answer (HMAC-SHA1, slot 2) joins the password in the lock: \
-                       the store then opens only with both.";
-            ui.label(RichText::new(why).small().color(l.muted));
+            ui.checkbox(&mut self.yk, "Use a hardware key (YubiKey)");
+            if self.yk {
+                let small = |ui: &mut Ui, t: &str| {
+                    ui.label(RichText::new(t).small().color(l.muted));
+                };
+                ui.radio_value(&mut self.quick, true, "To unlock quickly");
+                small(
+                    ui,
+                    "A tap and a PIN open the store. The password still \
+                           opens it alone if the key is lost: make it long.",
+                );
+                if self.quick {
+                    let pin =
+                        TextEdit::singleline(&mut *self.pin).password(true);
+                    ui.add(
+                        pin.hint_text("PIN (empty: none)").desired_width(160.0),
+                    );
+                }
+                ui.radio_value(&mut self.quick, false, "As a second factor");
+                small(ui, "Needed together with the password, every time.");
+            }
             ui.add_space(6.0);
             let ok = !self.pw.is_empty() && *self.pw == *self.pw2;
             let go = ui
@@ -546,6 +599,14 @@ impl App {
         } else {
             "Unlock"
         };
+        let quick = pasa::quick(&home()).filter(|_| !self.by_password);
+        if let Some((_, pin)) = quick {
+            return self.unlock_quick(ui, pin);
+        }
+        let back = pasa::quick(&home()).is_some();
+        if back && corner(ui, "Quick unlock is on.", "Use the YubiKey") {
+            (self.by_password, self.said) = (false, String::new());
+        }
         card(ui, "A small password store", title, |ui| {
             let pw = field(ui, "Password", &mut self.pw, true);
             let enter = entered(ui, &pw);
@@ -567,6 +628,28 @@ impl App {
             }
             self.said(ui);
         });
+    }
+
+    /// A tap, and the PIN if one is set; the password is the other way in.
+    fn unlock_quick(&mut self, ui: &mut Ui, pin: bool) {
+        card(ui, "A small password store", "Unlock", |ui| {
+            let mut enter = false;
+            if pin {
+                let p = field(ui, "PIN", &mut self.pin, true);
+                enter = entered(ui, &p);
+                if ui.memory(|m| m.focused().is_none()) {
+                    p.request_focus();
+                }
+            }
+            ui.add_space(6.0);
+            if primary(ui, "Unlock with the YubiKey", true).clicked() || enter {
+                self.begin(ui, Job::Quick, "Touch your YubiKey");
+            }
+            self.said(ui);
+        });
+        if corner(ui, "No key at hand?", "Use the password") {
+            (self.by_password, self.said) = (true, String::new());
+        }
     }
 
     /// The entry's user name, address and tags, read once per version.
@@ -1492,6 +1575,38 @@ impl App {
                 ui.end_row();
             },
         );
+        ui.separator();
+        ui.label(RichText::new("Quick unlock").strong());
+        let how = "A tap of your YubiKey and a PIN open the store on this \
+                   machine. The password still opens it alone: keep it long.";
+        ui.label(RichText::new(how).small().color(l.muted));
+        match pasa::quick(&home()) {
+            Some((_, pin)) => {
+                ui.horizontal(|ui| {
+                    ui.label(if pin { "On, with a PIN" } else { "On, no PIN" });
+                    if ui.button("Turn off").clicked() {
+                        self.begin(ui, Job::SetQuick(false), "");
+                    }
+                });
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    let pin =
+                        TextEdit::singleline(&mut *self.pin).password(true);
+                    ui.add(
+                        pin.hint_text("PIN (empty: none)").desired_width(160.0),
+                    );
+                    if ui.button("Turn on").clicked() {
+                        self.begin(
+                            ui,
+                            Job::SetQuick(true),
+                            "Touch your YubiKey",
+                        );
+                    }
+                });
+            }
+        }
+        self.said(ui);
         ui.separator();
         let about = format!(
             "pasa {}  ·  GPL-3.0-or-later\nStore: {}\nCopied secrets leave the clipboard after 45 s.",

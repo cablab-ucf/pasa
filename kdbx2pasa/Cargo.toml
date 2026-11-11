@@ -11,3 +11,8 @@ keepass = { version = "0.17", features = ["serialization"] }
 serde_json = "1"
 rpassword = "7"
 tar = { version = "0.4", default-features = false }
+uuid = "1"
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false }
+keepass = { version = "0.17", features = ["save_kdbx4"] }

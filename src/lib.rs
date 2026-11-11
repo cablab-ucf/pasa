@@ -275,10 +275,49 @@ impl Store {
     /// Open with the password and, if `key` asks, the YubiKey's response.
     pub fn open(dir: &Path, pw: &[u8], yk: Option<&[u8]>) -> Result<Store> {
         let f = fs::read(dir.join("key")).context("no store: pasa init")?;
+        let salt = f.get(..32).context("not a pasa key file")?;
+        Store::unsealed(dir, kek(pw, salt, yk)?)
+            .context("wrong password or key")
+    }
+
+    /// Open by a YubiKey's answer and the PIN, if [`quick_on`] set them:
+    /// they open the key the password opens.
+    ///
+    /// [`quick_on`]: Store::quick_on
+    pub fn open_quick(dir: &Path, pin: &[u8], yk: &[u8]) -> Result<Store> {
+        let f = fs::read(dir.join("quick")).context("quick unlock is off")?;
+        let (head, sealed) =
+            f.split_at_checked(33).context("not a quick file")?;
+        let k = kek(pin, &head[..32], Some(yk))?;
+        let kek = open(&k, sealed).context("wrong PIN or key")?;
+        Store::unsealed(dir, kek)
+            .context("quick unlock is out of date: use the password")
+    }
+
+    /// Let this device open the store by a YubiKey's answer to `challenge`
+    /// and a PIN (empty: none), beside the password: `quick` holds the key
+    /// the password opens, sealed to them. With the device's storage and
+    /// the YubiKey a PIN is guessed in days, so the password, which opens
+    /// the store alone, must be long.
+    pub fn quick_on(
+        &self,
+        pin: &[u8],
+        challenge: &[u8],
+        yk: &[u8],
+    ) -> Result<()> {
+        ensure!(challenge.len() == 32, "a challenge is 32 bytes");
+        let k = kek(pin, challenge, Some(yk))?;
+        let head = [challenge, &[!pin.is_empty() as u8]].concat();
+        let quick = [&head[..], &seal(&k, &self.kek)?].concat();
+        write(&self.dir.join("quick"), &quick)
+    }
+
+    /// With the key the password gives.
+    fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
+        let f = fs::read(dir.join("key")).context("no store: pasa init")?;
         let (salt, sealed) =
             f.split_at_checked(33).context("not a pasa key file")?;
-        let kek = kek(pw, &salt[..32], yk)?;
-        let keys = open(&kek, sealed).context("wrong password or key")?;
+        let keys = open(&kek, sealed).context("the key does not open it")?;
         ensure!(
             !keys.is_empty() && keys.len() % 32 == 0,
             "not a pasa key file"
@@ -298,7 +337,10 @@ impl Store {
         let salt = yk.map_or(rand::<32>().to_vec(), |c| c.0.to_vec());
         self.salt = [&salt[..], &[yk.is_some() as u8]].concat();
         self.kek = kek(pw, &salt, yk.map(|c| c.1))?;
-        self.save()
+        self.save()?;
+        // What quick unlock held opens the old lock only.
+        let _ = fs::remove_file(self.dir.join("quick"));
+        Ok(())
     }
 
     /// Write `key` and `dev` under a lock, unless `key` changed since we
@@ -536,15 +578,53 @@ impl Store {
     /// A new version of `name` (empty: deleted): after every version seen,
     /// following the newest of `name`.
     pub fn put(&self, name: &str, body: &[u8]) -> Result<()> {
+        let mut x = self.index()?;
+        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
+        let ms = now.max(x.last + 1);
+        self.keep(&mut x, name, body, ms, parent)
+    }
+
+    /// A version of `name` as it was at `at` (milliseconds): an import's.
+    /// It takes its place among the others by time and follows the one
+    /// before it; dated in the newest one's second, it follows that one.
+    /// The same text in the same second is not kept twice.
+    pub fn put_at(&self, name: &str, body: &[u8], at: u64) -> Result<()> {
+        let mut x = self.index()?;
+        let named = |v: &&Version| v.name == name;
+        let mut of: Vec<Version> =
+            x.heads.values().filter(named).cloned().collect();
+        of.sort_by(|a, b| (a.ms, &a.file).cmp(&(b.ms, &b.file)));
+        for v in &of {
+            if v.ms / 1000 == at / 1000
+                && v.size == body.len()
+                && *self.body(v)? == *body
+            {
+                return Ok(());
+            }
+        }
+        let ms = match of.last() {
+            Some(tip) if tip.ms / 1000 == at / 1000 => tip.ms + 1,
+            _ => at,
+        };
+        let before = of.iter().rfind(|v| v.ms < ms);
+        let parent = before.map_or("-".into(), |v| v.file.clone());
+        self.keep(&mut x, name, body, ms, parent)
+    }
+
+    fn keep(
+        &self,
+        x: &mut Index,
+        name: &str,
+        body: &[u8],
+        ms: u64,
+        parent: String,
+    ) -> Result<()> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
         ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
-        let mut x = self.index()?;
-        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
-        let last = x.last;
-        let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
         let mut v = Version {
-            ms: now.max(last + 1),
+            ms,
             size: body.len(),
             name: name.into(),
             parent,
@@ -563,6 +643,13 @@ impl Store {
         x.heads.insert(v.file.clone(), v);
         Ok(())
     }
+}
+
+/// Quick unlock on this device, if it is on: the YubiKey's challenge, and
+/// whether a PIN goes with its answer.
+pub fn quick(dir: &Path) -> Option<(Vec<u8>, bool)> {
+    let f = fs::read(dir.join("quick")).ok()?;
+    Some((f.get(..32)?.to_vec(), *f.get(32)? == 1))
 }
 
 pub fn generate(len: usize, symbols: bool) -> String {
@@ -955,6 +1042,57 @@ mod tests {
         assert_eq!(s.files("post").unwrap(), ["key.pem"]);
         s.remove("post").unwrap();
         assert!(s.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn quick_unlock_opens_what_the_password_opens() {
+        let d = dir("quick");
+        let mut s = Store::create(&d, b"a long master phrase", None).unwrap();
+        s.put("mail", b"pw\n").unwrap();
+        assert!(quick(&d).is_none());
+        let (c, r) = ([7; 32], [9; 20]);
+        s.quick_on(b"2468", &c, &r).unwrap();
+        assert_eq!(quick(&d), Some((c.to_vec(), true)));
+        let q = Store::open_quick(&d, b"2468", &r).unwrap();
+        assert_eq!(*q.get("mail").unwrap(), *b"pw\n");
+        assert!(Store::open_quick(&d, b"0000", &r).is_err());
+        assert!(Store::open_quick(&d, b"2468", &[1; 20]).is_err());
+        // The password still opens it alone; no PIN is a setting too.
+        Store::open(&d, b"a long master phrase", None).unwrap();
+        s.quick_on(b"", &c, &r).unwrap();
+        assert_eq!(quick(&d), Some((c.to_vec(), false)));
+        Store::open_quick(&d, b"", &r).unwrap();
+        // A new password ends it.
+        s.lock(b"another phrase", None).unwrap();
+        assert!(quick(&d).is_none());
+    }
+
+    #[test]
+    fn imports_keep_their_dates_and_order() {
+        let s = Store::create(&dir("dated"), b"pw", None).unwrap();
+        let day = 86_400_000;
+        // Out of order, twice, and two in one second.
+        for (at, body) in [
+            (3 * day, "c"),
+            (day, "a"),
+            (2 * day, "b"),
+            (day, "a"),
+            (3 * day, "d"),
+        ] {
+            s.put_at("mail", body.as_bytes(), at).unwrap();
+        }
+        let h = s.history("mail").unwrap();
+        let bodies: Vec<&[u8]> = h.iter().map(|v| &v.1[..]).collect();
+        assert_eq!(bodies, [&b"d"[..], b"c", b"b", b"a"]);
+        assert_eq!(h[3].0, day);
+        assert_eq!(*s.get("mail").unwrap(), *b"d");
+        // In order from the start: one line of versions, nothing flagged.
+        let t = Store::create(&dir("dated2"), b"pw", None).unwrap();
+        for (at, body) in [(day, "a"), (2 * day, "b"), (2 * day, "c")] {
+            t.put_at("mail", body.as_bytes(), at).unwrap();
+        }
+        assert!(t.conflicts().unwrap().is_empty());
+        assert_eq!(t.times("mail").unwrap().unwrap().0, day);
     }
 
     #[test]

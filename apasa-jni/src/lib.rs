@@ -103,17 +103,88 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
         let (dir, pw) = (dir.to_string(), bytes(e, &pw)?.unwrap_or_default());
         let (c, r) = (bytes(e, &chal)?, bytes(e, &resp)?);
         let dir = Path::new(&dir);
-        let mut st = match create {
+        let st = match create {
             true => Store::create(dir, &pw, c.as_deref().zip(r.as_deref()))?,
             false => Store::open(dir, &pw, r.as_deref())?,
         };
-        if let Some((name, hand)) = PENDING.lock().unwrap().take() {
-            sync::keep_hand(&mut st, &name, &hand)?;
-        }
-        sync::adopt(&mut st)?;
-        let h = jlong::from_be_bytes(pasa::rand());
-        STORES.lock().unwrap().insert(h, st);
-        Ok(h)
+        opened(st)
+    })
+}
+
+/// An opened store's handle: a joined pairing's hand-over key sealed into
+/// it, what peers handed over adopted.
+fn opened(mut st: Store) -> Result<jlong> {
+    if let Some((name, hand)) = PENDING.lock().unwrap().take() {
+        sync::keep_hand(&mut st, &name, &hand)?;
+    }
+    sync::adopt(&mut st)?;
+    let h = jlong::from_be_bytes(pasa::rand());
+    STORES.lock().unwrap().insert(h, st);
+    Ok(h)
+}
+
+/// Quick unlock, if it is on here: the YubiKey's challenge, then 1 if a
+/// PIN goes with its answer; else null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_quick<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JByteArray<'l> {
+    run(&mut env, |e| {
+        Ok(match pasa::quick(Path::new(&dir.to_string())) {
+            Some((c, pin)) => {
+                e.byte_array_from_slice(&[&c[..], &[pin as u8]].concat())?
+            }
+            None => JByteArray::default(),
+        })
+    })
+}
+
+/// Open by the YubiKey's answer and the PIN (empty: none).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_openQuick<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+    pin: JByteArray<'l>,
+    resp: JByteArray<'l>,
+) -> jlong {
+    run(&mut env, |e| {
+        let pin = zeroize::Zeroizing::new(bytes(e, &pin)?.unwrap_or_default());
+        let resp = bytes(e, &resp)?.unwrap_or_default();
+        opened(Store::open_quick(Path::new(&dir.to_string()), &pin, &resp)?)
+    })
+}
+
+/// Turn quick unlock on for an open store: a PIN (empty: none), and the
+/// YubiKey's answer to a fresh 32-byte challenge.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_quickOn<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    pin: JByteArray<'l>,
+    chal: JByteArray<'l>,
+    resp: JByteArray<'l>,
+) {
+    run(&mut env, |e| {
+        let pin = zeroize::Zeroizing::new(bytes(e, &pin)?.unwrap_or_default());
+        let (c, r) = (bytes(e, &chal)?, bytes(e, &resp)?);
+        let (c, r) = (c.unwrap_or_default(), r.unwrap_or_default());
+        with(h, |s| s.quick_on(&pin, &c, &r))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_quickOff<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) {
+    run(&mut env, |_| {
+        let _ = std::fs::remove_file(Path::new(&dir.to_string()).join("quick"));
+        Ok(())
     })
 }
 

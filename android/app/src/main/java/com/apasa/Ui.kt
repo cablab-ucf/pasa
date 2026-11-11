@@ -34,6 +34,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
@@ -73,6 +74,9 @@ data class Form(
     val otp: String = "", val notes: String = "", val tags: String = "",
 )
 
+/** A hardware key's part: none; a tap (and PIN) that opens the store beside the password; or needed with the password. */
+enum class Key { None, Quick, Both }
+
 /** How a password is made: characters, or words to say aloud (22 bits each). */
 data class Gen(
     val words: Boolean = false, val len: Int = 24, val symbols: Boolean = true,
@@ -88,8 +92,13 @@ interface Host {
     val open: Boolean
     val version: String
     var sync: Boolean
-    suspend fun create(pw: String, key: Boolean)
+    /** Quick unlock here: null if off, else whether a PIN goes with the tap. */
+    val quick: Boolean?
+    suspend fun create(pw: String, key: Key, pin: String)
     suspend fun unlock(pw: String)
+    suspend fun unlockQuick(pin: String)
+    /** Quick unlock on with [pin] (empty: none), or off (null). */
+    suspend fun setQuick(pin: String?)
     suspend fun join(name: String, code: String, pw: String)
     fun scan(got: (String) -> Unit)
     fun lock()
@@ -283,7 +292,8 @@ private fun Front(
 private fun Create(host: Host, nav: Nav) {
     var pw by remember { mutableStateOf("") }
     var again by remember { mutableStateOf("") }
-    var key by remember { mutableStateOf(false) }
+    var key by remember { mutableStateOf(Key.None) }
+    var pin by remember { mutableStateOf("") }
     val (busy, err, go) = rememberJob()
     val differ = again.isNotEmpty() && pw != again
     Front(
@@ -293,18 +303,17 @@ private fun Create(host: Host, nav: Nav) {
         Field(pw, { pw = it }, "Password", secret = true)
         if (pw.isNotEmpty()) Meter(host.strength(pw))
         Field(again, { again = it }, "Password, again", secret = true)
-        Row(Modifier.fillMaxWidth().clickable { key = !key }, verticalAlignment = Alignment.CenterVertically) {
-            Checkbox(key, { key = it })
-            Column {
-                Text("Require a hardware key (YubiKey)")
-                Text(
-                    "Its answer joins the password in the lock: the store then opens only with both.",
-                    style = MaterialTheme.typography.bodySmall, color = muted,
-                )
-            }
+        Row(Modifier.fillMaxWidth().clickable { key = if (key == Key.None) Key.Quick else Key.None }, verticalAlignment = Alignment.CenterVertically) {
+            Checkbox(key != Key.None, { key = if (it) Key.Quick else Key.None })
+            Text("Use a hardware key (YubiKey)")
         }
-        if (key && busy) Text("Hold your YubiKey to the phone", color = MaterialTheme.colorScheme.primary)
-        Primary("Create store", enabled = pw.isNotEmpty() && pw == again && !busy) { go { host.create(pw, key) } }
+        if (key != Key.None) {
+            Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost: make it long.", key == Key.Quick) { key = Key.Quick }
+            if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true)
+            Choice("As a second factor", "Needed together with the password, every time.", key == Key.Both) { key = Key.Both }
+        }
+        if (key != Key.None && busy) Text("Hold your YubiKey to the phone", color = MaterialTheme.colorScheme.primary)
+        Primary("Create store", enabled = pw.isNotEmpty() && pw == again && !busy) { go { host.create(pw, key, pin) } }
     }
 }
 
@@ -326,11 +335,33 @@ private fun Join(host: Host, nav: Nav) {
     }
 }
 
+/** One of a few ways, with what it means. */
+@Composable
+private fun Choice(title: String, about: String, on: Boolean, pick: () -> Unit) =
+    Row(Modifier.fillMaxWidth().clickable(onClick = pick), verticalAlignment = Alignment.CenterVertically) {
+        RadioButton(on, pick)
+        Column {
+            Text(title)
+            Text(about, style = MaterialTheme.typography.bodySmall, color = muted)
+        }
+    }
+
 @Composable
 private fun Unlock(host: Host) {
     var pw by remember { mutableStateOf("") }
+    var pin by remember { mutableStateOf("") }
+    var byPassword by remember { mutableStateOf(false) }
     val (busy, err, go) = rememberJob()
-    Front("Unlock", busy, err) {
+    val quick = host.quick
+    if (quick != null && !byPassword) return Front("Unlock", busy, err, "No key at hand?", "Use the password", { byPassword = true }) {
+        if (quick) Field(pin, { pin = it }, "PIN", secret = true)
+        Text("Then hold your YubiKey to the phone", style = MaterialTheme.typography.bodySmall, color = muted)
+        Primary("Unlock with the YubiKey", enabled = !busy) { go { host.unlockQuick(pin); pin = "" } }
+    }
+    Front(
+        "Unlock", busy, err, if (quick != null) "Quick unlock is on." else "", if (quick != null) "Use the YubiKey" else "",
+        { byPassword = false },
+    ) {
         Field(pw, { pw = it }, "Password", secret = true)
         if (host.needsKey) Text("Then hold your YubiKey to the phone", style = MaterialTheme.typography.bodySmall, color = muted)
         Primary("Unlock", enabled = !busy) { go { host.unlock(pw); pw = "" } }
@@ -719,6 +750,26 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
 
 @Composable
 private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
+    var pin by remember { mutableStateOf("") }
+    val (busy, err, go) = rememberJob()
+    Text("Quick unlock", style = MaterialTheme.typography.bodyLarge)
+    Text(
+        "A tap of your YubiKey and a PIN open the store on this phone. The password still opens it alone: keep it long.",
+        style = MaterialTheme.typography.bodySmall, color = muted,
+    )
+    when (val q = host.quick) {
+        null -> {
+            Field(pin, { pin = it }, "PIN (empty: none)", secret = true)
+            OutlinedButton({ go { host.setQuick(pin); pin = "" } }, enabled = !busy) { Text("Turn on: hold your YubiKey to the phone") }
+        }
+        else -> Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(if (q) "On, with a PIN" else "On, no PIN", Modifier.weight(1f))
+            TextButton({ go { host.setQuick(null) } }) { Text("Turn off") }
+        }
+    }
+    if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+    if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     for ((what, how) in listOf(
         "Locking" to "The store locks whenever the app leaves the screen.",
         "Clipboard" to "Copied secrets are marked sensitive and leave the clipboard after 45 s.",

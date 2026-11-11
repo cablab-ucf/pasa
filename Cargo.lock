@@ -2733,10 +2733,12 @@ name = "kdbx2pasa"
 version = "0.4.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "keepass",
  "rpassword",
  "serde_json",
  "tar",
+ "uuid",
 ]
 
 [[package]]

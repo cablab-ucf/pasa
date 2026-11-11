@@ -29,6 +29,8 @@ pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
+pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
+                             password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
 pasa pair NAME [--qr]        let a device join, called NAME here
 pasa join NAME CODE          join the device NAME showing CODE
@@ -64,15 +66,43 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
     Ok((pw, c, if yk { Some(yubikey(&c)?) } else { None }))
 }
 
+/// With quick unlock on: the YubiKey and the PIN; else, or if that
+/// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
+    if let Some((c, pin)) = pasa::quick(&home()) {
+        let typed = match pin {
+            true => ask("PIN (Enter: the password instead): ")?,
+            false => Default::default(),
+        };
+        if !pin || !typed.is_empty() {
+            match unlock_quick(&c, &typed) {
+                Ok(s) => return Ok(s),
+                Err(e) => eprintln!("{e:#}"),
+            }
+        }
+    }
     unlock(&ask("Password: ")?)
 }
 
 fn unlock(pw: &[u8]) -> Result<Store> {
     let k = std::fs::read(home().join("key")).context("no store: pasa init")?;
     let yk = challenge(&k).map(yubikey).transpose()?;
-    #[allow(unused_mut)]
-    let mut s = Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))?;
+    adopted(Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))?)
+}
+
+/// By the YubiKey's answer to `c` and the PIN ([`Store::quick_on`]).
+fn unlock_quick(c: &[u8], pin: &[u8]) -> Result<Store> {
+    adopted(Store::open_quick(&home(), pin, &yubikey(c)?)?)
+}
+
+/// Turn quick unlock on for the open store, with `pin` (empty: none).
+fn quick_on(s: &Store, pin: &[u8]) -> Result<()> {
+    let c = rand::<32>();
+    s.quick_on(pin, &c, &yubikey(&c)?)
+}
+
+#[allow(unused_mut)]
+fn adopted(mut s: Store) -> Result<Store> {
     #[cfg(feature = "sync")]
     pasa::sync::adopt(&mut s)?;
     Ok(s)
@@ -243,6 +273,18 @@ fn main() -> Result<()> {
             let (pw, c, r) = factors(flag("-y") || had && !flag("-n"))?;
             s.lock(&pw, r.as_ref().map(|r| (&c[..], &r[..])))?
         }
+        ["quick", "off"] => {
+            return Ok(std::fs::remove_file(home().join("quick"))?);
+        }
+        ["quick", ..] => {
+            let s = unlock(&ask("Password: ")?)?;
+            let mut pin = Secret::default();
+            if !flag("-n") {
+                pin = ask("PIN: ")?;
+                ensure!(*pin == *ask("Again: ")?, "the PINs differ");
+            }
+            return quick_on(&s, &pin);
+        }
         ["cp", n, ..] => {
             let f = a.get(2).unwrap_or(&"pass");
             return clip(
@@ -331,6 +373,7 @@ fn main() -> Result<()> {
         }
         ["load"] => {
             let s = open()?;
+            let mut all = vec![];
             for e in tar::Archive::new(std::io::stdin()).entries()? {
                 let mut e = e?;
                 if e.header().entry_type().is_file() {
@@ -341,7 +384,16 @@ fn main() -> Result<()> {
                         .to_string();
                     let mut b = Zeroizing::new(vec![]);
                     e.read_to_end(&mut b)?;
-                    s.put(&p, &b)?;
+                    all.push((e.header().mtime().unwrap_or(0), p, b));
+                }
+            }
+            // A dated file is a version as it was then: oldest first, so
+            // each follows the one before it.
+            all.sort_by_key(|e| e.0);
+            for (at, p, b) in all {
+                match at {
+                    0 => s.put(&p, &b)?,
+                    at => s.put_at(&p, &b, at * 1000)?,
                 }
             }
         }

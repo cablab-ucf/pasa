@@ -11,7 +11,8 @@ pasa on Android: a thin Compose UI over the same Rust (`apasa-jni`).
   user names, an entry's fields each with its copy, a form to edit them,
   a password generator, devices (pair, forget, sync) and settings.
 - Unlock with the password and, if the store has one, a YubiKey over NFC
-  (HMAC-SHA1 slot 2). Locks whenever the app leaves the screen.
+  (HMAC-SHA1 slot 2); or, with quick unlock on, by a tap of the key and a
+  PIN, the password staying the other way in. Locks whenever the app leaves the screen.
 - Copy password, user or TOTP (cleared after 45 s, marked sensitive).
   FLAG_SECURE, overlays hidden, no backup or device transfer.
 - Wakes come through pushir, the phone's one connection shared with the

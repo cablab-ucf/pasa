@@ -101,6 +101,13 @@ ciphertext, and learns when you change things. A version deleted from
   factors needed. The password is per device (`passwd` changes this one);
   each `passwd` takes a fresh challenge. Program two YubiKeys with one
   secret (`ykman otp chalresp 2 SECRET`).
+- **Quick unlock** (`pasa quick`, or the apps' settings; per device, never
+  synced): `quick` holds the key the password derives, sealed to Argon2id
+  of a PIN with the YubiKey's answer as its secret. A tap and the PIN then
+  open the store; so does the password alone, which must therefore be
+  long. The key alone opens nothing; the device's storage with the key
+  leaves only the PIN to guess, at Argon2id's pace: days for six digits.
+  `passwd` ends it.
 - **Transport keys, endpoint, lanes, device id**: what `serve` holds;
   none opens a version or a hand-over.
 
@@ -151,8 +158,16 @@ paired with. It keeps what it had: change the passwords it held.
 ## Migrating
 
 ```sh
-kdbx2pasa Passwords.kdbx | pasa load   # KeePass: history, attachments, .kdbx.json
+kdbx2pasa A.kdbx [B.kdbx ...] [-k KEYFILE] | pasa load   # KeePass
 contrib/migrate.sh                      # pasa 0.1 (age 1.3+)
 ```
+
+`kdbx2pasa` brings every entry with its history, each version dated as
+KeePass dated it, its attachments and tags, and `.kdbx.json` (the first
+database, whole); what is in the recycle bin stays out. Several databases
+are copies of one that went apart (sync conflicts): an entry is the same
+by its id in each, and its versions from all of them make one history by
+time, each once, the newest being the entry. `pasa load` keeps a tar
+member's date as its version's.
 
 License: GPL-3.0-or-later.

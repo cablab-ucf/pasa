@@ -53,6 +53,7 @@ class MainActivity : ComponentActivity(), Host {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         if (android.os.Build.VERSION.SDK_INT >= 31) window.setHideOverlayWindows(true)
         stored = File(dir, "key").exists()
+        readQuick()
         setContent {
             BackHandler(enabled = !nav.atTop) { nav.back() }
             Pasa(this, nav)
@@ -76,11 +77,36 @@ class MainActivity : ComponentActivity(), Host {
             if (on) push(this)
         }
 
-    override suspend fun create(pw: String, key: Boolean) {
-        val c = if (key) ByteArray(32).also { SecureRandom().nextBytes(it) } else null
+    private var quickNow by mutableStateOf<Boolean?>(null)
+    override val quick get() = quickNow
+    private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 } }
+    private fun fresh() = ByteArray(32).also { SecureRandom().nextBytes(it) }
+
+    override suspend fun create(pw: String, key: Key, pin: String) {
+        val c = if (key == Key.Both) fresh() else null
         val r = c?.let { yubikey(this, it) }
-        handle = io { Native.open(dir, pw.toByteArray(), c, r, true) }
+        val h = io { Native.open(dir, pw.toByteArray(), c, r, true) }
+        if (key == Key.Quick) runCatching { quickOn(h, pin) }.onFailure { Native.close(h); File(dir, "key").delete(); throw it }
+        handle = h
         stored = true
+    }
+
+    private suspend fun quickOn(h: Long, pin: String) {
+        val c = fresh()
+        val r = yubikey(this, c)
+        io { Native.quickOn(h, pin.toByteArray(), c, r) }
+        readQuick()
+    }
+
+    override suspend fun setQuick(pin: String?) {
+        if (pin == null) Native.quickOff(dir) else quickOn(handle, pin)
+        readQuick()
+    }
+
+    override suspend fun unlockQuick(pin: String) {
+        val r = yubikey(this, Native.quick(dir)!!.copyOf(32))
+        handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
+        if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
     override suspend fun unlock(pw: String) {
