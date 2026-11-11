@@ -31,6 +31,7 @@ object Native {
     external fun pwnedCount(kept: String, text: String): Long
     external fun form(body: String): String
     external fun text(form: String): String
+    external fun problem(form: String): String
     external fun peers(dir: String): String
     external fun forget(dir: String, name: String)
     external fun pair(h: Long, name: String): String

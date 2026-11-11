@@ -204,6 +204,8 @@ struct Edit {
     show: bool,
     /// The Advanced tab, not the entry's.
     advanced: bool,
+    /// How its password is made shows, to choose.
+    making: bool,
 }
 
 struct Generator {
@@ -236,6 +238,66 @@ impl Generator {
             true => pasa::speakable(self.count, self.seps, self.leet),
             false => pasa::generate(self.len, self.symbols),
         }
+    }
+
+    /// How passwords are made, to choose; whether something was chosen.
+    fn options(&mut self, ui: &mut Ui) -> bool {
+        let (g, l) = (self, look(ui));
+        let mut again = false;
+        ui.horizontal(|ui| {
+            again |= ui
+                .selectable_value(&mut g.words, false, "Characters")
+                .clicked();
+            again |= ui
+                .selectable_value(&mut g.words, true, "Speakable words")
+                .clicked();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let bits = format!("{} bits", g.bits());
+                ui.label(RichText::new(bits).small().color(l.muted));
+            });
+        });
+        match g.words {
+            true => {
+                let n = Slider::new(&mut g.count, 3..=8).text("words");
+                again |= ui.add(n).changed();
+                ui.horizontal(|ui| {
+                    let between = [
+                        ("", "Nothing: CapitalWords"),
+                        ("-", "A dash"),
+                        (".", "A period"),
+                        ("_", "An underscore"),
+                        ("-_.", "A dash, underscore or period"),
+                        (pasa::SEPS, "Any symbol"),
+                    ];
+                    let now = between.iter().find(|b| b.0 == g.seps);
+                    let now = now.map_or("", |b| b.1);
+                    ui.label("Between words");
+                    ComboBox::from_id_salt("seps").selected_text(now).show_ui(
+                        ui,
+                        |ui| {
+                            for (seps, name) in between {
+                                let r = ui.selectable_value(
+                                    &mut g.seps,
+                                    seps,
+                                    name,
+                                );
+                                again |= r.clicked();
+                            }
+                        },
+                    );
+                    let leet = ui.checkbox(&mut g.leet, "1337");
+                    again |= leet
+                        .on_hover_text("Some letters as @ 3 1 0 $ 7")
+                        .changed();
+                });
+            }
+            false => {
+                let n = Slider::new(&mut g.len, 8..=64).text("characters");
+                again |= ui.add(n).changed();
+                again |= ui.checkbox(&mut g.symbols, "Symbols").changed();
+            }
+        }
+        again
     }
 
     /// The bits of chance in the password: as made, what went into it;
@@ -1234,6 +1296,7 @@ impl App {
             f,
             show: false,
             advanced: false,
+            making: false,
         });
     }
 
@@ -1246,6 +1309,7 @@ impl App {
                 f,
                 show: false,
                 advanced: false,
+                making: false,
             });
         }
     }
@@ -1639,6 +1703,9 @@ impl App {
                     ui.selectable_value(&mut e.advanced, false, "Entry");
                 });
             });
+            // On a low window the form scrolls; Save stays in reach.
+            let tall = ui.ctx().content_rect().height() - 170.0;
+            ScrollArea::vertical().max_height(tall).show(ui, |ui| {
             if e.advanced {
                 small(ui, "Expires (YYYY-MM-DD; empty: never)");
                 ui.horizontal(|ui| {
@@ -1653,7 +1720,7 @@ impl App {
                         e.f.expires.clear();
                     }
                 });
-                small(ui, "Other fields: one a line, as  name: value");
+                small(ui, "Other fields: one a line, as  name_of_it: value");
                 let more = TextEdit::multiline(&mut e.f.more).desired_rows(5);
                 ui.add(more.desired_width(f32::INFINITY).code_editor());
                 small(ui, "Files");
@@ -1697,6 +1764,7 @@ impl App {
                     if ui.button("Generate").clicked() {
                         e.f.pass = self.generator.make();
                     }
+                    ui.toggle_value(&mut e.making, "Options");
                     if ui.button(if e.show { "Hide" } else { "Show" }).clicked() {
                         e.show ^= true;
                     }
@@ -1704,6 +1772,10 @@ impl App {
                     ui.add(t.desired_width(f32::INFINITY).margin(Margin::symmetric(8, 6)));
                 });
                 meter(ui, pasa::strength(&e.f.pass));
+                if e.making && self.generator.options(ui) {
+                    e.f.pass = self.generator.make();
+                    e.show = true;
+                }
                 field(ui, "URL", &mut e.f.url, false);
                 field(ui, "Tags (commas between)", &mut e.f.tags, false);
                 field(ui, "One-time code: its otpauth:// address", &mut e.f.otp, false);
@@ -1711,9 +1783,16 @@ impl App {
                 let notes = TextEdit::multiline(&mut e.f.notes).desired_rows(3);
                 ui.add(notes.desired_width(f32::INFINITY));
             }
+            });
             ui.add_space(6.0);
+            // Saved only as what it reads back as: said, not mended.
+            let wrong = e.f.problem();
+            if let Some(w) = &wrong {
+                ui.label(RichText::new(w).small().color(l.bad));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let ok = !e.name.trim().is_empty() && !e.name.ends_with('/');
+                let ok = ok && wrong.is_none();
                 save = ui.add_enabled_ui(ok, |ui| primary(ui, "Save", false)).inner.clicked();
                 close = ui.button("Cancel").clicked();
             });
@@ -1778,60 +1857,7 @@ impl App {
             );
         });
         meter(ui, g.bits());
-        let mut again = false;
-        ui.horizontal(|ui| {
-            again |= ui
-                .selectable_value(&mut g.words, false, "Characters")
-                .clicked();
-            again |= ui
-                .selectable_value(&mut g.words, true, "Speakable words")
-                .clicked();
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let bits = format!("{} bits", g.bits());
-                ui.label(RichText::new(bits).small().color(l.muted));
-            });
-        });
-        match g.words {
-            true => {
-                let n = Slider::new(&mut g.count, 3..=8).text("words");
-                again |= ui.add(n).changed();
-                ui.horizontal(|ui| {
-                    let between = [
-                        ("", "Nothing: CapitalWords"),
-                        ("-", "A dash"),
-                        (".", "A period"),
-                        ("_", "An underscore"),
-                        ("-_.", "A dash, underscore or period"),
-                        (pasa::SEPS, "Any symbol"),
-                    ];
-                    let now = between.iter().find(|b| b.0 == g.seps);
-                    let now = now.map_or("", |b| b.1);
-                    ui.label("Between words");
-                    ComboBox::from_id_salt("seps").selected_text(now).show_ui(
-                        ui,
-                        |ui| {
-                            for (seps, name) in between {
-                                let r = ui.selectable_value(
-                                    &mut g.seps,
-                                    seps,
-                                    name,
-                                );
-                                again |= r.clicked();
-                            }
-                        },
-                    );
-                    let leet = ui.checkbox(&mut g.leet, "1337");
-                    again |= leet
-                        .on_hover_text("Some letters as @ 3 1 0 $ 7")
-                        .changed();
-                });
-            }
-            false => {
-                let n = Slider::new(&mut g.len, 8..=64).text("characters");
-                again |= ui.add(n).changed();
-                again |= ui.checkbox(&mut g.symbols, "Symbols").changed();
-            }
-        }
+        let mut again = g.options(ui);
         ui.horizontal(|ui| {
             again |= ui.button("Another").clicked();
             if primary(ui, "Copy", false).clicked() {

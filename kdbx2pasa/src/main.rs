@@ -22,16 +22,22 @@ fn text(e: &Entry) -> Result<String> {
         if !["Title", "Password", "Notes"].contains(&k.as_str())
             && !v.is_empty()
         {
-            let k =
-                if k == "UserName" { "user".into() } else { k.to_lowercase() };
-            writeln!(b, "{k}: {}", v.replace('\n', "\n  "))?;
+            // A name pasa saves as it is: letters, digits and _.
+            let plain =
+                |c: char| if c.is_ascii_alphanumeric() { c } else { '_' };
+            let k = match k.as_str() {
+                "UserName" => "user".into(),
+                k => k.to_lowercase().chars().map(plain).collect::<String>(),
+            };
+            writeln!(b, "{k}: {}", v.trim().replace('\n', "\n  "))?;
         }
     }
     if !e.tags.is_empty() {
         writeln!(b, "tags: {}", e.tags.join(", "))?;
     }
+    // An empty line, then the notes: notes whatever they say.
     if let Some(n) = e.get("Notes").filter(|n| !n.is_empty()) {
-        writeln!(b, "{n}")?;
+        writeln!(b, "\n{n}")?;
     }
     Ok(b)
 }

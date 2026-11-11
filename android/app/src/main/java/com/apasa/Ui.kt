@@ -98,6 +98,9 @@ data class Health(
 /** A hardware key's part: none; a tap (and PIN) that opens the store beside the password; or needed with the password. */
 enum class Key { None, Quick, Both }
 
+/** How an empty key is said where it can be set up: the screens offer that on these words. */
+const val EMPTY_KEY = "Slot 2 of this YubiKey is empty."
+
 /** The symbols that may stand between speakable words (pasa::SEPS). */
 const val SEPS = "-_.!#%&*+=?^~,:;"
 
@@ -139,6 +142,11 @@ interface Host {
     val quick: Boolean?
     /** The phone has NFC and it is switched off: a key can then only be plugged in. */
     val nfcOff: Boolean
+    /**
+     * Sets up the next YubiKey tapped, if its slot 2 is empty, with a new secret; [spare]: with the secret
+     * of the key set up just before, so either opens what the other does.
+     */
+    suspend fun setUpKey(spare: Boolean)
     /** Open the phone's NFC settings. */
     fun nfcSettings()
     suspend fun create(pw: String, key: Key, pin: String)
@@ -163,6 +171,8 @@ interface Host {
     fun save(name: String, file: String, done: (String) -> Unit)
     fun form(body: String): Form
     fun text(f: Form): String
+    /** Why [f] may not be saved as it is, or "": saved only as what it reads back as. */
+    fun problem(f: Form): String
     fun code(body: String): String
     fun generate(g: Gen): String
     /** A guess at a typed password's bits. */
@@ -405,6 +415,17 @@ private fun Doing(work: Work, wait: String = "", host: Host? = null) {
     if (work.err.isNotEmpty()) Text(work.err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
     // What is wrong, and where to put it right.
     if (host != null && host.nfcOff && work.err.contains("NFC")) OutlinedButton(host::nfcSettings) { Text("Open NFC settings") }
+    // A new key, taken on: set up here, and a spare with it, now or never (the secret is not kept).
+    var setUp by remember { mutableStateOf(false) }
+    if (host != null && work.err.startsWith(EMPTY_KEY)) OutlinedButton({ work.go { host.setUpKey(false); setUp = true } }) { Text("Set up this key") }
+    if (host != null && setUp && !work.busy && work.err.isEmpty()) {
+        Text("The key is set up. Now do again what you were doing, and tap the key when asked.", color = MaterialTheme.colorScheme.primary)
+        Text(
+            "A spare key can be given the same secret now, and only now: the secret is not kept. Without one, the password is the way in if the key is lost.",
+            style = MaterialTheme.typography.bodySmall, color = muted,
+        )
+        OutlinedButton({ work.go { host.setUpKey(true) } }) { Text("Set up a spare key too") }
+    }
 }
 
 /** Before a key is asked for: that NFC is off, and where to turn it on. */
@@ -758,6 +779,9 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     val show = remember { mutableStateOf(old.isEmpty()) }
     LaunchedEffect(old) { if (old.isNotEmpty()) f = host.form(host.get(old)) }
     var advanced by remember { mutableStateOf(false) }
+    var making by remember { mutableStateOf(false) }
+    val wrong = host.problem(f)
+    if (making) Generator(host, nav, { _, _ -> }, { f = f.copy(pass = it); show.value = true; making = false }) { making = false }
     // The user names most entries have, to pick from.
     val users by produceState(listOf<String>()) {
         value = host.names().mapNotNull { n -> runCatching { host.form(host.get(n)).user }.getOrNull()?.takeIf { it.isNotEmpty() } }
@@ -777,7 +801,10 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
                 OutlinedButton({ f = f.copy(expires = day(365)) }) { Text("In a year") }
                 TextButton({ f = f.copy(expires = "") }) { Text("Never") }
             }
-            Field(f.more, { f = f.copy(more = it) }, "Other fields: one a line, as  name: value", lines = 5)
+            Field(
+                f.more, { f = f.copy(more = it) }, "Other fields: one a line, as  name_of_it: value", lines = 5,
+                error = if (wrong.startsWith("Other")) wrong else "",
+            )
             Text("Files are attached and removed on the entry's own screen.", style = MaterialTheme.typography.bodySmall, color = muted)
         } else {
             Field(
@@ -796,13 +823,17 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
             }
             Field(f.pass, { f = f.copy(pass = it) }, "Password", secret = true, shown = show)
             Meter(host.strength(f.pass))
-            OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show.value = true }) { Text("Generate a password") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton({ f = f.copy(pass = host.generate(nav.gen)); show.value = true }) { Text("Generate") }
+                TextButton({ making = true }) { Text("Generator options") }
+            }
             Field(f.url, { f = f.copy(url = it) }, "URL")
             Field(f.tags, { f = f.copy(tags = it) }, "Tags (commas between)")
-            Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address")
+            Field(f.otp, { f = f.copy(otp = it) }, "One-time code: its otpauth:// address", error = if (wrong.startsWith("One-time")) wrong else "")
             Field(f.notes, { f = f.copy(notes = it) }, "Notes", lines = 3, prose = true)
         }
-        Primary("Save", enabled = name.isNotBlank() && !name.endsWith("/")) {
+        if (wrong.isNotEmpty()) Text(wrong, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        Primary("Save", enabled = name.isNotBlank() && !name.endsWith("/") && wrong.isEmpty()) {
             val (to, text) = name.trim() to host.text(f)
             go {
                 if (old.isNotEmpty() && old != to) host.rename(old, to)
@@ -828,7 +859,7 @@ private fun Tick(text: String, on: Boolean, set: (Boolean) -> Unit) =
     }
 
 @Composable
-private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, close: () -> Unit) {
+private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use: ((String) -> Unit)? = null, close: () -> Unit) {
     val g = nav.gen
     var n by remember { mutableIntStateOf(0) }
     val made = remember(g, n) { host.generate(g) }
@@ -864,7 +895,9 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, clos
                 Text("Change it by hand and its bits are counted again. New entries start with a password made this way.", style = MaterialTheme.typography.bodySmall, color = muted)
             }
         },
-        confirmButton = { TextButton({ copy("Generated password", pw) }) { Text("Copy") } },
+        confirmButton = {
+            if (use != null) TextButton({ use(pw) }) { Text("Use") } else TextButton({ copy("Generated password", pw) }) { Text("Copy") }
+        },
         dismissButton = {
             Row {
                 TextButton({ n++ }) { Text("Another") }

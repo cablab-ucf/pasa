@@ -75,6 +75,8 @@ class MainActivity : ComponentActivity(), Host {
 
     override fun onStop() {
         super.onStop()
+        keySecret?.fill(0)
+        keySecret = null
         if (!isChangingConfigurations && !picking) lock()
     }
 
@@ -97,7 +99,7 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun create(pw: String, key: Key, pin: String) {
         val c = if (key == Key.Both) fresh() else null
-        val r = c?.let { yubikey(this, it) }
+        val r = c?.let { yubikey(this, it, enroll = true) }
         val h = io { Native.open(dir, pw.toByteArray(), c, r, true) }
         if (key == Key.Quick) runCatching { quickOn(h, pin) }.onFailure { Native.close(h); File(dir, "key").delete(); throw it }
         handle = h
@@ -106,9 +108,21 @@ class MainActivity : ComponentActivity(), Host {
 
     private suspend fun quickOn(h: Long, pin: String) {
         val c = fresh()
-        val r = yubikey(this, c)
+        val r = yubikey(this, c, enroll = true)
         io { Native.quickOn(h, pin.toByteArray(), c, r) }
         readQuick()
+    }
+
+    /** The secret of the key last set up, for a spare: kept until the app leaves the screen. */
+    private var keySecret: ByteArray? = null
+
+    override suspend fun setUpKey(spare: Boolean) {
+        val secret = when {
+            !spare -> ByteArray(20).also { SecureRandom().nextBytes(it) }
+            else -> keySecret ?: throw Exception("The first key's secret is no longer here (the app left the screen): a spare cannot be made of it now.")
+        }
+        writeKey(this, secret)
+        keySecret = secret
     }
 
     override suspend fun setQuick(pin: String?) {
@@ -163,8 +177,9 @@ class MainActivity : ComponentActivity(), Host {
         Form(at(0), at(1), at(2), at(3), at(7), at(4), at(5), at(6))
     }
 
-    override fun text(f: Form) =
-        Native.text(listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f"))
+    private fun joined(f: Form) = listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f")
+    override fun text(f: Form) = Native.text(joined(f))
+    override fun problem(f: Form) = Native.problem(joined(f))
     override fun strength(pw: String) = Native.strength(pw)
 
     override suspend fun times(name: String) = io {
