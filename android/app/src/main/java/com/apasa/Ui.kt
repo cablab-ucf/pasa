@@ -55,6 +55,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -65,7 +66,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.vector.PathParser
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
@@ -76,6 +81,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
@@ -142,6 +148,9 @@ interface Host {
     val quick: Boolean?
     /** The phone has NFC and it is switched off: a key can then only be plugged in. */
     val nfcOff: Boolean
+    /** A setting kept on this phone: "clip" and "lock", seconds; "theme": 0 the phone's, 1 dark, 2 light. */
+    fun setting(name: String): Int
+    fun set(name: String, value: Int)
     /**
      * Sets up the next YubiKey tapped, if its slot 2 is empty, with a new secret; [spare]: with the secret
      * of the key set up just before, so either opens what the other does.
@@ -247,7 +256,7 @@ private val mono = FontFamily.Monospace
 
 @Composable
 fun Pasa(host: Host, nav: Nav, dark: Boolean = isSystemInDarkTheme()) {
-    MaterialTheme(colorScheme = if (dark) Dark else Light) {
+    MaterialTheme(colorScheme = if (host.setting("theme").let { it == 1 || it == 0 && dark }) Dark else Light) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Box(Modifier.safeDrawingPadding()) {
                 when {
@@ -292,6 +301,65 @@ private fun rememberJob(): Work {
 
 @Composable
 private fun Label(t: String) = Text(t, style = MaterialTheme.typography.labelMedium, color = muted)
+
+/** The app's mark: a padlock that reads as the letter a (the launcher icon's paths). */
+@Composable
+private fun Logo(size: Dp, modifier: Modifier = Modifier) {
+    val (ink, hole) = MaterialTheme.colorScheme.primary to MaterialTheme.colorScheme.background
+    val paths = remember {
+        listOf(
+            "M37,45V41a17.5,17.5 0,0 1,35 0V78",
+            "M40,52h26.5a10,10 0,0 1,10 10v14.5a10,10 0,0 1,-10 10H40a10,10 0,0 1,-10 -10V62a10,10 0,0 1,10 -10z",
+            "M53,62.5a4.6,4.6 0,0 1,2.6 8.4V76a2.6,2.6 0,0 1,-5.2 0V70.9A4.6,4.6 0,0 1,53 62.5z",
+        ).map { PathParser().parsePathString(it).toPath() }
+    }
+    Canvas(modifier.size(size)) {
+        scale(this.size.width / 72f, pivot = Offset.Zero) {
+            translate(-18f, -17f) {
+                drawPath(paths[0], ink, style = Stroke(9f, cap = StrokeCap.Round))
+                drawPath(paths[1], ink)
+                drawPath(paths[2], hole)
+            }
+        }
+    }
+}
+
+/** A small drawn sign on a button that says what it does to a screen reader: "Copy", "Open", "Edit". */
+@Composable
+private fun Sign(what: String, tint: Color = MaterialTheme.colorScheme.primary, act: () -> Unit) = Box(
+    Modifier.size(44.dp).clickable(onClick = act).semantics { contentDescription = what }, contentAlignment = Alignment.Center,
+) {
+    Canvas(Modifier.size(20.dp)) {
+        val (w, pen) = size.width to Stroke(size.width * 0.09f, cap = StrokeCap.Round)
+        val r = androidx.compose.ui.geometry.CornerRadius(w * 0.12f)
+        when (what) {
+            // Two sheets, one behind the other.
+            "Copy" -> {
+                drawRoundRect(tint, Offset(w * 0.34f, w * 0.30f), Size(w * 0.56f, w * 0.62f), r, style = pen)
+                drawLine(tint, Offset(w * 0.12f, w * 0.68f), Offset(w * 0.12f, w * 0.10f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.12f, w * 0.10f), Offset(w * 0.62f, w * 0.10f), pen.width, StrokeCap.Round)
+            }
+            // An arrow leaving a box.
+            "Open" -> {
+                drawLine(tint, Offset(w * 0.42f, w * 0.14f), Offset(w * 0.14f, w * 0.14f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.14f, w * 0.14f), Offset(w * 0.14f, w * 0.86f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.14f, w * 0.86f), Offset(w * 0.86f, w * 0.86f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.86f, w * 0.86f), Offset(w * 0.86f, w * 0.58f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.44f, w * 0.56f), Offset(w * 0.88f, w * 0.12f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.60f, w * 0.12f), Offset(w * 0.88f, w * 0.12f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.88f, w * 0.12f), Offset(w * 0.88f, w * 0.40f), pen.width, StrokeCap.Round)
+            }
+            // A pencil, point down.
+            else -> {
+                drawLine(tint, Offset(w * 0.20f, w * 0.80f), Offset(w * 0.26f, w * 0.58f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.20f, w * 0.80f), Offset(w * 0.42f, w * 0.74f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.26f, w * 0.58f), Offset(w * 0.70f, w * 0.14f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.42f, w * 0.74f), Offset(w * 0.86f, w * 0.30f), pen.width, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.70f, w * 0.14f), Offset(w * 0.86f, w * 0.30f), pen.width, StrokeCap.Round)
+            }
+        }
+    }
+}
 
 /** An eye, struck through while what it watches is hidden. */
 @Composable
@@ -381,7 +449,8 @@ private fun Front(
         Modifier.align(Alignment.TopCenter).widthIn(max = 420.dp).verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Spacer(Modifier.height(56.dp))
+        Spacer(Modifier.height(40.dp))
+        Logo(64.dp)
         Text("pasa", fontSize = 40.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
         Text("A small password store", color = muted)
         Spacer(Modifier.height(24.dp))
@@ -486,6 +555,10 @@ private fun Create(host: Host, nav: Nav) {
             Text("Use a hardware key (YubiKey)")
         }
         if (key != Key.None) {
+            Text(
+                "A new key is set up here when it is first tapped. A spare key gets the same secret right then, or never: have both at hand before you start. Without a spare, the password is the way in if the key is lost.",
+                style = MaterialTheme.typography.bodySmall, color = muted,
+            )
             Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
             if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true, done = create)
             Choice("As a second factor", "Needed together with the password, every time.", key == Key.Both) { key = Key.Both }
@@ -559,7 +632,7 @@ private fun Page(title: String, nav: Nav, action: String = "", act: () -> Unit =
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         TextButton({ nav.back() }) { Text("←  Back") }
         Text(title, Modifier.weight(1f), style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        if (action.isNotEmpty()) TextButton(act) { Text(action) }
+        if (action == "Edit") Sign(action, act = act) else if (action.isNotEmpty()) TextButton(act) { Text(action) }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     Column(
@@ -581,7 +654,7 @@ private fun Store(host: Host, nav: Nav) {
             tick++
         }
     }
-    val copy: (String, String) -> Unit = { what, v -> host.copy(v); say("$what copied, cleared in 45 s") }
+    val copy: (String, String) -> Unit = { what, v -> host.copy(v); say("$what copied, cleared in ${host.setting("clip")} s") }
     Scaffold(
         snackbarHost = { SnackbarHost(said) },
         containerColor = MaterialTheme.colorScheme.background,
@@ -623,7 +696,12 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
         (tag.isEmpty() || tag in tagsOf(n)) && q.split(' ').all { hay.contains(it, ignoreCase = true) }
     }
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.padding(start = 16.dp, end = 4.dp, top = 10.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            // The app's mark: about it, and its settings.
+            Box(
+                Modifier.padding(end = 8.dp).size(44.dp).clickable { nav.screen = Screen.Settings }.semantics { contentDescription = "About and settings" },
+                contentAlignment = Alignment.Center,
+            ) { Logo(34.dp) }
             OutlinedTextField(
                 q, { q = it }, placeholder = { Text("Search") }, singleLine = true,
                 shape = RoundedCornerShape(28.dp), modifier = Modifier.weight(1f),
@@ -662,20 +740,34 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
             if (names.isEmpty()) "No entries yet. New adds the first." else "Nothing matches.",
             Modifier.fillMaxWidth().padding(32.dp), color = muted,
         )
+        // Entries of no group first; then each group under its name, a group within a group further in.
+        // A tap on a name folds what is under it (not while searching: what matches shows).
+        val groups = shown.groupBy { it.substringBeforeLast('/', "") }
+        val paths = groups.keys.filter { it.isNotEmpty() }.flatMap { g -> g.split('/').runningReduce { a, b -> "$a/$b" } }
+            .distinct().sortedBy { it.replace('/', '\u0001') }
+        val folded = remember { mutableStateListOf<String>() }
+        val under = { g: String -> q.isEmpty() && folded.any { g == it || g.startsWith("$it/") } }
+        val rows = groups[""].orEmpty().map { Triple(false, it, 0) } + paths.flatMap { g ->
+            val depth = g.count { it == '/' }
+            if (q.isEmpty() && folded.any { g.startsWith("$it/") }) listOf()
+            else listOf(Triple(true, g, depth)) + if (under(g)) listOf() else groups[g].orEmpty().map { Triple(false, it, depth + 1) }
+        }
         LazyColumn(contentPadding = PaddingValues(bottom = 88.dp)) {
-            for ((group, of) in shown.groupBy { it.substringBeforeLast('/', "") }) {
-                if (group.isNotEmpty()) item(key = "/$group") {
+            for ((head, n, depth) in rows) {
+                if (head) item(key = "/$n") {
                     Text(
-                        group.uppercase(), Modifier.padding(start = 20.dp, top = 16.dp, bottom = 4.dp),
+                        (if (under(n)) "\u25B8  " else "\u25BE  ") + n.substringAfterLast('/').uppercase(),
+                        Modifier.fillMaxWidth().clickable { if (!folded.remove(n)) folded.add(n) }
+                            .padding(start = (20 + 16 * depth).dp, top = 16.dp, bottom = 6.dp),
                         style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, letterSpacing = 1.sp,
                     )
                 }
-                for (n in of) item(key = n) {
+                else item(key = n) {
                     val f = forms[n] ?: Form()
                     var held by remember { mutableStateOf(false) }
                     Row(
                         Modifier.fillMaxWidth().combinedClickable(onLongClick = { held = true }) { nav.screen = Screen.Entry(n) }
-                            .padding(horizontal = 20.dp, vertical = 10.dp),
+                            .padding(start = (20 + 16 * depth).dp, end = 20.dp, top = 10.dp, bottom = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Column(Modifier.weight(1f)) {
@@ -712,7 +804,7 @@ private fun Shown(label: String, value: String, mono: Boolean = false, act: Stri
             Text(value, style = MaterialTheme.typography.bodyLarge, fontFamily = if (mono) FontFamily.Monospace else null)
         }
         more()
-        if (copy != null) TextButton(copy) { Text(act) }
+        if (copy != null && act == "Copy") Sign(act, act = copy) else if (copy != null) TextButton(copy) { Text(act) }
     }
 
 @Composable
@@ -726,7 +818,12 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
         if (f.user.isNotEmpty()) Shown("Username", f.user) { copy("Username", f.user) }
         Shown(
             "Password", if (shown) f.pass else "•".repeat(f.pass.length.coerceAtMost(20)), mono = true,
-            more = { TextButton({ shown = !shown }) { Text(if (shown) "Hide" else "Show") } },
+            more = {
+                Box(
+                    Modifier.size(44.dp).clickable { shown = !shown }.semantics { contentDescription = if (shown) "Hide" else "Show" },
+                    contentAlignment = Alignment.Center,
+                ) { Eye(shown, MaterialTheme.colorScheme.primary) }
+            },
         ) { copy("Password", f.pass) }
         val code = remember(body, now / 30) { host.code(body) }
         if (code.isNotEmpty()) Shown(
@@ -735,7 +832,7 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
         ) { copy("Code", code) }
         if (f.url.isNotEmpty()) Shown(
             "URL", f.url,
-            more = { if (f.url.startsWith("http")) TextButton({ host.open(f.url) }) { Text("Open") } },
+            more = { if (f.url.startsWith("http")) Sign("Open") { host.open(f.url) } },
         ) { copy("URL", f.url) }
         if (f.tags.isNotEmpty()) Shown("Tags", f.tags)
         if (f.expires.isNotEmpty()) Shown("Expires", f.expires)
@@ -1058,6 +1155,28 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
 
 @Composable
 private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+        Logo(52.dp)
+        Column {
+            Text("apasa ${host.version}", style = MaterialTheme.typography.titleMedium)
+            Text("A small password store  \u00B7  GPL-3.0-or-later", style = MaterialTheme.typography.bodySmall, color = muted)
+        }
+    }
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+    // One of a few values, the chosen one filled.
+    val pick = @Composable { name: String, title: String, about: String, of: List<Pair<Int, String>> ->
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(about, style = MaterialTheme.typography.bodySmall, color = muted)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for ((v, text) in of) Way(text, host.setting(name) == v) { host.set(name, v) }
+            }
+        }
+    }
+    pick("clip", "Clipboard", "Copied secrets are marked sensitive and leave the clipboard after this long.", listOf(15 to "15 s", 30 to "30 s", 45 to "45 s", 90 to "90 s"))
+    pick("lock", "Locking", "The store locks when the app has been off the screen this long.", listOf(0 to "At once", 60 to "1 min", 300 to "5 min"))
+    pick("theme", "Looks", "Dark or light.", listOf(0 to "As the phone", 1 to "Dark", 2 to "Light"))
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     var pin by remember { mutableStateOf("") }
     val work = rememberJob()
     val (busy, _, go) = work
@@ -1080,14 +1199,10 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     Doing(work, "Hold your YubiKey still against the phone, or plug it in", host)
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     for ((what, how) in listOf(
-        "Locking" to "The store locks whenever the app leaves the screen.",
-        "Clipboard" to "Copied secrets are marked sensitive and leave the clipboard after 45 s.",
         "Screen" to "Screenshots and overlays are blocked while the app shows.",
         "Backups" to "The store is kept out of Android's backups and device transfers: pair a device instead.",
     )) Column {
         Text(what, style = MaterialTheme.typography.bodyLarge)
         Text(how, style = MaterialTheme.typography.bodySmall, color = muted)
     }
-    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-    Text("apasa ${host.version}  ·  GPL-3.0-or-later", style = MaterialTheme.typography.bodySmall, color = muted)
 }

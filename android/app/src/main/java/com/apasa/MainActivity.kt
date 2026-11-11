@@ -17,6 +17,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.File
@@ -77,7 +78,25 @@ class MainActivity : ComponentActivity(), Host {
         super.onStop()
         keySecret?.fill(0)
         keySecret = null
-        if (!isChangingConfigurations && !picking) lock()
+        if (isChangingConfigurations || picking) return
+        if (setting("lock") == 0) lock() else main.postDelayed(locker, setting("lock") * 1000L)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        main.removeCallbacks(locker)
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+    private val locker = Runnable { lock() }
+
+    // What Settings changes, kept on this phone: seconds, and for the theme a number.
+    private val settings = mutableStateMapOf<String, Int>()
+    private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0)
+    override fun setting(name: String) = settings.getOrPut(name) { getSharedPreferences("pasa", 0).getInt(name, usual[name] ?: 0) }
+    override fun set(name: String, value: Int) {
+        settings[name] = value
+        getSharedPreferences("pasa", 0).edit().putInt(name, value).apply()
     }
 
     override val hasStore get() = stored
@@ -255,7 +274,7 @@ class MainActivity : ComponentActivity(), Host {
         val clip = ClipData.newPlainText("pasa", text)
         clip.description.extras = PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
         cm.setPrimaryClip(clip)
-        Handler(Looper.getMainLooper()).postDelayed({ cm.clearPrimaryClip() }, 45_000)
+        main.postDelayed({ cm.clearPrimaryClip() }, setting("clip") * 1000L)
     }
 
     override suspend fun syncNow() = io { Native.sync(dir, false) }

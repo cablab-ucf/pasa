@@ -330,6 +330,8 @@ struct App {
     pw: Zeroizing<String>,
     pw2: Zeroizing<String>,
     yk: bool,
+    /// The secret of the key just set up, for a spare.
+    key_secret: Option<Zeroizing<Vec<u8>>>,
     /// The key opens the store quickly, beside the password; else it is
     /// needed with the password, every time.
     quick: bool,
@@ -631,7 +633,7 @@ impl App {
                 if self.yk && self.quick {
                     crate::quick_on(&s, self.pin.as_bytes())?;
                 }
-                self.v = Some(View::new(s));
+                (self.v, self.key_secret) = (Some(View::new(s)), None);
             }
             Job::Quick => {
                 let (c, _) =
@@ -731,6 +733,7 @@ impl App {
             ui.add_space(4.0);
             ui.checkbox(&mut self.yk, "Use a hardware key (YubiKey)");
             if self.yk {
+                self.new_key(ui);
                 ui.radio_value(&mut self.quick, true, "To unlock quickly");
                 small(
                     ui,
@@ -1682,6 +1685,31 @@ impl App {
         let note = "Click a date to see that version; Compare sets what it \
                     is compared with. Nothing is ever overwritten.";
         ui.label(RichText::new(note).small().color(l.muted));
+    }
+
+    /// A key never used before is set up here, and a spare with it: the
+    /// same secret, which is held until the store is made and no longer.
+    fn new_key(&mut self, ui: &mut Ui) {
+        let l = look(ui);
+        let note = "A new key must be set up first. A spare key gets the \
+                    same secret right then, or never: have both at hand. \
+                    Without a spare, the password is the way in if the key \
+                    is lost.";
+        ui.label(RichText::new(note).small().color(l.muted));
+        ui.horizontal(|ui| {
+            let spare = self.key_secret.is_some();
+            let text = if spare { "Set up a spare key" } else { "Set up a new key" };
+            if ui.button(text).clicked() {
+                let secret = self.key_secret.take();
+                let secret = secret.unwrap_or_else(|| Zeroizing::new(pasa::rand::<20>().to_vec()));
+                self.said = match crate::key_setup(&secret) {
+                    Ok(()) if spare => "The spare is set up: unplug it, and plug the first key in.".into(),
+                    Ok(()) => "The key is set up. For a spare, plug that in now instead.".into(),
+                    Err(e) => format!("{e:#}"),
+                };
+                self.key_secret = Some(secret);
+            }
+        });
     }
 
     /// The entry being made or changed: what it is, and under Advanced

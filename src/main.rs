@@ -33,6 +33,8 @@ pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
+pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
+                             spare with the same secret, now or never: have both at hand
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
                              password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
@@ -62,6 +64,36 @@ fn yubikey(c: &[u8]) -> Result<Secret> {
         String::from_utf8_lossy(&o.stderr)
     );
     Ok(Zeroizing::new(HEXLOWER.decode(o.stdout.trim_ascii())?))
+}
+
+/// A new YubiKey made ready: `secret` (20 bytes) becomes its slot 2's
+/// HMAC-SHA1 secret. Only if the key says that slot is empty: never over
+/// what one holds. A spare is given the same secret, while it is at hand.
+fn key_setup(secret: &[u8]) -> Result<()> {
+    let info = Command::new("ykman").args(["otp", "info"]).output();
+    let info = info.context("ykman (YubiKey Manager) is needed for this")?;
+    ensure!(
+        String::from_utf8_lossy(&info.stdout).contains("Slot 2: empty"),
+        "slot 2 of this YubiKey is in use, or no key is plugged in: nothing \
+         was written"
+    );
+    // The secret goes in where ykman asks for it, not as an argument
+    // any process can read.
+    let mut c = Command::new("ykman")
+        .args(["otp", "chalresp", "--force", "2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let hex = Zeroizing::new(HEXLOWER.encode(secret) + "\n");
+    c.stdin.take().context("ykman")?.write_all(hex.as_bytes())?;
+    let o = c.wait_with_output()?;
+    ensure!(
+        o.status.success(),
+        "ykman: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    Ok(())
 }
 
 /// A new password and, with `yk`, a challenge and the YubiKey's response.
@@ -281,6 +313,21 @@ fn main() -> Result<()> {
             let had = challenge(&std::fs::read(s.dir.join("key"))?).is_some();
             let (pw, c, r) = factors(flag("-y") || had && !flag("-n"))?;
             s.lock(&pw, r.as_ref().map(|r| (&c[..], &r[..])))?
+        }
+        // A new key, and with -s a spare: the same secret, held only here.
+        ["key", ..] => {
+            let secret = Zeroizing::new(pasa::rand::<20>());
+            key_setup(&secret[..])?;
+            eprintln!("This YubiKey is set up.");
+            if flag("-s") {
+                eprintln!("Now plug in the spare instead, and press Enter.");
+                std::io::stdin().read_line(&mut String::new())?;
+                key_setup(&secret[..])?;
+                eprintln!(
+                    "The spare is set up: either key does for the other."
+                );
+            }
+            return Ok(());
         }
         ["quick", "off"] => {
             return Ok(std::fs::remove_file(home().join("quick"))?);
