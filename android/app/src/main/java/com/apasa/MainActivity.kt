@@ -17,6 +17,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import java.io.File
@@ -77,7 +78,25 @@ class MainActivity : ComponentActivity(), Host {
         super.onStop()
         keySecret?.fill(0)
         keySecret = null
-        if (!isChangingConfigurations && !picking) lock()
+        if (isChangingConfigurations || picking) return
+        if (setting("lock") == 0) lock() else main.postDelayed(locker, setting("lock") * 1000L)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        main.removeCallbacks(locker)
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+    private val locker = Runnable { lock() }
+
+    // What Settings changes, kept on this phone: seconds, and for the theme a number.
+    private val settings = mutableStateMapOf<String, Int>()
+    private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0)
+    override fun setting(name: String) = settings.getOrPut(name) { getSharedPreferences("pasa", 0).getInt(name, usual[name] ?: 0) }
+    override fun set(name: String, value: Int) {
+        settings[name] = value
+        getSharedPreferences("pasa", 0).edit().putInt(name, value).apply()
     }
 
     override val hasStore get() = stored
@@ -94,7 +113,7 @@ class MainActivity : ComponentActivity(), Host {
 
     private var quickNow by mutableStateOf<Boolean?>(null)
     override val quick get() = quickNow
-    private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 } }
+    private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 }; readFido() }
     private fun fresh() = ByteArray(32).also { SecureRandom().nextBytes(it) }
 
     override suspend fun create(pw: String, key: Key, pin: String) {
@@ -134,6 +153,37 @@ class MainActivity : ComponentActivity(), Host {
         val r = yubikey(this, Native.quick(dir)!!.copyOf(32))
         handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
         if (sync) io { runCatching { Native.sync(dir, false) } }
+    }
+
+    // Security keys (FIDO2): how many open the store here, and whether a PIN goes with any.
+    private var fidoNow by mutableStateOf(0 to false)
+    override val fidoKeys get() = fidoNow.first
+    override val fidoPin get() = fidoNow.second
+    private fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+    private fun fidoHere() = Native.fido(dir).lines().filter { it.isNotEmpty() }.let { l ->
+        l.firstOrNull()?.let { salt -> hex(salt) to l.drop(1).map { k -> hex(k.substringBefore(' ')) to k.endsWith(" 1") } }
+    }
+    private fun readFido() { fidoNow = fidoHere()?.second.orEmpty().let { it.size to it.any { k -> k.second } } }
+
+    override suspend fun fidoAdd(pin: String) {
+        val salt = Native.fidoSalt(handle)
+        val (cred, uv, secret) = fidoNew(this, salt, pin)
+        io { Native.fidoAdd(handle, salt, cred, uv, secret) }
+        secret.fill(0)
+        readFido()
+    }
+
+    override suspend fun unlockFido(pin: String) {
+        val (salt, keys) = fidoHere() ?: throw Exception("No security key opens this store")
+        val (cred, secret) = fidoSecret(this, keys, salt, pin)
+        handle = io { Native.openFido(dir, cred, secret) }
+        secret.fill(0)
+        if (sync) io { runCatching { Native.sync(dir, false) } }
+    }
+
+    override fun fidoOff() {
+        Native.fidoOff(dir)
+        readFido()
     }
 
     override suspend fun unlock(pw: String) {
@@ -255,7 +305,7 @@ class MainActivity : ComponentActivity(), Host {
         val clip = ClipData.newPlainText("pasa", text)
         clip.description.extras = PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
         cm.setPrimaryClip(clip)
-        Handler(Looper.getMainLooper()).postDelayed({ cm.clearPrimaryClip() }, 45_000)
+        main.postDelayed({ cm.clearPrimaryClip() }, setting("clip") * 1000L)
     }
 
     override suspend fun syncNow() = io { Native.sync(dir, false) }

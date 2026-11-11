@@ -60,7 +60,11 @@ suspend fun writeKey(a: Activity, secret: ByteArray): Unit = withKey(a) { s ->
 }
 
 /** What [use] makes of the next YubiKey tapped or plugged in. */
-private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T {
+private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T =
+    withDevice(a) { d, done -> YubiOtpSession.create(d) { session -> done(runCatching { use(session.value) }) } }
+
+/** The next key tapped or plugged in, handed to [open], which says through its second argument what came of it. */
+suspend fun <T> withDevice(a: Activity, open: (YubiKeyDevice, (Result<T>) -> Unit) -> Unit): T {
     val nfc = nfcOn(a)
     if (!nfc && !plugged(a)) throw NoKey(nfcOff(a))
     val mine = waits.incrementAndGet()
@@ -73,8 +77,7 @@ private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T {
             Unit
         }
         val answer = { d: YubiKeyDevice ->
-            YubiOtpSession.create(d) { session ->
-                val r = runCatching { use(session.value) }
+            open(d) { r ->
                 if (d is NfcYubiKeyDevice) d.remove { stop() } else stop()
                 if (k.isActive) r.onSuccess { k.resume(it) }.onFailure { k.resumeWithException(Exception(said(it))) }
             }
@@ -94,8 +97,12 @@ private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T {
 private class Empty(val enroll: Boolean) : Exception()
 private class InUse : Exception()
 
+/** Already in the words for someone holding the key. */
+class Said(text: String) : Exception(text)
+
 /** What went wrong with the key, for someone holding it. */
-private fun said(e: Throwable) = when {
+private fun said(e: Throwable): String = when {
+    e is Said -> e.message!!
     e is android.nfc.TagLostException || e.message?.contains("Tag was lost") == true ->
         "The key moved away too soon: hold it still against the phone until this is done."
     e is java.io.IOException -> "The key did not answer: hold it still against the phone, or plug it in. (${e.message})"

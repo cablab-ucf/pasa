@@ -11,8 +11,8 @@ android {
         applicationId = "com.apasa"
         minSdk = 26
         targetSdk = 35
-        versionCode = 18
-        versionName = "0.4.6"
+        versionCode = 19
+        versionName = "0.4.7"
         // pushir: apps signed by the same key share one connection.
         manifestPlaceholders["pushirGroup"] = "center.cxn"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
@@ -68,6 +68,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("com.yubico.yubikit:android:3.3.0")
     implementation("com.yubico.yubikit:yubiotp:3.3.0")
+    implementation("com.yubico.yubikit:fido:3.3.0")
     implementation(project(":pairir"))
     implementation(project(":pushir"))
 }

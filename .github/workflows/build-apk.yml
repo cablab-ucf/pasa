@@ -144,6 +144,11 @@ jobs:
             ./gradlew --no-daemon assembleDebug -Ppasa.fast=true
           fi
 
+      # What talks to a hardware key (CTAP2, slot 2) opens no connection:
+      # not the app's code for it, not Yubico's library as it was resolved.
+      - name: The key code reaches no network
+        run: sh android/no-network.sh
+
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: env.MAIN == 'true' && steps.gradle.outputs.cache-hit != 'true'
         with:

@@ -33,6 +33,12 @@ pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
+pasa ctap | ctap off         let the security key plugged in open the store here beside
+                             the password, by CTAP2 (FIDO2 without the network: only
+                             this machine and the key, over USB); again for a spare, at
+                             any time. off: none does. Needs libfido2's tools.
+pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
+                             spare with the same secret, now or never: have both at hand
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
                              password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
@@ -64,6 +70,166 @@ fn yubikey(c: &[u8]) -> Result<Secret> {
     Ok(Zeroizing::new(HEXLOWER.decode(o.stdout.trim_ascii())?))
 }
 
+/// A new YubiKey made ready: `secret` (20 bytes) becomes its slot 2's
+/// HMAC-SHA1 secret. Only if the key says that slot is empty: never over
+/// what one holds. A spare is given the same secret, while it is at hand.
+fn key_setup(secret: &[u8]) -> Result<()> {
+    let info = Command::new("ykman").args(["otp", "info"]).output();
+    let info = info.context("ykman (YubiKey Manager) is needed for this")?;
+    ensure!(
+        String::from_utf8_lossy(&info.stdout).contains("Slot 2: empty"),
+        "slot 2 of this YubiKey is in use, or no key is plugged in: nothing \
+         was written"
+    );
+    // The secret goes in where ykman asks for it, not as an argument
+    // any process can read.
+    let mut c = Command::new("ykman")
+        .args(["otp", "chalresp", "--force", "2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let hex = Zeroizing::new(HEXLOWER.encode(secret) + "\n");
+    c.stdin.take().context("ykman")?.write_all(hex.as_bytes())?;
+    let o = c.wait_with_output()?;
+    ensure!(
+        o.status.success(),
+        "ykman: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    Ok(())
+}
+
+/// One of libfido2's tools (fido2-token, fido2-cred, fido2-assert) on
+/// `input`, its lines out. CTAP2 goes between this computer and the key
+/// alone: no server, no network. `pin`: given where the tool asks for
+/// it (a window has no terminal for it to ask on); `None`: it asks on
+/// the terminal itself.
+fn fido_tool(
+    tool: &str,
+    flags: &[&str],
+    dev: &str,
+    input: &str,
+    pin: Option<&[u8]>,
+) -> Result<Vec<String>> {
+    // The input holds nothing secret: random bytes, a name, the
+    // credential and the salt the `ctap` file has in the clear.
+    let at = home().join(format!(".ctap-{}", HEXLOWER.encode(&rand::<4>())));
+    pasa::write(&at, input.as_bytes())?;
+    // Away from the terminal, the tool reads the PIN where we write it.
+    let detach =
+        pin.is_some() && Command::new("setsid").arg("-V").output().is_ok();
+    let mut c = Command::new(if detach { "setsid" } else { tool });
+    c.args(detach.then_some(["-w", tool]).into_iter().flatten());
+    c.args(flags).arg("-i").arg(&at).arg(dev);
+    c.stdout(Stdio::piped()).stderr(Stdio::piped());
+    c.stdin(if pin.is_some() { Stdio::piped() } else { Stdio::inherit() });
+    let run = c.spawn().and_then(|mut c| {
+        if let (Some(pin), Some(mut i)) = (pin, c.stdin.take()) {
+            i.write_all(&[pin, b"\n"].concat())?;
+        }
+        c.wait_with_output()
+    });
+    let _ = std::fs::remove_file(&at);
+    let o = run.with_context(|| {
+        format!("{tool} (libfido2's tools) is needed for security keys")
+    })?;
+    let said = String::from_utf8_lossy(&o.stderr);
+    ensure!(o.status.success(), "{}", said.trim());
+    Ok(String::from_utf8(o.stdout)?.lines().map(Into::into).collect())
+}
+
+/// The security key plugged in (the first, of several), and whether it
+/// has a PIN.
+fn fido_key() -> Result<(String, bool)> {
+    let l = Command::new("fido2-token").arg("-L").output();
+    let l = l.context(
+        "fido2-token (libfido2's tools) is needed for security keys",
+    )?;
+    let l = String::from_utf8_lossy(&l.stdout).into_owned();
+    let dev = l.lines().next().and_then(|l| l.split_once(": "));
+    let dev = dev.context("no security key is plugged in")?.0.to_string();
+    let i = Command::new("fido2-token").args(["-I", &dev]).output()?;
+    let i = String::from_utf8_lossy(&i.stdout).into_owned();
+    let options = i.lines().find(|l| l.starts_with("options:"));
+    let pin =
+        options.is_some_and(|o| o.split([' ', ',']).any(|w| w == "clientPin"));
+    Ok((dev, pin))
+}
+
+const B64: data_encoding::Encoding = data_encoding::BASE64;
+
+/// The key's secret for credential `cred` and `salt` (hmac-secret): with
+/// its PIN if the credential was made with one, since the secret differs.
+fn fido_secret(
+    dev: &str,
+    cred: &[u8],
+    salt: &[u8],
+    pin: bool,
+    typed: Option<&[u8]>,
+) -> Result<Secret> {
+    let input = format!(
+        "{}\npasa\n{}\n{}\n",
+        B64.encode(&rand::<32>()),
+        B64.encode(cred),
+        B64.encode(salt)
+    );
+    let args: &[&str] =
+        if pin { &["-G", "-h", "-t", "pin=true"] } else { &["-G", "-h"] };
+    eprintln!("Touch your security key");
+    let out =
+        fido_tool("fido2-assert", args, dev, &input, typed.filter(|_| pin))?;
+    let secret = out.get(4).context("the key gave no secret")?;
+    let secret = Zeroizing::new(B64.decode(secret.as_bytes())?);
+    ensure!(secret.len() == 32, "the key gave no secret");
+    Ok(secret)
+}
+
+/// Whether the key holds `cred`, asked without a touch.
+fn fido_holds(dev: &str, cred: &[u8]) -> bool {
+    let input =
+        format!("{}\npasa\n{}\n", B64.encode(&rand::<32>()), B64.encode(cred));
+    fido_tool("fido2-assert", &["-G", "-t", "up=false"], dev, &input, None)
+        .is_ok()
+}
+
+/// Let the security key plugged in open the store on this device: a new
+/// credential on it (not one of those a key has room for only a few
+/// of), and the key the password opens sealed to its secret. `typed`:
+/// its PIN, from a window.
+pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
+    let (dev, pin) = fido_key()?;
+    let input = format!(
+        "{}\npasa\npasa\n{}\n",
+        B64.encode(&rand::<32>()),
+        B64.encode(&rand::<16>())
+    );
+    eprintln!("Touch your security key");
+    let out = fido_tool(
+        "fido2-cred",
+        &["-M", "-h"],
+        &dev,
+        &input,
+        typed.filter(|_| pin),
+    )?;
+    let cred = out.get(4).context("the key made no credential")?;
+    let cred = B64.decode(cred.as_bytes())?;
+    let salt = s.fido_salt();
+    s.fido_add(&salt, &cred, pin, &fido_secret(&dev, &cred, &salt, pin, typed)?)
+}
+
+/// Open by the security key plugged in, if it is one of this store's.
+pub(crate) fn unlock_fido(typed: Option<&[u8]>) -> Result<Store> {
+    let f = pasa::fido(&home()).context("no security key opens this store")?;
+    let (dev, _) = fido_key()?;
+    let one = f.keys.len() == 1;
+    let key = f.keys.iter().find(|k| one || fido_holds(&dev, &k.0));
+    let (cred, pin) =
+        key.context("this security key is not one of this store's")?;
+    let secret = fido_secret(&dev, cred, &f.salt, *pin, typed)?;
+    adopted(Store::open_fido(&home(), cred, &secret)?)
+}
+
 /// A new password and, with `yk`, a challenge and the YubiKey's response.
 fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
     let (pw, c) = (new_password()?, rand::<32>());
@@ -73,6 +239,13 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 /// With quick unlock on: the YubiKey and the PIN; else, or if that
 /// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
+    // A security key of this store's, plugged in: it opens it.
+    if pasa::fido(&home()).is_some() && fido_key().is_ok() {
+        match unlock_fido(None) {
+            Ok(s) => return Ok(s),
+            Err(e) => eprintln!("{e:#}"),
+        }
+    }
     if let Some((c, pin)) = pasa::quick(&home()) {
         let typed = match pin {
             true => ask("PIN (Enter: the password instead): ")?,
@@ -281,6 +454,23 @@ fn main() -> Result<()> {
             let had = challenge(&std::fs::read(s.dir.join("key"))?).is_some();
             let (pw, c, r) = factors(flag("-y") || had && !flag("-n"))?;
             s.lock(&pw, r.as_ref().map(|r| (&c[..], &r[..])))?
+        }
+        ["ctap", "off"] => return pasa::fido_off(&home(), None),
+        ["ctap", ..] => return fido_add(&unlock(&ask("Password: ")?)?, None),
+        // A new key, and with -s a spare: the same secret, held only here.
+        ["key", ..] => {
+            let secret = Zeroizing::new(pasa::rand::<20>());
+            key_setup(&secret[..])?;
+            eprintln!("This YubiKey is set up.");
+            if flag("-s") {
+                eprintln!("Now plug in the spare instead, and press Enter.");
+                std::io::stdin().read_line(&mut String::new())?;
+                key_setup(&secret[..])?;
+                eprintln!(
+                    "The spare is set up: either key does for the other."
+                );
+            }
+            return Ok(());
         }
         ["quick", "off"] => {
             return Ok(std::fs::remove_file(home().join("quick"))?);

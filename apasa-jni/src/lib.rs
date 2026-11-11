@@ -188,6 +188,89 @@ pub extern "system" fn Java_com_apasa_Native_quickOff<'l>(
     })
 }
 
+/// The security keys that open the store here: the salt, then a line a
+/// key (its credential, a space, 1 if its PIN goes with it), hex; "" if
+/// none.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_fido<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let hex =
+            |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let f = pasa::fido(Path::new(&dir.to_string()));
+        let lines = f.map_or(vec![], |f| {
+            let key =
+                |k: &(Vec<u8>, bool)| format!("{} {}", hex(&k.0), k.1 as u8);
+            std::iter::once(hex(&f.salt))
+                .chain(f.keys.iter().map(key))
+                .collect()
+        });
+        Ok(e.new_string(lines.join("\n"))?)
+    })
+}
+
+/// The salt a security key is asked with for an open store.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_fidoSalt<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> JByteArray<'l> {
+    run(&mut env, |e| {
+        Ok(e.byte_array_from_slice(&with(h, |s| Ok(s.fido_salt()))?)?)
+    })
+}
+
+/// Let a security key open an open store here ([`pasa::Store::fido_add`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_fidoAdd<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    salt: JByteArray<'l>,
+    cred: JByteArray<'l>,
+    pin: bool,
+    secret: JByteArray<'l>,
+) {
+    run(&mut env, |e| {
+        let salt = bytes(e, &salt)?.unwrap_or_default();
+        let cred = bytes(e, &cred)?.unwrap_or_default();
+        let secret =
+            zeroize::Zeroizing::new(bytes(e, &secret)?.unwrap_or_default());
+        with(h, |s| s.fido_add(&salt, &cred, pin, &secret))
+    })
+}
+
+/// Open by a security key's answer ([`pasa::Store::open_fido`]).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_openFido<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+    cred: JByteArray<'l>,
+    secret: JByteArray<'l>,
+) -> jlong {
+    run(&mut env, |e| {
+        let cred = bytes(e, &cred)?.unwrap_or_default();
+        let secret =
+            zeroize::Zeroizing::new(bytes(e, &secret)?.unwrap_or_default());
+        opened(Store::open_fido(Path::new(&dir.to_string()), &cred, &secret)?)
+    })
+}
+
+/// No security key opens the store here any more.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_fidoOff<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) {
+    run(&mut env, |_| Ok(pasa::fido_off(Path::new(&dir.to_string()), None)?))
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_close<'l>(
     _: EnvUnowned<'l>,
