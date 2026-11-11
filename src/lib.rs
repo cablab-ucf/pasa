@@ -968,13 +968,12 @@ impl Form {
             pass: l.next().unwrap_or_default().into(),
             ..Form::default()
         };
-        // `key: value`, the key a short name: a field of its own.
+        // `key: value`, the key short, whatever it is spelt with: a
+        // field of its own. (`https://...` has no space after its colon.)
         let named = |l: &str| {
-            let name = |c: char| c.is_ascii_alphanumeric() || " _-".contains(c);
             l.split_once(':').is_some_and(|(k, v)| {
-                k.starts_with(|c: char| c.is_ascii_alphabetic())
-                    && k.len() <= 32
-                    && k.chars().all(name)
+                k.starts_with(char::is_alphanumeric)
+                    && k.chars().count() <= 32
                     && (v.is_empty() || v.starts_with(' '))
             })
         };
@@ -1034,8 +1033,16 @@ impl Form {
                 t += &format!("{k}{}\n", one(v.trim()));
             }
         }
-        if !self.more.trim().is_empty() {
-            t += &format!("{}\n", self.more.trim_end());
+        // A field typed as `key:value`, or with a wide colon, is one all
+        // the same: written as [`Form::parse`] knows it.
+        for l in self.more.trim_end().lines().filter(|l| !l.trim().is_empty()) {
+            let l = l.replace('\u{ff1a}', ":");
+            t += &match l.split_once(':') {
+                Some((k, v)) if !l.starts_with("  ") => {
+                    format!("{}: {}\n", k.trim(), v.trim())
+                }
+                _ => format!("{l}\n"),
+            };
         }
         if !self.notes.trim().is_empty() {
             t += &format!("{}\n", self.notes.trim_end());
@@ -1378,6 +1385,16 @@ mod tests {
         let bare = Form { pass: "a\nb".into(), ..Form::default() };
         assert_eq!(bare.text(), "a b\n");
         assert_eq!(Form::parse(""), Form::default());
+        // Fields as people type them stay fields, and notes stay notes.
+        let typed =
+            "Card #:1234\nacct.no : 5\n2nd e-mail\u{ff1a}a@b.c\nQ&A (old): x";
+        let f =
+            Form { more: typed.into(), notes: "see https://a.b".into(), ..f };
+        let back = Form::parse(&f.text());
+        let fields =
+            "Card #: 1234\nacct.no: 5\n2nd e-mail: a@b.c\nQ&A (old): x";
+        assert_eq!((&*back.more, &*back.notes), (fields, "see https://a.b"));
+        assert_eq!(Form::parse(&back.text()), back);
     }
 
     #[test]
