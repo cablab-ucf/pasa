@@ -4,6 +4,8 @@ pasa on Android: a Compose UI (`Ui.kt`, free of Android, so it renders
 on a desk too; `MainActivity.kt` is what it asks of the phone) over the
 same Rust (`apasa-jni`).
 
+- Several stores side by side, one per person or purpose: Store, on the
+  lock screen.
 - Unlock by password (and a YubiKey's slot 2 held to the phone or
   plugged in), or by quick unlock: a tap of the key and a PIN. Locks when
   the app leaves the screen.

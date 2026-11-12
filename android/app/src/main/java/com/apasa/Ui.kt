@@ -138,6 +138,11 @@ fun changes(was: Form, now: Form): List<Pair<String, List<Pair<Char, String>>>> 
 
 interface Host {
     val hasStore: Boolean
+    /** Folder names, "pasa" first; [storeName] is the open one. */
+    val stores: List<String>
+    val storeName: String
+    /** Locks, and opens store [name]: a new name makes a new store. */
+    fun useStore(name: String)
     val needsKey: Boolean
     val open: Boolean
     val version: String
@@ -271,9 +276,36 @@ fun Pasa(host: Host, nav: Nav, dark: Boolean = isSystemInDarkTheme()) {
                     nav.joining -> Join(host, nav)
                     else -> Create(host, nav)
                 }
+                if (!host.open) Stores(host)
             }
         }
     }
+}
+
+@Composable
+private fun Stores(host: Host) {
+    var menu by remember { mutableStateOf(false) }
+    var naming by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    val shown = { s: String -> s.removePrefix("pasa-") }
+    Box(Modifier.padding(8.dp)) {
+        TextButton({ menu = true }) { Text("Store: ${shown(host.storeName)}  ▾") }
+        DropdownMenu(menu, { menu = false }) {
+            for (s in host.stores) DropdownMenuItem({ Text(shown(s)) }, { menu = false; if (s != host.storeName) host.useStore(s) })
+            DropdownMenuItem({ Text("New store…") }, { menu = false; naming = true })
+        }
+    }
+    if (naming) AlertDialog(
+        { naming = false }, title = { Text("New store") },
+        text = {
+            OutlinedTextField(
+                name, { t -> name = t.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it in "-_" }.take(32) },
+                label = { Text("Its name: one per person or purpose") }, singleLine = true,
+            )
+        },
+        confirmButton = { TextButton({ naming = false; host.useStore("pasa-$name") }, enabled = name.isNotEmpty()) { Text("Open") } },
+        dismissButton = { TextButton({ naming = false }) { Text("Cancel") } },
+    )
 }
 
 private data class Work(val busy: Boolean, val err: String, val go: (suspend () -> Unit) -> Unit, val stop: () -> Unit)

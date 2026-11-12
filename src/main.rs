@@ -36,6 +36,7 @@ mod tui;
 mod view;
 
 const USAGE: &str = "\
+pasa --dir DIR COMMAND       on the store in DIR, not ~/.pasa (or PASA_DIR)
 pasa [ls]                    names
 pasa tui | gui               browse, copy, edit: one unlock
 pasa [show] NAME [FIELD]     entry, or a field: pass, user, otp, ...
@@ -667,7 +668,12 @@ fn record_in(dir: &Path) {
 }
 
 fn main() -> Result<()> {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+    let mut a: Vec<String> = std::env::args().skip(1).collect();
+    if a.first().is_some_and(|f| f == "--dir") {
+        ensure!(a.len() > 1, "{USAGE}");
+        pasa::set_home(&a[1]);
+        a.drain(..2);
+    }
     let a: Vec<&str> = a.iter().map(String::as_str).collect();
     let flag = |f| a.contains(&f);
     match a[..] {
@@ -938,6 +944,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// pasa CMD on store `dir`, remembered, in a new process: nothing of this
+/// one's unlock goes with it.
+#[cfg(any(feature = "tui", feature = "gui"))]
+fn reopen(dir: &Path, cmd: &str) -> Result<Command> {
+    pasa::remember(dir)?;
+    let mut c = Command::new(std::env::current_exe()?);
+    c.arg("--dir").arg(dir).arg(cmd);
+    Ok(c)
+}
+
 /// `pasa sync` beside a view, unseen: what it brings shows as `v/` changes.
 #[cfg(any(feature = "tui", feature = "gui"))]
 fn aside(news: bool) {
@@ -948,6 +964,7 @@ fn aside(news: bool) {
         let c = std::env::current_exe().map(Command::new);
         let _ = c.map(|mut c| {
             c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
+            c.env("PASA_DIR", home());
             c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         });
     }

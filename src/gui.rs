@@ -377,6 +377,8 @@ struct App {
     pin: Zeroizing<String>,
     made: (Zeroizing<String>, u32),
     joining: bool,
+    /// A store's folder, typed.
+    other: String,
     peer: String,
     code: String,
     pair_pw: Zeroizing<String>,
@@ -622,6 +624,9 @@ impl eframe::App for App {
             }
             ui.ctx().request_repaint();
         }
+        if self.v.is_none() {
+            self.stores(ui);
+        }
         match self.v.take() {
             Some(v) => self.store(ui, v),
             None if home().join("key").exists() => self.unlock(ui),
@@ -809,6 +814,52 @@ impl App {
         if corner(ui, "A store on another device already?", "Join it") {
             (self.joining, self.said) = (true, String::new());
         }
+    }
+
+    /// Another store opens in a new window, its own process: this one,
+    /// locked, closes.
+    fn stores(&mut self, ui: &Ui) {
+        let here = home();
+        let short = |p: &std::path::Path| {
+            let h = std::env::home_dir().unwrap_or_default();
+            p.strip_prefix(&h).map_or(p.display().to_string(), |r| {
+                format!("~/{}", r.display())
+            })
+        };
+        let a = Area::new(Id::unique("stores"))
+            .anchor(Align2::LEFT_TOP, [16.0, 12.0]);
+        a.show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                let mut to = None;
+                let c =
+                    ComboBox::from_id_salt("store").selected_text(short(&here));
+                c.show_ui(ui, |ui| {
+                    for s in pasa::stores() {
+                        if ui.selectable_label(s == here, short(&s)).clicked() {
+                            to = Some(s);
+                        }
+                    }
+                });
+                let t = TextEdit::singleline(&mut self.other)
+                    .hint_text("Another folder")
+                    .desired_width(150.0);
+                let t = ui.add(t);
+                let open = ui.button("Open").clicked() || entered(ui, &t);
+                if open && !self.other.trim().is_empty() {
+                    to = Some(pasa::path(&self.other));
+                }
+                if let Some(d) = to.filter(|d| *d != here) {
+                    match crate::reopen(&d, "gui")
+                        .and_then(|mut c| Ok(c.spawn()?))
+                    {
+                        Ok(_) => ui
+                            .ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(e) => self.said = format!("{e:#}"),
+                    }
+                }
+            });
+        });
     }
 
     fn join(&mut self, ui: &mut Ui) {
@@ -2131,6 +2182,7 @@ impl App {
         std::thread::spawn(move || {
             let run = std::env::current_exe().and_then(|p| {
                 std::process::Command::new(p)
+                    .env("PASA_DIR", home())
                     .arg("sync")
                     .args(news.then_some("--news"))
                     .stdin(std::process::Stdio::null())
