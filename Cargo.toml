@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 rust-version = "1.97"
 description = "A tiny password store: sealed versions, synced by union"
 
-# The program needs its features; the library (Android's) does not.
+# Android builds the library alone.
 [[bin]]
 name = "pasa"
 path = "src/main.rs"
@@ -18,9 +18,7 @@ members = ["kdbx2pasa", "apasa-jni"]
 [features]
 default = ["sync", "tui", "scan", "fido"]
 sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode", "dep:landlock"]
-# A QR code by the camera, or in a picture (desktop; Android scans with ZXing).
 scan = ["sync", "dep:rqrr", "dep:rxing", "dep:nokhwa", "dep:image"]
-# Security keys by CTAP2 over USB, in-process (desktop; Android: Yubico's kit).
 fido = ["dep:authenticator", "dep:openssl", "dep:pcsc"]
 tui = ["dep:crossterm"]
 gui = ["dep:eframe", "dep:winit", "scan", "fido"]
@@ -45,30 +43,23 @@ pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "6e7faa92e6732834
 iroh = { version = "1.4", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
-# Read a pairing QR code in camera frames (pure Rust): each reads frames
-# the other misses.
+# Two QR decoders: each reads frames the other misses.
 rqrr = { version = "0.11", optional = true }
 rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"], optional = true }
-# The camera, in this process: AVFoundation (macOS), V4L2 (Linux). Its own
-# MJPEG decoder (C) left out: `image` (Rust) reads JPEG and PNG.
+# No C MJPEG decoder: `image` decodes.
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
-# CTAP2 to security keys over USB HID: Firefox's own. No tool to install, no
-# keyboard access (macOS asks no Input Monitoring). Its key agreement and
-# ciphers by AWS-LC (built with CMake), the library under the network side's
-# TLS too, whose P-256 is constant time and formally verified; its RustCrypto
-# backend's (p256 0.13 < crypto-bigint 0.5) is not (RUSTSEC-2026-0387).
+# CTAP2 on AWS-LC: constant-time P-256 (the RustCrypto backend's p256 0.13
+# is not: RUSTSEC-2026-0387).
 authenticator = { version = "0.5", default-features = false, features = ["crypto_openssl"], optional = true }
 openssl = { version = "0.10", default-features = false, features = ["aws-lc"], optional = true }
-# Smart cards: a YubiKey held to an NFC reader (or its CCID side, plugged
-# in), through the system's PC/SC (pcsc-lite; macOS's own).
+# YubiKeys on NFC readers (or CCID) through PC/SC.
 pcsc = { version = "2.9", optional = true }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
-# The frame (close, minimise, maximise) that GNOME on Wayland leaves to the app.
+# Window frame, which GNOME on Wayland leaves to the app.
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"], optional = true }
 
-# The network side confines itself to v/ and net/.
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 landlock = { version = "0.4", optional = true }
 

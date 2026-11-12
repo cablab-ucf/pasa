@@ -1,23 +1,12 @@
 name: Build
 
-# Tests on Linux and macOS; the APK on Linux. The debug APK artifact is for
-# testing only (the runner's throwaway debug key). A version tag (v*), or a
-# run by hand naming one (the release then makes the tag), builds
-# an unsigned release APK with no secrets in reach, then a separate job that
-# runs no build code signs it with apksigner and publishes it with its
-# SHA-256.
-#
-# Supply chain: third-party actions pinned to commit SHAs, the Rust toolchain
-# to a version, Cargo to the committed lockfile (checked against RustSec),
-# the Gradle wrapper validated and its distribution pinned by SHA-256,
-# read-only token, no persisted git credentials.
-#
-# Caches (third-party crates, compiled; Gradle's downloads and task outputs)
-# are saved by runs on main alone and read by every run: a pull request
-# cannot write what a release reads.
+# A release (tag v*, or a run by hand naming one) builds unsigned artifacts
+# with no secrets in reach; a separate job that runs no build code signs and
+# publishes them. Actions pinned by SHA, toolchain by version, Cargo by lockfile
+# (RustSec-checked), Gradle wrapper validated, read-only token. Only runs on
+# main save caches, so a pull request cannot write what a release reads.
 
-# A release tag, once per pull request (Markdown alone runs nothing), or by
-# hand: not again on every merge. Minutes are scarce.
+# Minutes are scarce: not on every merge.
 on:
   push:
     tags: ["v*"]
@@ -36,7 +25,6 @@ permissions:
   contents: read
 
 env:
-  # The release's tag: pushed, or named by hand. Empty: no release.
   TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/v') && github.ref_name || '') }}
   NDK_VERSION: "30.0.16248370"
   RUST_VERSION: "1.97.0"
@@ -91,8 +79,7 @@ jobs:
 
       - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
         with:
-          # The default also installs the legacy `tools` package, which the
-          # SDK repository no longer provides (sdkmanager exits 1).
+          # The default asks for the legacy `tools` package, now gone (sdkmanager exits 1).
           packages: platform-tools
 
       - name: Install Android NDK
@@ -124,9 +111,7 @@ jobs:
           grep -qx "version = \"${TAG#v}\"" Cargo.toml
           grep -q "versionName = \"${TAG#v}\"" android/app/build.gradle.kts
 
-      # Not for a release: the native library as an earlier run built it
-      # from these very Rust sources, so a change to the Kotlin alone
-      # compiles no Rust.
+      # Not for a release: reuse the native library built from these Rust sources.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: so
         if: env.TAG == ''
@@ -134,8 +119,7 @@ jobs:
           path: android/app/src/main/jniLibs
           key: so-${{ env.NDK_VERSION }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**', 'apasa-jni/**', '.cargo/**', 'android/app/build.gradle.kts') }}
 
-      # A release: both APKs, both ABIs, optimised as a whole. Otherwise the
-      # debug APK alone, for phones, quickly (-Ppasa.fast).
+      # Release: both APKs and ABIs; else the debug APK, quickly.
       - name: Build the APKs
         working-directory: android
         env:
@@ -147,8 +131,7 @@ jobs:
             ./gradlew --no-daemon assembleDebug -Ppasa.fast=true
           fi
 
-      # What talks to a hardware key (CTAP2, slot 2) opens no connection:
-      # not the app's code for it, not Yubico's library as it was resolved.
+      # The hardware-key code, Yubico's library included, opens no connection.
       - name: The key code reaches no network
         run: sh android/no-network.sh
 
@@ -173,7 +156,6 @@ jobs:
           path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-  # For a release: the desktop binary (cli, tui and gui in one).
   desktop:
     if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/v')
     strategy:
@@ -213,8 +195,7 @@ jobs:
     if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/v')
     needs: [test, apk, desktop]
     runs-on: ubuntu-latest
-    # The signing secrets live in this environment, used only after a
-    # required reviewer approves.
+    # Signing secrets: this environment, after a required reviewer approves.
     environment: release
     permissions:
       contents: write

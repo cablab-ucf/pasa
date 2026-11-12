@@ -1,37 +1,26 @@
 # apasa
 
-pasa on Android: a thin Compose UI over the same Rust (`apasa-jni`).
-`Ui.kt` is the screens, free of Android so they render on a desk too;
-`MainActivity.kt` is what they ask of the phone.
+pasa on Android: a Compose UI (`Ui.kt`, free of Android, so it renders
+on a desk too; `MainActivity.kt` is what it asks of the phone) over the
+same Rust (`apasa-jni`).
 
-- First run: a password and, if wanted, a YubiKey make a new store;
-  joining one from another device (its code, typed or scanned) is the
-  small link in the corner.
-- Then the desktop window's layout and words: entries by group with their
-  user names, an entry's fields each with its copy, a form to edit them,
-  a password generator, devices (pair, forget, sync) and settings.
-- Unlock with the password and, if the store has one, a YubiKey held to the
-  phone or plugged in (HMAC-SHA1 slot 2); or, with quick unlock on, by a tap of the key and a
-  PIN, the password staying the other way in. Locks whenever the app leaves the screen.
-- Copy password, user or TOTP (cleared after 45 s, marked sensitive).
-  FLAG_SECURE, overlays hidden, no backup or device transfer.
-- Wakes come through pushir, the phone's one connection shared with the
-  group's other apps (`pushirGroup` = `center.cxn`, same signing key);
-  whoever holds it hands them over unopened. The app also syncs on unlock,
-  after each change, and when that connection comes back, and serves while
-  it is on the screen. Devices, Add a device shows a QR code (its password
-  first, never beside it) or a code to type; Join a store scans one and
-  then asks for its password, and syncs; the store's password opens it
-  after. Neither pairing nor syncing asks for that password or the key.
-- Unlike the desktop, the network side runs inside the app's process:
-  Android gives an app no way to keep part of itself from the app's own
-  files (the network process an isolated one could not open sockets), so
-  it could read `key`, sealed, and the memory of an open store.
+- Unlock by password (and a YubiKey's slot 2 held to the phone or
+  plugged in), or by quick unlock: a tap of the key and a PIN. Locks when
+  the app leaves the screen.
+- Copies are cleared after 45 s and marked sensitive; FLAG_SECURE,
+  overlays hidden, no backup or device transfer.
+- Wakes come through pushir: one connection shared by the apps of the
+  group `pushirGroup` = `center.cxn` (same signing key), which hand
+  messages over unopened. The app syncs on unlock, after each change and
+  when that connection returns, and serves while on the screen.
+- The network side runs in the app's process: an isolated process could
+  not open sockets, so nothing keeps it from `key` (sealed) or an open
+  store's memory.
 
 ```sh
 rustup target add aarch64-linux-android x86_64-linux-android
 cargo install --locked cargo-ndk
 git submodule update --init
 cd android && ./gradlew assembleDebug   # ANDROID_HOME, ANDROID_NDK_HOME (NDK 30)
-./gradlew installDebug -Ppasa.fast=true # to try a change: seconds, not minutes
+./gradlew installDebug -Ppasa.fast=true # a quick build to try a change
 ```
