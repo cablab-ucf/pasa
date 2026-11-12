@@ -1314,7 +1314,8 @@ mod tests {
             .join(format!("pasa-ed-{}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
         let ed = d.join("ed.sh");
-        let script = "#!/bin/sh\nprintf 'new\\n' > \"$1\"\n\
+        let script = "#!/bin/sh\n[ \"$1\" = --version ] && exit\n\
+                      printf 'new\\n' > \"$1\"\n\
                       cp \"$1\" \"$1.swp\"; cp \"$1\" \"$1~\"\n\
                       dirname \"$1\" > \"$0.at\"\n";
         fs::write(&ed, script).unwrap();
