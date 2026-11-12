@@ -108,19 +108,29 @@ two devices changing an entry apart show up in `pasa ls` until an edit
 follows the winner. A file alone tells nothing: not its entry, not its
 history. Back up `~/.pasa` with anything.
 
-`git init ~/.pasa/store` and pasa commits each new version there, and
-pushes if a remote is set (`git -C ~/.pasa/store remote add origin URL`,
-then `git -C ~/.pasa/store push -u origin HEAD` once): a remote holds what
-`serve` does, ciphertext, and learns when you change things. git's whole
+`git init ~/.pasa/store` and pasa commits each new version there, and,
+while sync is on, pushes if a remote is set (`git -C ~/.pasa/store remote
+add origin URL`, then `git -C ~/.pasa/store push -u origin HEAD` once): a
+remote holds what `serve` does, ciphertext, and learns when you change
+things. git's whole
 world is `store/`: the versions, and no key, so no git command, however
 mistaken, reaches one. The network side writes in `store/v/`, never in
 `store/.git`, so no hook or config of its can run; hooks never run
 anyway, and only versions are committed (a name of 32 hex digits, an age
-file), not whatever else lies in `v/`. Versions in `~/.pasa/v/` (before)
-move into `store/v/` by themselves, and a repository made there
-(`v/.git`) up to `store/.git`, its hooks dropped and its config cut to
-its remotes and branches. A version deleted is then named by `pasa ls`
-and restored by `git -C ~/.pasa/store checkout v`.
+file), not whatever else lies in `v/`. A version deleted is then named by
+`pasa ls` and restored by `git -C ~/.pasa/store checkout v`. Versions in
+`~/.pasa/v/` (before) move into `store/v/` by themselves; a repository
+made there (`v/.git`) moves with them, and pasa neither runs it nor
+adopts it, since the network side could have written it: nothing is
+committed until it is out of `v/`. If you made it, and trust it:
+
+```sh
+mv ~/.pasa/store/v/.git ~/pasa-old.git
+git init ~/.pasa/store
+git -C ~/.pasa/store fetch ~/pasa-old.git HEAD   # its history; runs nothing of it
+git -C ~/.pasa/store reset --soft FETCH_HEAD     # the next commit moves it under v/
+git -C ~/.pasa/store remote add origin URL       # its remote, as you know it
+```
 
 `pasa edit` (and `^E` in the terminal browser) hands `$EDITOR` a file in a directory of its own (the owner
 alone), on a file system in memory where there is one (Linux:

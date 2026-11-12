@@ -677,55 +677,8 @@ fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
     o.status.success().then_some(o.stdout)
 }
 
-/// A repository made in `v/` before (`git init ~/.pasa/v`), which moved
-/// with it into `store/v/`, moves up to `store/.git`. The network side
-/// could write where it lay, so its hooks go, and of its config only what
-/// names remotes and branches stays.
-fn git_moved(dir: &Path) {
-    let old = pasa::versions(dir).join(".git");
-    let new = dir.join("store").join(".git");
-    if !old.is_dir() || new.exists() {
-        return;
-    }
-    let mut c = Command::new("git");
-    c.args(["config", "-z", "--file"]).arg(old.join("config"));
-    let keep = c.args(["--get-regexp", "."]).output().ok();
-    let keep = keep.map(|o| o.stdout).unwrap_or_default();
-    let kept = |k: &str| {
-        let p: Vec<&str> = k.split('.').collect();
-        matches!(
-            p[..],
-            ["remote", _, "url" | "pushurl" | "fetch"]
-                | ["branch", _, "remote" | "merge"]
-                | ["core", "repositoryformatversion"]
-                | ["extensions", _]
-        )
-    };
-    if std::fs::rename(&old, &new).is_err() {
-        return;
-    }
-    let _ = std::fs::remove_dir_all(new.join("hooks"));
-    let cfg = new.join("config");
-    let _ = std::fs::write(&cfg, "[core]\n\tbare = false\n");
-    for e in keep.split(|b| *b == 0).filter_map(|e| std::str::from_utf8(e).ok())
-    {
-        if let Some((k, v)) = e.split_once('\n').filter(|(k, _)| kept(k)) {
-            let mut c = Command::new("git");
-            c.args(["config", "--file"]).arg(&cfg).args(["--add", k, v]);
-            let _ = c.output();
-        }
-    }
-    // What it held was the versions in v/; they are now under v/ here.
-    let _ = git(dir, &["rm", "-rq", "--cached", "--ignore-unmatch", "."], None);
-    eprintln!(
-        "pasa: the git repository moved from v/.git to store/.git, where \
-         the network side cannot write; its hooks were dropped, and of its \
-         config only remotes and branches kept"
-    );
-}
-
-/// Commit the versions `store/v/` gained, and push if that has somewhere
-/// to go. Only versions are staged (a name of 32 hex digits, an age file):
+/// Commit the versions `store/v/` gained, and push, while sync is on, if
+/// that has somewhere to go. Only versions are staged (a name of 32 hex digits, an age file):
 /// nothing else that lies there. A file gone is never committed as gone:
 /// `ls` says so instead.
 fn record() {
@@ -734,7 +687,16 @@ fn record() {
 
 fn record_in(dir: &Path) {
     let v = pasa::versions(dir);
-    git_moved(dir);
+    // A repository in v/ (made there before 0.4.14, or by the network side,
+    // which may write there): git in store/ sees v/ as another repository
+    // and adds nothing, and pasa runs nothing of it nor moves it.
+    if v.join(".git").symlink_metadata().is_ok() {
+        return eprintln!(
+            "pasa: not committed: store/v/.git is in the way, and pasa runs \
+             nothing of it (the network side may write in v/); move it out \
+             (README: git)"
+        );
+    }
     let Some(out) = git(dir, &["ls-files", "-z", "--others", "v"], None) else {
         return;
     };
@@ -759,7 +721,8 @@ fn record_in(dir: &Path) {
         ["user.name=pasa", "user.email=pasa@localhost", "commit.gpgsign=false"];
     let me = me.iter().flat_map(|c| ["-c", c]);
     let commit: Vec<&str> = me.chain(["commit", "-qm", "."]).collect();
-    if git(dir, &commit, None).is_some() {
+    // A push is a connection: only while sync is on.
+    if git(dir, &commit, None).is_some() && pasa::sync::on(dir) {
         git(dir, &["push", "-q"], None);
     }
 }
@@ -1364,19 +1327,18 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// git runs nothing planted where the network side writes: a
-    /// repository made in `v/` before moves (with `v/`) to `store/.git`
-    /// without its hooks or its other config (a monitor, a pack command a
-    /// push would run), and only versions are committed, nothing else that
-    /// lies in `v/`. The push still goes; git's work tree is `store/`,
-    /// which holds no key.
+    /// A repository the network side planted in `v/` (or one made there
+    /// before) is neither run, nor moved, nor made the store's: nothing of
+    /// it runs, and nothing is committed while it is there. In the user's
+    /// `store/.git` only versions are committed, no hook runs, and the push
+    /// goes only while sync is on.
     #[test]
     fn git_runs_nothing_planted_and_commits_versions_alone() {
         let d = std::env::temp_dir()
             .join(format!("pasa-git-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
-        let (v, ran) = (d.join("v"), d.join("ran"));
-        fs::create_dir_all(&v).unwrap();
+        let (old, ran) = (d.join("v"), d.join("ran"));
+        fs::create_dir_all(&old).unwrap();
         let git = |a: &[&str]| {
             let o = Command::new("git").args(a).output().unwrap();
             assert!(
@@ -1388,49 +1350,69 @@ mod tests {
         let at = |p: &std::path::Path| p.to_str().unwrap().to_string();
         let remote = at(&d.join("remote.git"));
         git(&["init", "-q", "-b", "main", "--bare", &remote]);
-        git(&["init", "-q", "-b", "main", &at(&v)]);
+        git(&["init", "-q", "-b", "main", &at(&old)]);
         let evil = d.join("evil.sh");
         fs::write(&evil, format!("#!/bin/sh\ntouch {}\n", ran.display()))
             .unwrap();
         let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
         fs::set_permissions(&evil, mode).unwrap();
-        for h in ["pre-commit", "post-commit"] {
-            fs::copy(&evil, v.join(".git/hooks").join(h)).unwrap();
-        }
-        let cfg = at(&v.join(".git/config"));
-        for (k, val) in [
-            ("core.fsmonitor", at(&evil)),
-            ("remote.origin.url", remote.clone()),
-            ("remote.origin.receivepack", at(&evil)),
-            ("branch.main.remote", "origin".into()),
-            ("branch.main.merge", "refs/heads/main".into()),
-        ] {
-            git(&["config", "--file", &cfg, k, &val]);
-        }
+        let plant = |g: &std::path::Path| {
+            for h in ["pre-commit", "post-commit", "pre-push"] {
+                fs::copy(&evil, g.join("hooks").join(h)).unwrap();
+            }
+            let cfg = at(&g.join("config"));
+            for k in ["core.fsmonitor", "core.sshCommand", "diff.external"] {
+                git(&["config", "--file", &cfg, k, &at(&evil)]);
+            }
+            git(&["config", "--file", &cfg, "extensions.worktreeConfig", "1"]);
+            let wt = format!("[core]\n\tfsmonitor = {}\n", evil.display());
+            fs::write(g.join("config.worktree"), wt).unwrap();
+        };
+        plant(&old.join(".git"));
+        fs::write(old.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
         let version = "0123456789abcdef0123456789abcdef";
-        fs::write(v.join(version), b"age-encryption.org/v1\n-> x\n").unwrap();
-        fs::write(v.join("notes.txt"), b"a plaintext left here").unwrap();
-        fs::write(v.join("fedcba9876543210fedcba9876543210"), b"no age")
+        fs::write(old.join(version), b"age-encryption.org/v1\n-> x\n").unwrap();
+        fs::write(old.join("notes.txt"), b"a plaintext left here").unwrap();
+        fs::write(old.join("fedcba9876543210fedcba9876543210"), b"no age")
             .unwrap();
+        let (store, pushed) = (d.join("store"), || {
+            Command::new("git")
+                .args(["--git-dir", &remote, "log", "--oneline", "main"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        });
+        let tracked = || {
+            let t = super::git(&d, &["ls-files"], None).unwrap_or_default();
+            String::from_utf8(t).unwrap()
+        };
         super::record_in(&d);
+        assert!(!store.join(".git").exists(), "v/.git is not made the store's");
+        // The user's repository, with a remote (and hooks of its own).
+        git(&["init", "-q", "-b", "main", &at(&store)]);
+        plant(&store.join(".git"));
+        let s = at(&store);
+        git(&["-C", &s, "config", "--unset", "core.fsmonitor"]);
+        git(&["-C", &s, "remote", "add", "origin", &remote]);
+        git(&["-C", &s, "config", "branch.main.remote", "origin"]);
+        git(&["-C", &s, "config", "branch.main.merge", "refs/heads/main"]);
+        super::record_in(&d);
+        assert!(!old.exists() && store.join("v/.git/config").exists());
+        assert_eq!(tracked(), "", "nothing committed beside a v/.git");
+        fs::remove_dir_all(store.join("v/.git")).unwrap();
+        super::record_in(&d);
+        assert_eq!(tracked(), format!("v/{version}\n"));
+        assert!(!pushed(), "sync off: no push");
+        pasa::sync::set_on(&d, true).unwrap();
+        fs::write(
+            store.join("v").join(version.replace('0', "1")),
+            b"age-encryption.org/v1\n",
+        )
+        .unwrap();
+        super::record_in(&d);
+        assert!(pushed(), "sync on: the push went");
         assert!(!ran.exists(), "something planted ran");
-        let store = d.join("store");
-        assert!(!v.exists(), "v/ moved into store/");
-        assert!(
-            store.join(".git").is_dir() && !store.join(".git/hooks").exists()
-        );
-        assert!(!store.join("v/.git").exists());
-        let tracked = super::git(&d, &["ls-files"], None).unwrap();
-        let tracked = String::from_utf8(tracked).unwrap();
-        assert_eq!(tracked, format!("v/{version}\n"));
-        let cfg = fs::read_to_string(store.join(".git/config")).unwrap();
-        assert!(cfg.contains("url = ") && cfg.contains("merge = "));
-        assert!(!cfg.contains("receivepack") && !cfg.contains("fsmonitor"));
-        let pushed = Command::new("git")
-            .args(["--git-dir", &remote, "log", "--oneline", "main"])
-            .output()
-            .unwrap();
-        assert!(pushed.status.success(), "the push went");
         fs::remove_dir_all(&d).unwrap();
     }
 
