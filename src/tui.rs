@@ -1,5 +1,3 @@
-//! `pasa tui`: type to filter, arrows to choose, Enter copies the password.
-
 use crate::view::{IDLE, View};
 use anyhow::Result;
 use crossterm::event::{
@@ -37,7 +35,6 @@ pub fn run(s: pasa::Store) -> Result<()> {
     r
 }
 
-/// Which device is overdue a check-in, if one is; else whether sync is on.
 fn checkin() -> String {
     #[cfg(feature = "sync")]
     {
@@ -101,7 +98,7 @@ fn browse(mut v: View) -> Result<()> {
     let (mut shown, mut armed) = (false, false);
     loop {
         draw(&v, shown)?;
-        // Left alone: locked, by leaving.
+        // Idle: returning drops the store, which locks it.
         if !poll(IDLE)? {
             return Ok(());
         }

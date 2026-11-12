@@ -1,21 +1,19 @@
-//! What the terminal and the window both show: the names a filter leaves,
-//! one of them chosen, and what was last done.
+//! State shared by the terminal and the window.
 
 use crate::{aside, clip, record, text};
 use anyhow::{Context, Result, ensure};
 use pasa::{Secret, Store, field};
 use std::time::Duration;
 
-/// A view left alone this long locks.
 pub const IDLE: Duration = Duration::from_secs(300);
 
 pub struct View {
     pub s: Store,
     pub filter: String,
     pub names: Vec<String>,
-    /// Each name's newest version, by its file: what a cache keys on.
+    /// Each name's newest version file: what caches key on.
     pub files: Vec<String>,
-    /// When each name last changed (ms), and how many files it keeps.
+    /// Per name: last change (ms), and how many attached files.
     pub ms: Vec<u64>,
     pub kept: Vec<usize>,
     pub at: usize,
@@ -42,7 +40,6 @@ impl View {
         v
     }
 
-    /// The names holding every word of the filter, as `v/` is now.
     pub fn load(&mut self) {
         let f = self.filter.to_lowercase();
         let has = |n: &String| {
@@ -71,7 +68,6 @@ impl View {
         self.name().and_then(|n| self.s.get(n).ok()).unwrap_or_default()
     }
 
-    /// Do `f` and say what it did, or why not.
     fn act(&mut self, f: impl FnOnce(&View) -> Result<String>) {
         self.note = f(self).unwrap_or_else(|e| format!("{e:#}"));
         self.load();
@@ -85,7 +81,7 @@ impl View {
         })
     }
 
-    /// Empty: deleted.
+    /// An empty body deletes.
     pub fn put(&mut self, name: &str, body: &[u8]) {
         self.act(|v| {
             v.s.put(name, body)?;
@@ -95,7 +91,6 @@ impl View {
         })
     }
 
-    /// `pw` as `name`'s new password, copied.
     pub fn generate(&mut self, name: &str, pw: String) {
         self.act(|v| {
             ensure!(!name.trim().is_empty(), "type a name first");
@@ -106,7 +101,6 @@ impl View {
         })
     }
 
-    /// Something done to the store: said, recorded, the peers told.
     pub fn change(&mut self, f: impl FnOnce(&pasa::Store) -> Result<String>) {
         self.act(|v| {
             let said = f(&v.s)?;
@@ -116,7 +110,7 @@ impl View {
     }
 }
 
-/// A change: recorded, and the peers told.
+/// Commit the change (git, if any) and sync it to the peers.
 fn news() {
     record();
     aside(true);

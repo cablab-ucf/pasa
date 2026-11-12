@@ -1,8 +1,3 @@
-//! `pasa gui`: the store in a window. A first run asks for the password
-//! and, if wanted, a hardware key; joining another device's store waits in
-//! the corner. Then groups, entries and the chosen one's fields, as the
-//! Android app lays them out.
-
 use crate::view::View;
 use anyhow::{Context as _, Result};
 use eframe::egui::{
@@ -17,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-/// The colours both apps share.
+/// Shared with the Android app.
 struct Look {
     bg: Color32,
     card: Color32,
@@ -101,13 +96,11 @@ fn style(ctx: &Context) {
     });
 }
 
-/// What is kept between runs, in `~/.pasa/ui`: minutes left alone before
-/// locking, and the theme.
 #[derive(Clone)]
 struct Prefs {
     lock: u64,
     theme: ThemePreference,
-    /// Which of [`COLS`] the table shows; the title always.
+    /// Which of [`COLS`] show; the title always does.
     cols: [bool; 9],
 }
 
@@ -148,10 +141,8 @@ impl Prefs {
     }
 }
 
-/// Entries whose password breaches hold, and how often.
 type Breached = Vec<(String, u64)>;
 
-/// The table's columns: what each is called, and how wide.
 const COLS: [(&str, f32); 9] = [
     ("Title", 230.0),
     ("Username", 190.0),
@@ -164,7 +155,6 @@ const COLS: [(&str, f32); 9] = [
     ("Notes", 260.0),
 ];
 
-/// What a row shows of an entry, and a search looks through.
 #[derive(Clone, Default)]
 struct Meta {
     user: String,
@@ -178,13 +168,9 @@ struct Meta {
 enum Job {
     Create,
     Unlock,
-    /// By the YubiKey and the PIN.
     Quick,
-    /// Quick unlock on for the open store, or off.
     SetQuick(bool),
-    /// By a security key (FIDO2) and its PIN, if it has one.
     Fido,
-    /// The security key plugged in opens the open store from now on.
     AddFido,
     Join,
 }
@@ -200,25 +186,23 @@ enum Win {
     Settings,
 }
 
-/// An entry in the form; `old`: its name before, or empty for a new one.
+/// `old`: the entry's name before, or empty for a new one.
 struct Edit {
     old: String,
     name: String,
     f: Form,
     show: bool,
-    /// The Advanced tab, not the entry's.
     advanced: bool,
-    /// How its password is made shows, to choose.
+    /// The generator's options show.
     making: bool,
 }
 
 struct Generator {
-    /// Speakable words, else characters.
     words: bool,
     len: usize,
     symbols: bool,
     count: usize,
-    /// What may stand between two words: one of these.
+    /// Each gap between words gets one of these.
     seps: &'static str,
     leet: bool,
     pw: Zeroizing<String>,
@@ -241,7 +225,7 @@ impl Generator {
         }
     }
 
-    /// How passwords are made, to choose; whether something was chosen.
+    /// Whether an option changed.
     fn options(&mut self, ui: &mut Ui) -> bool {
         let (g, l) = (self, look(ui));
         let mut again = false;
@@ -301,7 +285,6 @@ impl Generator {
         again
     }
 
-    /// The bits of chance that go into a password made this way.
     fn bits(&self) -> u32 {
         let abc: f64 = if self.symbols { 80.0 } else { 62.0 };
         match self.words {
@@ -311,22 +294,16 @@ impl Generator {
     }
 }
 
-/// A device being added: for a QR code, its password first (never shown
-/// beside the code), then the code; and how a short code ends.
 struct Pairing {
     name: String,
-    /// The QR code's password, while it is chosen.
+    /// The QR code's password: never shown beside the code.
     pw: Option<Zeroizing<String>>,
     code: String,
-    /// The QR code, once shown.
     img: Option<egui::TextureHandle>,
-    /// How a short code ended, from the network side.
     end: Option<Arc<Mutex<Option<String>>>>,
     state: String,
 }
 
-/// The camera looking for a QR code, beside the window: the frame it last
-/// saw, and what it found or why it stopped.
 struct Scanning {
     frame: Arc<Mutex<Option<crate::scan::Frame>>>,
     found: Arc<Mutex<Option<Result<String, String>>>>,
@@ -372,7 +349,6 @@ impl Drop for Scanning {
     }
 }
 
-/// `text` as a QR code, a module a pixel, with its quiet zone.
 fn qr_image(ctx: &Context, text: &str) -> Result<egui::TextureHandle> {
     let c = qrcode::QrCode::new(text)?;
     let (w, dark, q) = (c.width(), c.to_colors(), 4);
@@ -390,57 +366,43 @@ fn qr_image(ctx: &Context, text: &str) -> Result<egui::TextureHandle> {
 struct App {
     v: Option<View>,
     prefs: Prefs,
-    /// By the clock that runs while the machine sleeps.
+    /// Not an Instant: that stops while the machine sleeps.
     used: Option<SystemTime>,
-    // Before the store is open.
     pw: Zeroizing<String>,
     pw2: Zeroizing<String>,
     yk: bool,
-    /// The secret of the key just set up, for a spare.
+    /// For a spare key; dropped once the store is made.
     key_secret: Option<Zeroizing<Vec<u8>>>,
-    /// The key opens the store quickly, beside the password; else it is
-    /// needed with the password, every time.
     quick: bool,
     pin: Zeroizing<String>,
-    /// The store's password as generated here, and its bits.
     made: (Zeroizing<String>, u32),
-    /// At the unlock: the password, though quick unlock is on.
     joining: bool,
     peer: String,
     code: String,
     pair_pw: Zeroizing<String>,
-    /// A pairing taken: the store comes, and its password opens it.
     joined: bool,
-    /// Done at the next frame, once this one has said so.
+    /// Run next frame, so this one shows what it waits on (a touch).
     job: Option<Job>,
     said: String,
-    // The open store.
     group: Option<String>,
-    /// Each version's user, address and tags, read once: what rows show
-    /// and a search looks through.
+    /// Keyed by version file: each version is read once.
     meta: HashMap<String, Meta>,
-    /// The store in numbers, while its tab shows.
     stats: Option<Vec<(&'static str, String)>>,
     numbers: bool,
     tag: Option<String>,
-    /// What a breach check found, entry by entry, once it is back.
     breached: Arc<Mutex<Option<Breached>>>,
     health: Option<pasa::Health>,
     shown: bool,
     armed: bool,
     edit: Option<Edit>,
     win: Win,
-    /// In History: the version looked at, the one it is compared with,
-    /// and whether passwords show.
+    /// History: the version shown, the one compared, passwords shown.
     hist: (usize, usize, bool),
     generator: Generator,
     device: String,
     pairing: Option<Pairing>,
-    /// The camera, while it looks for a QR code.
     scanning: Option<Scanning>,
-    /// What syncs said, beside the window, until shown.
     synced: Arc<Mutex<Option<String>>>,
-    /// Whether this window serves (from the first pairing on).
     serving: bool,
     rt: Option<tokio::runtime::Runtime>,
 }
@@ -462,8 +424,7 @@ pub fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// A muted label over a field as wide as its place. A secret is hidden,
-/// with an eye beside it to show it: which, the field's label remembers.
+/// A secret's eye (shown or hidden) is remembered by its label.
 fn field(
     ui: &mut Ui,
     label: &str,
@@ -481,7 +442,6 @@ fn field(
     let r = ui.horizontal(|ui| {
         let (rect, eye) =
             ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-        // An eye, struck through while what it watches is hidden.
         let (c, ink) = (rect.center(), Stroke::new(1.6, l.muted));
         let lid = [
             vec2(-9.0, 0.0),
@@ -508,7 +468,6 @@ fn field(
     r.inner
 }
 
-/// `body` as `file` in the downloads folder, under a name not yet there.
 fn saved(file: &str, body: &[u8]) -> Result<String> {
     // A name, never a path: an entry's name is whatever a device wrote.
     let file = std::path::Path::new(file).file_name().context("no name")?;
@@ -526,27 +485,22 @@ fn saved(file: &str, body: &[u8]) -> Result<String> {
     Ok(format!("{file}: saved as {}", to.display()))
 }
 
-/// In the browser.
 fn open_url(url: &str) {
     let with = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     let _ = std::process::Command::new(with).arg(url).spawn();
 }
 
-/// The day `days` from now, as YYYY-MM-DD.
 fn day(days: u64) -> String {
     let at = std::time::SystemTime::now() + Duration::from_secs(days * 86_400);
     humantime::format_rfc3339_seconds(at).to_string()[..10].into()
 }
 
-/// A time in milliseconds, as a date and a minute.
 fn date(ms: u64) -> String {
     let at = UNIX_EPOCH + Duration::from_millis(ms);
     let at = humantime::format_rfc3339_seconds(at).to_string();
     at[..16].replace('T', " ")
 }
 
-/// What so many bits are called, and their colour: under 40 poor, under
-/// 65 weak, under 100 good.
 fn grade(bits: u32) -> (&'static str, Color32) {
     match bits {
         0..40 => ("Poor", rgb(0xE5604F)),
@@ -556,13 +510,11 @@ fn grade(bits: u32) -> (&'static str, Color32) {
     }
 }
 
-/// A bar that fills and turns from red to green as a password's bits grow.
 fn meter(ui: &mut Ui, bits: u32) {
     meter_to(ui, bits, 0)
 }
 
-/// [`meter`], full at `goal` and saying how far that is (0: no goal). The
-/// store's own password has one, 256: a suggestion, nothing is refused.
+/// Full at `goal` (0: none), a suggestion only: nothing is refused.
 fn meter_to(ui: &mut Ui, bits: u32, goal: u32) {
     let (name, colour) = grade(bits);
     let full = if goal > 0 { goal } else { 128 } as f32;
@@ -582,12 +534,10 @@ fn meter_to(ui: &mut Ui, bits: u32, goal: u32) {
     ui.label(RichText::new(said).small().color(colour));
 }
 
-/// A dialog's frame: the window's, with room around what it holds.
 fn sheet(ctx: &Context) -> Frame {
     Frame::window(&ctx.global_style()).inner_margin(20)
 }
 
-/// The one button a screen is for.
 fn primary(ui: &mut Ui, text: &str, wide: bool) -> Response {
     let l = look(ui);
     let b = Button::new(RichText::new(text).color(l.on_accent).strong())
@@ -598,7 +548,6 @@ fn primary(ui: &mut Ui, text: &str, wide: bool) -> Response {
     }
 }
 
-/// The name, then one card in the middle: what the app wants first.
 fn card(ui: &mut Ui, about: &str, title: &str, body: impl FnOnce(&mut Ui)) {
     let l = look(ui);
     CentralPanel::default().show(ui, |ui| {
@@ -628,7 +577,6 @@ fn card(ui: &mut Ui, about: &str, title: &str, body: impl FnOnce(&mut Ui)) {
     });
 }
 
-/// The other way in, small, in the corner.
 fn corner(ui: &Ui, ask: &str, link: &str) -> bool {
     let a = Area::new(Id::unique("corner"))
         .anchor(Align2::RIGHT_BOTTOM, [-20.0, -16.0]);
@@ -650,12 +598,11 @@ impl eframe::App for App {
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Q)) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // Left alone: locked, the store and what was typed dropped.
         if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
             self.used = Some(SystemTime::now());
         }
         let idle = Duration::from_secs(self.prefs.lock * 60);
-        // Asleep counts as left alone; so does a clock set back.
+        // A clock set back counts as idle too.
         let left = |t: SystemTime| t.elapsed().map_or(true, |e| e > idle);
         if self.v.is_some() && self.used.is_some_and(left) {
             self.lock();
@@ -669,8 +616,7 @@ impl eframe::App for App {
                 .err()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_default();
-            // Just joined, or opened: a sync, which shows what it brought
-            // when done. Joined, the store comes before the password.
+            // Joined or opened: sync. Joined, the store precedes its password.
             if was != (self.v.is_some(), self.joined) {
                 self.sync_now(ui.ctx(), false);
             }
@@ -753,8 +699,7 @@ impl App {
                     self.code.trim().to_string(),
                     self.pair_pw.clone(),
                 );
-                // A QR code opens here, offline; a short code is the
-                // network side's to take.
+                // A QR code opens here, offline; a short code, in `net`.
                 let got = match code.starts_with("PAIRIR1:") {
                     true => self.rt()?.block_on(sync::unqr(&code, &pw))?,
                     false => {
@@ -825,7 +770,6 @@ impl App {
                 );
             }
             let again = field(ui, "Password, again", &mut self.pw2, true);
-            // What is wrong with it, right under it.
             if !self.pw2.is_empty() && *self.pw != *self.pw2 {
                 small(ui, "The passwords differ", l.bad);
             }
@@ -877,7 +821,6 @@ impl App {
             field(ui, "A name for that device", &mut self.peer, false);
             let mut pw = field(ui, "Code", &mut self.code, false);
             self.scan(ui);
-            // A QR code's text asks for its password; a typed code has none.
             if self.code.trim().starts_with("PAIRIR1:") {
                 pw = field(
                     ui,
@@ -901,12 +844,8 @@ impl App {
         }
     }
 
-    /// Scan the other device's QR code with the camera, offline: its
-    /// text goes in the Code field, and its password is asked for.
     fn scan(&mut self, ui: &mut Ui) {
         let l = look(ui);
-        // A picture of the code (a photo of the other screen), dropped on
-        // the window: read here, as camera frames are.
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
         if let Some(p) = dropped.first().map(|f| f.path().to_path_buf()) {
             let got = crate::scan::picture(&p).map(|f| crate::scan::read(&f));
@@ -988,8 +927,7 @@ impl App {
                 let say = if yk { "Touch your YubiKey" } else { "Unlocking" };
                 self.begin(ui, Job::Unlock, say);
             }
-            // Every other way in is here too: the quick-unlock YubiKey, a
-            // security key (CTAP2). One PIN field serves whichever is used.
+            // One PIN field serves quick unlock and security keys alike.
             let (quick, keys) = (pasa::quick(&home()), pasa::fido(&home()));
             if quick.is_some() || keys.is_some() {
                 ui.separator();
@@ -1024,7 +962,6 @@ impl App {
         });
     }
 
-    /// What a row shows of the entry, read once per version.
     fn meta(&mut self, v: &View, i: usize) -> &Meta {
         let read = || {
             let b = v.s.get(&v.names[i]).unwrap_or_default();
@@ -1043,7 +980,6 @@ impl App {
         self.meta.entry(v.files[i].clone()).or_insert_with(read)
     }
 
-    /// The user names most entries have, the commonest first.
     fn users(&self) -> Vec<String> {
         let mut n: HashMap<&str, usize> = HashMap::new();
         for m in self.meta.values().filter(|m| !m.user.is_empty()) {
@@ -1063,8 +999,7 @@ impl App {
         {
             v.note = s;
         }
-        // The search looks through names, users, addresses and tags; View's
-        // own filter (names alone, for the terminal) is left empty here.
+        // View's filter matches names alone; this search looks further.
         let query = std::mem::take(&mut v.filter);
         v.load();
         v.filter = query;
@@ -1198,7 +1133,6 @@ impl App {
 
         let foot =
             Frame::new().fill(l.card).inner_margin(Margin::symmetric(12, 5));
-        // Devices apart for a month say so here, until they check in.
         let apart = sync::unseen(&home());
         Panel::bottom("status").frame(foot).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1309,7 +1243,6 @@ impl App {
                     );
                     x += COLS[*c].1;
                 }
-                // The header's menu: which columns show.
                 head.on_hover_text("Right-click: columns").context_menu(|ui| {
                     ui.label(RichText::new("COLUMNS").small().color(l.muted));
                     for (c, col) in COLS.iter().enumerate().skip(1) {
@@ -1334,9 +1267,7 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for i in range {
                             let at = rows[i];
-                            // Deleted this frame (in the entry pane, drawn
-                            // first), or by a sync since: the list is
-                            // shorter; the next frame draws it anew.
+                            // Deleted since (by the entry pane or a sync).
                             if at >= v.names.len() {
                                 continue;
                             }
@@ -1369,7 +1300,6 @@ impl App {
                                     2 => grey(&m.url),
                                     3 => grey(&m.tags),
                                     4 => {
-                                        // A short bar in the grade's colour, then the bits.
                                         let (_, colour) = grade(m.bits);
                                         let full = egui::Rect::from_min_size(
                                             pos2(x, y - 3.0),
@@ -1418,7 +1348,6 @@ impl App {
                             if r.double_clicked() {
                                 act = Some((at, "pass"));
                             }
-                            // What can be done with an entry, under the pointer.
                             r.context_menu(|ui| {
                                 let web = m.url.starts_with("http");
                                 for (what, text, on) in [
@@ -1520,7 +1449,6 @@ impl App {
         }
     }
 
-    /// The chosen entry's fields, each with its copy.
     fn entry(&mut self, ui: &mut Ui, v: &mut View, chosen: Option<&str>) {
         let l = look(ui);
         let Some(name) = chosen else {
@@ -1665,7 +1593,6 @@ impl App {
         });
     }
 
-    /// Weak, shared and, if asked, breached passwords.
     fn health(&mut self, ui: &mut Ui, v: &mut View) {
         let l = look(ui);
         ui.horizontal(|ui| {
@@ -1786,7 +1713,6 @@ impl App {
         }
     }
 
-    /// The chosen entry's versions: what it was, and a way back.
     fn history(&mut self, ui: &mut Ui, v: &mut View) {
         let l = look(ui);
         let name = v.name().unwrap_or_default().to_string();
@@ -1844,8 +1770,6 @@ impl App {
                 },
             );
         });
-        // The version looked at, as it was; against another, the older's
-        // lines that went (-) and the newer's that came (+).
         if let (Some(x), Some(y)) = (all.get(a), all.get(b)) {
             ui.separator();
             let (old, new) = if a >= b { (a, b) } else { (b, a) };
@@ -1897,8 +1821,6 @@ impl App {
         ui.label(RichText::new(note).small().color(l.muted));
     }
 
-    /// A key never used before is set up here, and a spare with it: the
-    /// same secret, which is held until the store is made and no longer.
     fn new_key(&mut self, ui: &mut Ui) {
         let l = look(ui);
         let note = "A new key must be set up first. A spare key gets the \
@@ -1922,8 +1844,6 @@ impl App {
         });
     }
 
-    /// The entry being made or changed: what it is, and under Advanced
-    /// when it expires, its other fields and its files.
     fn form(&mut self, ctx: &Context, v: &mut View) {
         let users = self.users();
         let Some(e) = &mut self.edit else { return };
@@ -1985,7 +1905,6 @@ impl App {
                     title.request_focus();
                 }
                 field(ui, "Username", &mut e.f.user, false);
-                // Those most entries have, to pick.
                 let fits = |u: &&String| **u != e.f.user && u.starts_with(&*e.f.user);
                 let picks: Vec<&String> = users.iter().filter(fits).take(4).collect();
                 if !picks.is_empty() {
@@ -2023,7 +1942,7 @@ impl App {
             }
             });
             ui.add_space(6.0);
-            // Saved only as what it reads back as: said, not mended.
+            // Saved only as it reads back: a problem is said, not mended.
             let wrong = e.f.problem();
             if let Some(w) = &wrong {
                 ui.label(RichText::new(w).small().color(l.bad));
@@ -2094,7 +2013,6 @@ impl App {
                 t.font(FontId::monospace(16.0)).desired_width(f32::INFINITY),
             );
         });
-        // Of the password as it stands, at every change of it.
         meter(ui, pasa::strength(&g.pw));
         let mut again = g.options(ui);
         ui.horizontal(|ui| {
@@ -2204,9 +2122,7 @@ impl App {
         }
     }
 
-    /// `pasa sync` beside the window: those that serve are dialed (with
-    /// `news`, those that listen woken to dial here); what it said, shown
-    /// once back.
+    /// In a process of its own: the window opens no socket.
     fn sync_now(&self, ctx: &Context, news: bool) {
         if !sync::net(&home()).join("peers").exists() || !sync::on(&home()) {
             return;
@@ -2231,11 +2147,7 @@ impl App {
         });
     }
 
-    /// Serve while the window is open, once paired and with sync on:
-    /// devices dial here. The network side is a process of its own that
-    /// sees `v/` and `net/` alone, and stops serving within seconds of sync
-    /// going off (and serves again when it comes back on); what it brings
-    /// shows at once, and is said.
+    /// Started once: the serving process itself follows sync off and on.
     fn serve(&mut self, ctx: &Context) {
         let paired = sync::net(&home()).join("peers").exists();
         if self.serving || !paired || !sync::on(&home()) {
@@ -2258,7 +2170,7 @@ impl App {
         });
     }
 
-    /// The two ways to show a pairing; which was chosen: true, the QR code.
+    /// Some(true): the QR code; Some(false): the code to type.
     fn shows(&self, ui: &mut Ui, ok: bool) -> Option<bool> {
         ui.horizontal(|ui| {
             let qr = ui.add_enabled(ok, Button::new("Show a QR code"));
@@ -2270,8 +2182,7 @@ impl App {
         .inner
     }
 
-    /// The short code, from the network side, which takes what the
-    /// pairing hands over (all of it sealed) and waits for its taker.
+    /// The network side gets the offer sealed, and waits for its taker.
     fn show_code(&mut self, ctx: &Context) -> Result<()> {
         let p = self.pairing.as_mut().context("no pairing")?;
         let got = sync::offer(&home(), &p.name)?;
@@ -2294,8 +2205,6 @@ impl App {
         Ok(())
     }
 
-    /// The pairing: a QR code's password, then the code alone; or the
-    /// short code; and how it is going.
     fn pairing(&mut self, ui: &mut Ui) -> Result<()> {
         let l = look(ui);
         let ctx = ui.ctx().clone();
