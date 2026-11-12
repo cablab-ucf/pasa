@@ -163,10 +163,21 @@ ciphertext, and learns when you change things. A version deleted from
 pasa pair phone --qr   # here: the QR code's password, then the code; serves until phone has synced
 pasa join home CODE    # there (the apps scan it): the QR code's password; then it syncs
 pasa join home --scan  # the same, the code read by this computer's camera
+pasa sync on | off     # sync with the paired devices, or stay offline (off until turned on; pairing turns it on)
 pasa serve             # accept syncs; wake listening peers on news
 pasa listen            # sync when woken, through pushir's daemon (laptops)
 pasa sync              # with every peer, all at once (also after each change)
 ```
+
+**Offline by default.** Each device has a switch, off until turned on
+(pairing turns it on): `pasa sync on|off`, the window's Devices or its
+status bar, `^S` in `pasa tui`, the phone's Devices. Off, nothing of the
+store goes online: no serving (`pasa serve` and its service wait, and
+start or stop within seconds of the switch), no listening, no sync after
+a change. Offline is the norm; check in about once a month. Each device
+keeps when each other last synced with it, and says which it has not met
+for a month: in the window's status bar and Devices, `pasa peers`, on a
+terminal's commands, and above the phone's list.
 
 Pairing hands over the keys; syncing, the store. Neither opens either:
 the store's password and hardware key are never asked for, typed or

@@ -71,6 +71,8 @@ pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys'
 pasa join NAME CODE|--scan   take the code device NAME shows (a QR code: its password
                              too; --scan: by the camera, in this program), then sync. The
                              store's password opens it afterwards
+pasa sync on | off           sync with the paired devices, or stay offline: off until turned
+                             on (pairing does). A month apart, each device says so
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 
 fn ask(p: &str) -> Result<Secret> {
@@ -385,6 +387,16 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 /// With quick unlock on: the YubiKey and the PIN; else, or if that
 /// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
+    // Devices apart for a month, said where a person reads.
+    #[cfg(feature = "sync")]
+    if std::io::stderr().is_terminal() {
+        for (who, d) in pasa::sync::unseen(&home()) {
+            eprintln!(
+                "Not synced with {who} for {d} days: check in (pasa sync on, \
+                 then pasa sync)"
+            );
+        }
+    }
     // A security key of this store's, plugged in: it opens it.
     if pasa::fido(&home()).is_some_and(|f| fido_here(&f.keys)) {
         match unlock_fido(None) {
@@ -822,7 +834,9 @@ fn main() -> Result<()> {
     }
     record();
     #[cfg(feature = "sync")]
-    if pasa::sync::net(&home()).join("peers").exists() {
+    if pasa::sync::net(&home()).join("peers").exists()
+        && pasa::sync::on(&home())
+    {
         sync(&["sync", "--news"])?;
     }
     Ok(())
@@ -832,7 +846,9 @@ fn main() -> Result<()> {
 #[cfg(any(feature = "tui", feature = "gui"))]
 fn aside(news: bool) {
     #[cfg(feature = "sync")]
-    if pasa::sync::net(&home()).join("peers").exists() {
+    if pasa::sync::net(&home()).join("peers").exists()
+        && pasa::sync::on(&home())
+    {
         let c = std::env::current_exe().map(Command::new);
         let _ = c.map(|mut c| {
             c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
@@ -932,6 +948,30 @@ fn net_side(a: &[&str]) -> Result<()> {
     net_go(&dir, a, got.trim())
 }
 
+/// `go`, while sync is on here: nothing goes online while it is off, and
+/// within seconds of the switch it starts or stops. A service running
+/// `pasa serve` follows the switch, as the window does.
+#[cfg(feature = "sync")]
+async fn while_on<F: std::future::Future<Output = Result<()>>>(
+    dir: &std::path::Path,
+    go: impl Fn() -> F,
+) -> Result<()> {
+    use pasa::sync::on;
+    let tick = || tokio::time::sleep(std::time::Duration::from_secs(2));
+    loop {
+        if !on(dir) {
+            eprintln!("Offline: nothing goes online until pasa sync on");
+            while !on(dir) {
+                tick().await
+            }
+        }
+        tokio::select! {
+            r = go() => return r,
+            _ = async { while on(dir) { tick().await } } => {}
+        }
+    }
+}
+
 #[cfg(feature = "sync")]
 #[tokio::main]
 async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
@@ -949,8 +989,8 @@ async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
             let r = sync::sync(dir, a.contains(&"--news")).await?;
             r.into_iter().for_each(|(w, r)| said(&w, r))
         }
-        ["serve"] => sync::serve(dir, said).await?,
-        ["listen"] => sync::listen(dir, said).await?,
+        ["serve"] => while_on(dir, || sync::serve(dir, said)).await?,
+        ["listen"] => while_on(dir, || sync::listen(dir, said)).await?,
         ["give"] => {
             let (code, end) = sync::give(&B64.decode(got.as_bytes())?).await?;
             println!("{code}");
@@ -1056,15 +1096,37 @@ async fn sync(a: &[&str]) -> Result<()> {
             net_run(&["sync"])?;
             eprintln!("The store is here: its password opens it (pasa ls)");
         }
-        ["sync", ..] => net_run(a)?,
+        ["sync", "on"] => {
+            sync::set_on(&dir, true)?;
+            eprintln!("Sync on: paired devices sync with this one");
+        }
+        ["sync", "off"] => {
+            sync::set_on(&dir, false)?;
+            eprintln!("Offline: nothing goes online until pasa sync on");
+        }
+        ["sync", ..] => {
+            ensure!(sync::on(&dir), "offline: pasa sync on, then pasa sync");
+            net_run(a)?
+        }
         ["serve"] | ["listen"] => net_run(a)?,
         ["peers"] => {
-            sync::peers(&dir).iter().for_each(|p| println!("{}", p.name))
+            let on = if sync::on(&dir) { "on" } else { "off (pasa sync on)" };
+            eprintln!("Sync: {on}");
+            for (name, d, late) in sync::apart(&dir) {
+                match late {
+                    true => {
+                        println!("{name}\tnot synced for {d} days: check in")
+                    }
+                    false => println!("{name}\tsynced {d} days ago"),
+                }
+            }
         }
         ["forget", name] => sync::forget(&dir, name)?,
         ["revoke", name] => {
             sync::revoke(&mut open()?, name)?;
-            net_run(&["sync", "--news"])?;
+            if sync::on(&dir) {
+                net_run(&["sync", "--news"])?;
+            }
             eprintln!(
                 "A new store key: pair the other devices again (pasa pair \
                  NAME here, join there), and forget {name} on each"

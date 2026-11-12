@@ -38,6 +38,7 @@ object Native {
     external fun text(form: String): String
     external fun problem(form: String): String
     external fun peers(dir: String): String
+    external fun seen(dir: String): String
     external fun forget(dir: String, name: String)
     external fun revoke(h: Long, name: String)
     external fun pair(h: Long, name: String, qrPw: String?): String

@@ -10,8 +10,8 @@ use crossterm::terminal::{self, Clear, ClearType::All};
 use crossterm::{cursor::MoveTo, execute, queue};
 use std::io::{Write, stdout};
 
-const HELP: &str =
-    "Enter pass ^U user ^O otp Tab show ^E edit ^G regen ^N new ^D del Esc";
+const HELP: &str = "Enter pass ^U user ^O otp Tab show ^E edit ^G regen ^N new \
+                    ^D del ^S sync Esc";
 
 fn screen(on: bool) -> Result<()> {
     match on {
@@ -30,9 +30,34 @@ fn screen(on: bool) -> Result<()> {
 pub fn run(s: pasa::Store) -> Result<()> {
     screen(true)?;
     crate::aside(false);
-    let r = browse(View::new(s));
+    let mut v = View::new(s);
+    v.note = checkin();
+    let r = browse(v);
     screen(false)?;
     r
+}
+
+/// Which device is overdue a check-in, if one is; else whether sync is on.
+fn checkin() -> String {
+    #[cfg(feature = "sync")]
+    {
+        let h = pasa::home();
+        if let Some((who, d)) = pasa::sync::unseen(&h).first() {
+            return format!(
+                "Not synced with {who} for {d} days: check in (^S: sync on)"
+            );
+        }
+        if !pasa::sync::peers(&h).is_empty() {
+            let on = pasa::sync::on(&h);
+            return (if on {
+                "Sync on (^S: off)"
+            } else {
+                "Offline (^S: sync on)"
+            })
+            .into();
+        }
+    }
+    String::new()
 }
 
 fn draw(v: &View, shown: bool) -> Result<()> {
@@ -120,6 +145,19 @@ fn browse(mut v: View) -> Result<()> {
             (Char('d'), Some(n)) if ctrl => {
                 armed = true;
                 v.note = format!("^D again deletes {n}");
+            }
+            #[cfg(feature = "sync")]
+            (Char('s'), _) if ctrl => {
+                let h = pasa::home();
+                let on = !pasa::sync::on(&h);
+                v.note = match pasa::sync::set_on(&h, on) {
+                    Ok(()) if on => {
+                        crate::aside(false);
+                        "Sync on: paired devices sync with this one".into()
+                    }
+                    Ok(()) => "Offline: nothing goes online".into(),
+                    Err(e) => format!("{e:#}"),
+                };
             }
             (Backspace, _) => drop(v.filter.pop()),
             (Char(c), _) if !ctrl => v.filter.push(c),

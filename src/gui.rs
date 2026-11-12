@@ -1193,13 +1193,34 @@ impl App {
 
         let foot =
             Frame::new().fill(l.card).inner_margin(Margin::symmetric(12, 5));
+        // Devices apart for a month say so here, until they check in.
+        let apart = sync::unseen(&home());
         Panel::bottom("status").frame(foot).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&v.note).small().color(l.muted));
+                match (v.note.is_empty(), apart.first()) {
+                    (true, Some((who, d))) => {
+                        let more = apart.len() - 1;
+                        let and = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+                        let say = format!("Not synced with {who} for {d} days{and}: check in, in Devices");
+                        ui.label(RichText::new(say).small().color(l.bad));
+                    }
+                    _ => {
+                        ui.label(RichText::new(&v.note).small().color(l.muted));
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let n =
                         format!("{} of {} entries", rows.len(), v.names.len());
                     ui.label(RichText::new(n).small().color(l.muted));
+                    let (say, c) = match sync::on(&home()) {
+                        true => ("Sync on", l.accent),
+                        false => ("Offline", l.muted),
+                    };
+                    let tip = "Devices: sync on or off, and when each last synced";
+                    let b = Button::new(RichText::new(say).small().color(c)).frame(false);
+                    if ui.add(b).on_hover_text(tip).clicked() {
+                        self.win = Win::Devices;
+                    }
                 });
             })
         });
@@ -2093,16 +2114,43 @@ impl App {
     fn devices(&mut self, ui: &mut Ui, v: &mut View) {
         let l = look(ui);
         ui.heading("Devices");
+        let mut on = sync::on(&home());
+        if ui.checkbox(&mut on, "Sync with my devices").changed() {
+            v.note = match sync::set_on(&home(), on) {
+                Ok(()) if on => {
+                    "Sync on: paired devices sync with this one".into()
+                }
+                Ok(()) => "Offline: nothing goes online".into(),
+                Err(e) => format!("{e:#}"),
+            };
+            if on {
+                self.sync_now(ui.ctx(), false);
+            }
+        }
         let about = "Devices that hold this store sync with each other directly, \
-                     sealed end to end. No account, no server keeps a copy.";
+                     sealed end to end. No account, no server keeps a copy. Off: \
+                     this computer never uses the network for it. Offline is \
+                     fine; check in about once a month, and each device says \
+                     which others it has not met for longer.";
         ui.label(RichText::new(about).small().color(l.muted));
-        let peers = sync::peers(&home());
+        let (peers, apart) = (sync::peers(&home()), sync::apart(&home()));
         if peers.is_empty() {
             ui.label(RichText::new("No other device yet.").color(l.muted));
         }
         for p in &peers {
             ui.horizontal(|ui| {
                 ui.label(&p.name);
+                let a = apart.iter().find(|a| a.0 == p.name);
+                let (when, c) = match a.map(|a| (a.1, a.2)) {
+                    Some((d, true)) => {
+                        (format!("not synced for {d} days: check in"), l.bad)
+                    }
+                    Some((0, _)) => ("synced today".into(), l.muted),
+                    Some((1, _)) => ("synced yesterday".into(), l.muted),
+                    Some((d, _)) => (format!("synced {d} days ago"), l.muted),
+                    None => (String::new(), l.muted),
+                };
+                ui.label(RichText::new(when).small().color(c));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Forget").clicked() {
                         v.note = match sync::forget(&home(), &p.name) {
@@ -2127,7 +2175,7 @@ impl App {
                 });
             });
         }
-        if !peers.is_empty() && ui.button("Sync now").clicked() {
+        if on && !peers.is_empty() && ui.button("Sync now").clicked() {
             v.note = "Syncing".into();
             self.sync_now(ui.ctx(), true);
         }
@@ -2153,7 +2201,7 @@ impl App {
     /// `news`, those that listen woken to dial here); what it said, shown
     /// once back.
     fn sync_now(&self, ctx: &Context, news: bool) {
-        if !sync::net(&home()).join("peers").exists() {
+        if !sync::net(&home()).join("peers").exists() || !sync::on(&home()) {
             return;
         }
         let (out, ctx) = (self.synced.clone(), ctx.clone());
@@ -2176,11 +2224,14 @@ impl App {
         });
     }
 
-    /// Serve while the window is open, once paired: devices dial here. The
-    /// network side is a process of its own that sees `v/` and `net/`
-    /// alone; what it brings shows at once, and is said.
+    /// Serve while the window is open, once paired and with sync on:
+    /// devices dial here. The network side is a process of its own that
+    /// sees `v/` and `net/` alone, and stops serving within seconds of sync
+    /// going off (and serves again when it comes back on); what it brings
+    /// shows at once, and is said.
     fn serve(&mut self, ctx: &Context) {
-        if self.serving || !sync::net(&home()).join("peers").exists() {
+        let paired = sync::net(&home()).join("peers").exists();
+        if self.serving || !paired || !sync::on(&home()) {
             return;
         }
         self.serving = true;
