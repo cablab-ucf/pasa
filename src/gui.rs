@@ -328,7 +328,7 @@ struct Pairing {
 /// The camera looking for a QR code, beside the window: the frame it last
 /// saw, and what it found or why it stopped.
 struct Scanning {
-    frame: Arc<Mutex<Option<Vec<u8>>>>,
+    frame: Arc<Mutex<Option<crate::scan::Frame>>>,
     found: Arc<Mutex<Option<Result<String, String>>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     img: Option<egui::TextureHandle>,
@@ -905,12 +905,28 @@ impl App {
     /// text goes in the Code field, and its password is asked for.
     fn scan(&mut self, ui: &mut Ui) {
         let l = look(ui);
+        // A picture of the code (a photo of the other screen), dropped on
+        // the window: read here, as camera frames are.
+        let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if let Some(p) = dropped.first().map(|f| f.path().to_path_buf()) {
+            let got = crate::scan::picture(&p).map(|f| crate::scan::read(&f));
+            match got {
+                Ok(Some(t)) => (self.code, self.said) = (t, String::new()),
+                Ok(None) => {
+                    self.said = "No QR code read in that picture".into()
+                }
+                Err(e) => self.said = format!("{e:#}"),
+            }
+            self.scanning = None;
+        }
         let Some(s) = &mut self.scanning else {
             let tip = "The camera reads the code the other device shows: \
                        nothing goes online, no frame is kept";
             if ui.button("Scan with the camera").on_hover_text(tip).clicked() {
                 self.scanning = Some(Scanning::start(ui.ctx()));
             }
+            let or = "Or drop a picture of the code on this window";
+            ui.label(RichText::new(or).small().color(l.muted));
             return;
         };
         // Taken out of the lock first: the result outlives the guard.
@@ -927,8 +943,7 @@ impl App {
         if let Some(f) =
             s.frame.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
-            let img =
-                ColorImage::from_gray([crate::scan::W, crate::scan::H], &f);
+            let img = ColorImage::from_gray([f.w, f.h], &f.px);
             match &mut s.img {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => {
@@ -940,7 +955,9 @@ impl App {
         let say = "Hold the other device's QR code to the camera";
         ui.label(RichText::new(say).small().color(l.muted));
         if let Some(t) = &s.img {
-            ui.image((t.id(), vec2(352.0, 198.0)));
+            let [w, h] = t.size();
+            let h = 352.0 * h as f32 / w.max(1) as f32;
+            ui.image((t.id(), vec2(352.0, h)));
         }
         if ui.button("Stop the camera").clicked() {
             self.scanning = None;

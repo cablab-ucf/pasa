@@ -69,7 +69,7 @@ pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys'
                              (offline) after its password; serve until it has synced. No
                              store password asked
 pasa join NAME CODE|--scan   take the code device NAME shows (a QR code: its password
-                             too; --scan: by the camera, with ffmpeg), then sync. The
+                             too; --scan: by the camera, in this program), then sync. The
                              store's password opens it afterwards
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 

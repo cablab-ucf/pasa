@@ -162,7 +162,7 @@ ciphertext, and learns when you change things. A version deleted from
 ```sh
 pasa pair phone --qr   # here: the QR code's password, then the code; serves until phone has synced
 pasa join home CODE    # there (the apps scan it): the QR code's password; then it syncs
-pasa join home --scan  # the same, the code read by this computer's camera (ffmpeg)
+pasa join home --scan  # the same, the code read by this computer's camera
 pasa serve             # accept syncs; wake listening peers on news
 pasa listen            # sync when woken, through pushir's daemon (laptops)
 pasa sync              # with every peer, all at once (also after each change)
@@ -177,7 +177,9 @@ YubiKey), and the hardware keys' files if there are any (`quick`, `ctap`:
 sealed to them), with this device's endpoint and a fresh transport key for the
 two. The device that has the keys shows a QR code (offline: a phone's
 camera, a computer's by `join --scan` or the window's "Scan with the
-camera", or `join` with its text takes it; frames stay in memory), under a password of its own, typed or two
+camera" (in-process: AVFoundation, V4L2; nothing to install), a picture
+of it dropped on the window, or `join` with its text takes it; frames
+stay in memory), under a password of its own, typed or two
 made-up words, shown before the code and never beside it; or a short
 code to type (`pair` without `--qr`, for a device with no camera), which
 meets once at the relay under [pairir](https://github.com/cablab-ucf/pairir)
