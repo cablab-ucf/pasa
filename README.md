@@ -86,10 +86,11 @@ libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 ## Files
 
 ```
-~/.pasa/key      store keys, sealed to the password (+ YubiKey); paired, as it is
-~/.pasa/v/       versions: age files, named by their hash; synced, as they are
-~/.pasa/net/     what the network side sees beside v/: pairings (transport key, endpoint,
-                 lane), this device's endpoint key and lane
+~/.pasa/key        store keys, sealed to the password (+ YubiKey); paired, as it is
+~/.pasa/store/v/   versions: age files, named by their hash; synced, as they are
+~/.pasa/store/.git if you make one: git's work tree is store/, ciphertext alone
+~/.pasa/net/       what the network side sees beside store/v/: pairings (transport key,
+                   endpoint, lane), this device's endpoint key and lane
 ```
 
 Nothing else is written: no index, no cache. A listing opens every
@@ -107,17 +108,19 @@ two devices changing an entry apart show up in `pasa ls` until an edit
 follows the winner. A file alone tells nothing: not its entry, not its
 history. Back up `~/.pasa` with anything.
 
-`git init --bare ~/.pasa/git` and pasa commits each new version of `v/`
-there, and pushes if a remote is set (`git --git-dir ~/.pasa/git remote
-add origin URL`, then `git ... push -u` once): a remote holds what `serve`
-does, ciphertext, and learns when you change things. The repository lies
-beside `v/`, never in it, since the network side may write in `v/`: no
-hook or config of its can run where the keys are. Hooks never run, and
-only versions are committed (a name of 32 hex digits, an age file), not
-whatever else lies in `v/`. One made in `v/` before (`v/.git`) moves
-there by itself, its hooks dropped and its config cut to its remotes and
-branches. A version deleted from `v/` is then named by `pasa ls` and
-restored by `git --git-dir ~/.pasa/git --work-tree ~/.pasa/v checkout .`.
+`git init ~/.pasa/store` and pasa commits each new version there, and
+pushes if a remote is set (`git -C ~/.pasa/store remote add origin URL`,
+then `git -C ~/.pasa/store push -u origin HEAD` once): a remote holds what
+`serve` does, ciphertext, and learns when you change things. git's whole
+world is `store/`: the versions, and no key, so no git command, however
+mistaken, reaches one. The network side writes in `store/v/`, never in
+`store/.git`, so no hook or config of its can run; hooks never run
+anyway, and only versions are committed (a name of 32 hex digits, an age
+file), not whatever else lies in `v/`. Versions in `~/.pasa/v/` (before)
+move into `store/v/` by themselves, and a repository made there
+(`v/.git`) up to `store/.git`, its hooks dropped and its config cut to
+its remotes and branches. A version deleted is then named by `pasa ls`
+and restored by `git -C ~/.pasa/store checkout v`.
 
 `pasa edit` (and `^E` in the terminal browser) hands `$EDITOR` a file in a directory of its own (the owner
 alone), on a file system in memory where there is one (Linux:
@@ -235,12 +238,12 @@ opened that one alone, go).
 new device syncs at once, before anything is unlocked. On every platform
 what crosses the network is ciphertext: versions, and at pairing the
 sealed key files. Beyond that, and as far as the system allows (best
-effort), a computer runs it in a process of its own that sees `v/` and
+effort), a computer runs it in a process of its own that sees `store/v/` and
 `net/` alone: never `key`, the rest of `~/.pasa` or of the computer. On
 Linux it confines itself by Landlock before it opens a socket (a kernel
 without Landlock: it says so and runs unconfined); on macOS its parent
 starts it inside the system sandbox (`sandbox-exec`), which keeps it out
-of `/Users`, `/Volumes` and the temporary directories but for `v/` and
+of `/Users`, `/Volumes` and the temporary directories but for `store/v/` and
 `net/`. The process that holds the store open (the window, a command)
 opens no socket. On Android the app is one process: its network code
 shares it with an unlocked store. The window
@@ -260,7 +263,7 @@ files, its endpoint key and the pairings: taking it over yields
 ciphertext. One process serves a store at a time (a lock on the endpoint
 key): the window and a daemon would take each other's place at the
 relay. Dialers use throwaway endpoints. Received files must match
-their names, be asked for, and be under 16 MiB; strays in `v/` are
+their names, be asked for, and be under 16 MiB; strays in `store/v/` are
 ignored.
 
 A wake (after a change here, or Sync now; never otherwise) is an empty

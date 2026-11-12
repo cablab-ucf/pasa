@@ -118,6 +118,24 @@ pub fn is_name(n: &str) -> bool {
     n.len() == 32 && n.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The versions: `store/v/`, beside the store's git repository, if one is
+/// made (`store/.git`), and apart from the keys: git's whole world is
+/// ciphertext. Moved from `v/`, where they lay before, the first time asked
+/// (one by one, if something made `store/v/` first).
+pub fn versions(dir: &Path) -> PathBuf {
+    let (v, old) = (dir.join("store").join("v"), dir.join("v"));
+    if old.is_dir() {
+        let _ = fs::create_dir_all(dir.join("store"));
+        if fs::rename(&old, &v).is_err() {
+            for e in fs::read_dir(&old).into_iter().flatten().flatten() {
+                let _ = fs::rename(e.path(), v.join(e.file_name()));
+            }
+            let _ = fs::remove_dir(&old);
+        }
+    }
+    v
+}
+
 pub fn home() -> PathBuf {
     let h = || std::env::home_dir().unwrap_or_default().join(".pasa");
     std::env::var_os("PASA_DIR").map_or_else(h, PathBuf::from)
@@ -238,6 +256,8 @@ impl Index {
 
 pub struct Store {
     pub dir: PathBuf,
+    /// [`versions`].
+    v: PathBuf,
     /// Store keys, newest first: older ones open history.
     keys: Vec<Secret>,
     ids: Vec<age::scrypt::Identity>,
@@ -260,6 +280,7 @@ impl Store {
     ) -> Result<Store> {
         Ok(Store {
             dir: dir.into(),
+            v: versions(dir),
             ids: keys.iter().map(|k| identity(k)).collect(),
             newest: recipient(keys.first().context("no store key")?),
             keys,
@@ -485,7 +506,7 @@ impl Store {
     }
 
     fn version(&self, file: &str) -> Result<impl Read + use<'_>> {
-        reader(&self.ids, fs::File::open(self.dir.join("v").join(file))?)
+        reader(&self.ids, fs::File::open(self.v.join(file))?)
     }
 
     fn head(&self, file: &str) -> Option<Version> {
@@ -500,7 +521,7 @@ impl Store {
     /// no store key opens are counted in [`Store::unreadable`].
     fn index(&self) -> Result<std::sync::MutexGuard<'_, Index>> {
         let mut x = self.index.lock().unwrap_or_else(|p| p.into_inner());
-        let v = self.dir.join("v");
+        let v = self.v.clone();
         let mtime = fs::metadata(&v).and_then(|m| m.modified()).ok();
         // A listing made within the directory's own two seconds may be
         // behind it (a sync writes beside us, in the same tick).
@@ -652,8 +673,7 @@ impl Store {
             .filter_map(|f| Some(f.0.rsplit_once('/')?.0))
             .collect();
         let unique: HashSet<&str> = forms.iter().map(|f| &*f.1.pass).collect();
-        let size =
-            fs::read_dir(self.dir.join("v")).into_iter().flatten().flatten();
+        let size = fs::read_dir(&self.v).into_iter().flatten().flatten();
         let size: u64 =
             size.filter_map(|e| Some(e.metadata().ok()?.len())).sum();
         let date = |ms: Option<u64>| {
@@ -795,9 +815,8 @@ impl Store {
         pt.resize(n, 0);
         let ct = encrypt(&self.newest, &pt)?;
         v.file = name_of(&ct);
-        write(&self.dir.join("v").join(&v.file), &ct)?;
-        x.mtime =
-            fs::metadata(self.dir.join("v")).and_then(|m| m.modified()).ok();
+        write(&self.v.join(&v.file), &ct)?;
+        x.mtime = fs::metadata(&self.v).and_then(|m| m.modified()).ok();
         x.tip(&v);
         x.heads.insert(v.file.clone(), v);
         Ok(())
@@ -1370,8 +1389,11 @@ mod tests {
         // Four, mail sealed again, and word that the first key is retired.
         assert_eq!(s.versions().unwrap().len(), 6);
         assert!(s.conflicts().unwrap().is_empty());
-        fs::write(d.join("v/0123456789abcdef0123456789abcdef"), b"not ours")
-            .unwrap();
+        fs::write(
+            crate::versions(&d).join("0123456789abcdef0123456789abcdef"),
+            b"not ours",
+        )
+        .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
         assert_eq!(s.versions().unwrap().len(), 6);
@@ -1394,6 +1416,23 @@ mod tests {
         assert!(b.lock(b"other", None).is_err());
         assert!(b.rotate().is_err());
         assert_eq!(Store::open(&d, b"pw", None).unwrap().keys().len(), 2);
+    }
+
+    /// Versions move from `v/` into `store/v/`, all of them, also when
+    /// something made `store/v/` first; the store opens there as before.
+    #[test]
+    fn versions_move_into_store() {
+        let d = dir("move");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        s.put("x", b"1").unwrap();
+        drop(s);
+        fs::rename(versions(&d), d.join("v")).unwrap();
+        fs::write(d.join("v/a"), b"").unwrap();
+        fs::create_dir_all(d.join("store/v")).unwrap();
+        let s = Store::open(&d, b"pw", None).unwrap();
+        assert!(!d.join("v").exists());
+        assert!(d.join("store/v/a").exists());
+        assert_eq!(&s.get("x").unwrap()[..], b"1");
     }
 
     /// A session opened before a rotation writes nothing more: its key
@@ -1422,9 +1461,10 @@ mod tests {
         s.put("x", b"1").unwrap();
         drop(s);
         let sync = |from: &Path, to: &Path| {
-            fs::create_dir_all(to.join("v")).unwrap();
-            for e in fs::read_dir(from.join("v")).unwrap().flatten() {
-                fs::copy(e.path(), to.join("v").join(e.file_name())).unwrap();
+            fs::create_dir_all(crate::versions(to)).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                fs::copy(e.path(), crate::versions(to).join(e.file_name()))
+                    .unwrap();
             }
         };
         sync(&a, &b);
@@ -1454,9 +1494,10 @@ mod tests {
         s.put("x", b"1").unwrap();
         let o = d.join("other");
         let copy = |from: &Path, to: &Path| {
-            for e in fs::read_dir(from.join("v")).unwrap().flatten() {
-                fs::create_dir_all(to.join("v")).unwrap();
-                fs::copy(e.path(), to.join("v").join(e.file_name())).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                fs::create_dir_all(crate::versions(to)).unwrap();
+                fs::copy(e.path(), crate::versions(to).join(e.file_name()))
+                    .unwrap();
             }
         };
         copy(&d, &o);
@@ -1479,7 +1520,7 @@ mod tests {
         let s = Store::create(&d, b"pw", None).unwrap();
         s.put("x", b"hunter2").unwrap();
         let v = &s.entries().unwrap()["x"];
-        let ct = fs::read(d.join("v").join(&v.file)).unwrap();
+        let ct = fs::read(crate::versions(&d).join(&v.file)).unwrap();
         assert!(ct.starts_with(b"age-encryption.org/v1\n-> scrypt "));
         let pt = open(&s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
@@ -1494,7 +1535,7 @@ mod tests {
         let s = Store::create(&d, b"pw", None).unwrap();
         let line = format!("{} - {} x\n", u64::MAX, usize::MAX);
         let ct = seal(&s.keys()[0], line.as_bytes()).unwrap();
-        write(&d.join("v").join(name_of(&ct)), &ct).unwrap();
+        write(&crate::versions(&d).join(name_of(&ct)), &ct).unwrap();
         assert!(s.get("x").is_err(), "damaged");
         s.put("y", b"after").unwrap();
         assert_eq!(&s.get("y").unwrap()[..], b"after");

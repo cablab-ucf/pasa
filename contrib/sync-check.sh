@@ -63,9 +63,9 @@ done
 say "what the network side sees (v/, net/): no key file, no store key, no secret"
 k=$(p phone pw keys | tail -1)
 for d in phone desk lap; do
-  n=$(ls $d/v | wc -l)
-  a=$(for f in $d/v/*; do head -n1 "$f"; done | grep -c '^age-encryption.org/v1$')
+  n=$(ls $d/store/v | wc -l)
+  a=$(for f in $d/store/v/*; do head -n1 "$f"; done | grep -c '^age-encryption.org/v1$')
   c=$(grep -rlaF -e hunter2 -e phone-secret-1 -e desk-secret-2 -e "$k" \
-    $d/v $d/net | wc -l)
+    $d/store/v $d/net | wc -l)
   echo "$d: $a of $n versions are age files; $c files hold a secret"
 done

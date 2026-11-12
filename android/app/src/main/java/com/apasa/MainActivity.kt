@@ -108,7 +108,7 @@ class MainActivity : ComponentActivity(), Host {
     private fun here(on: Boolean) {
         Native.serve(dir, on)
         watch?.stopWatching()
-        watch = if (!on) null else object : android.os.FileObserver(File(dir, "v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
+        watch = if (!on) null else object : android.os.FileObserver(File(dir, "store/v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
             override fun onEvent(event: Int, path: String?) { main.post { news++ } }
         }.apply { startWatching() }
     }

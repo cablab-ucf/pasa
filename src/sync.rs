@@ -214,7 +214,7 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     let theirs = theirs.and_then(|l| l.parse().ok());
     let id = <[u8; 32]>::try_from(&rx.recv(32).await?[..]).ok();
     let id = id.and_then(|b| PublicKey::from_bytes(&b).ok());
-    let v = dir.join("v");
+    let v = crate::versions(dir);
     let names = fs::read_dir(&v).into_iter().flatten().flatten();
     let mine: HashSet<String> = names
         .filter_map(|e| e.file_name().into_string().ok())
@@ -642,20 +642,16 @@ mod tests {
         let node = |d: &Path| key(d, "node").unwrap().public();
         assert_eq!(at(&desk, "phone").unwrap().id, Some(node(&phone)));
         assert_eq!(at(&phone, "desk").unwrap().id, Some(node(&desk)));
-        // The sync side's view, v/ and net/: age files and transport keys;
+        // The sync side's view, store/v/ and net/: age files and transport keys;
         // no store key, no entry, no key file.
         for d in [&phone, &desk] {
-            for e in fs::read_dir(d.join("v")).unwrap().flatten() {
+            for e in fs::read_dir(crate::versions(d)).unwrap().flatten() {
                 let b = fs::read(e.path()).unwrap();
                 assert!(b.starts_with(b"age-encryption.org/v1\n-> scrypt "));
             }
             for s in [&store_key[..], b"hunter2", b"Tr0ub4dor", &file[..]] {
-                for sub in ["v", "net"] {
-                    assert!(
-                        !holds(&d.join(sub), s),
-                        "{}: a secret",
-                        d.display()
-                    );
+                for sub in [crate::versions(d), d.join("net")] {
+                    assert!(!holds(&sub, s), "{}: a secret", d.display());
                 }
             }
         }
@@ -760,10 +756,10 @@ mod tests {
         Store::create(&a, b"pw", None).unwrap();
         pair(&a, "a", &b, "b");
         for (side, x) in [(&a, 0u32), (&b, 1)] {
-            fs::create_dir_all(side.join("v")).unwrap();
+            fs::create_dir_all(crate::versions(side)).unwrap();
             for i in 0..70_000u32 {
                 let n = format!("{x:08x}{i:024x}");
-                fs::File::create(side.join("v").join(n)).unwrap();
+                fs::File::create(crate::versions(side).join(n)).unwrap();
             }
         }
         let go = swap_once(&a, &b, "b", "a");
@@ -783,7 +779,7 @@ mod tests {
         pair(&a, "a", &c, "c");
         sa.put("x", b"1").unwrap();
         Store::open(&b, b"pw", None).unwrap().put("y", b"2").unwrap();
-        fs::write(a.join("v/stray"), b"editor backup").unwrap();
+        fs::write(crate::versions(&a).join("stray"), b"editor backup").unwrap();
         // a listens: whoever it dials learns its lane, to wake it there.
         set_mailbox(&a, SecretKey::from_bytes(&[3; 32]).public()).unwrap();
         assert_eq!(swap_once(&a, &b, "b", "a").await, (1, 1));

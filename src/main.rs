@@ -654,17 +654,17 @@ fn pwned(pw: &str) -> Result<u64> {
     Ok(pasa::pwned_count(&kept, &String::from_utf8_lossy(&o.stdout)))
 }
 
-/// `git` on `v/`, its repository `git/` beside it (`git init --bare
-/// ~/.pasa/git`), never in `v/`, where the network side may write: a hook
-/// or config it planted there would run here, beside the keys. Hooks
-/// never run. Its output, if it succeeded.
+/// `git` in `store/`, where the user made a repository (`git init
+/// ~/.pasa/store`): its work tree holds the versions (`v/`) and nothing
+/// of the keys. The network side may write in `v/`, never in `.git`;
+/// hooks never run. Its output, if it succeeded.
 fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
-    let g = dir.join("git");
-    if !g.is_dir() {
+    let s = dir.join("store");
+    if !s.join(".git").is_dir() {
         return None;
     }
     let mut c = Command::new("git");
-    c.arg("--git-dir").arg(&g).arg("--work-tree").arg(dir.join("v"));
+    c.arg("-C").arg(&s);
     c.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]);
     c.args(a).env("GIT_TERMINAL_PROMPT", "0");
     c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
@@ -677,11 +677,13 @@ fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
     o.status.success().then_some(o.stdout)
 }
 
-/// A repository made in `v/` before (`git init ~/.pasa/v`) moves beside
-/// it. The network side could write there, so its hooks go, and of its
-/// config only what names remotes and branches stays.
+/// A repository made in `v/` before (`git init ~/.pasa/v`), which moved
+/// with it into `store/v/`, moves up to `store/.git`. The network side
+/// could write where it lay, so its hooks go, and of its config only what
+/// names remotes and branches stays.
 fn git_moved(dir: &Path) {
-    let (old, new) = (dir.join("v").join(".git"), dir.join("git"));
+    let old = pasa::versions(dir).join(".git");
+    let new = dir.join("store").join(".git");
     if !old.is_dir() || new.exists() {
         return;
     }
@@ -713,37 +715,41 @@ fn git_moved(dir: &Path) {
             let _ = c.output();
         }
     }
+    // What it held was the versions in v/; they are now under v/ here.
+    let _ = git(dir, &["rm", "-rq", "--cached", "--ignore-unmatch", "."], None);
     eprintln!(
-        "pasa: the git repository moved from v/.git to git/, where the \
-         network side cannot write; its hooks were dropped, and of its \
+        "pasa: the git repository moved from v/.git to store/.git, where \
+         the network side cannot write; its hooks were dropped, and of its \
          config only remotes and branches kept"
     );
 }
 
-/// Commit the versions `v/` gained, and push if that has somewhere to go.
-/// Only versions are staged (a name of 32 hex digits, an age file):
-/// nothing else that lies in `v/`. A file gone from `v/` is never
-/// committed as gone: `ls` says so instead.
+/// Commit the versions `store/v/` gained, and push if that has somewhere
+/// to go. Only versions are staged (a name of 32 hex digits, an age file):
+/// nothing else that lies there. A file gone is never committed as gone:
+/// `ls` says so instead.
 fn record() {
     record_in(&home())
 }
 
 fn record_in(dir: &Path) {
+    let v = pasa::versions(dir);
     git_moved(dir);
-    let Some(out) = git(dir, &["ls-files", "-z", "--others"], None) else {
+    let Some(out) = git(dir, &["ls-files", "-z", "--others", "v"], None) else {
         return;
     };
     let age = |n: &str| {
         let mut h = [0; 22];
-        let f = std::fs::File::open(dir.join("v").join(n));
+        let f = std::fs::File::open(v.join(n));
         f.and_then(|mut f| f.read_exact(&mut h)).is_ok()
             && &h == b"age-encryption.org/v1\n"
     };
     let names =
         out.split(|b| *b == 0).filter_map(|n| std::str::from_utf8(n).ok());
     let new: Vec<u8> = names
+        .filter_map(|n| n.strip_prefix("v/"))
         .filter(|n| pasa::is_name(n) && age(n))
-        .flat_map(|n| [n.as_bytes(), b"\0"].concat())
+        .flat_map(|n| [b"v/", n.as_bytes(), b"\0"].concat())
         .collect();
     let add = ["add", "--pathspec-from-file=-", "--pathspec-file-nul"];
     if new.is_empty() || git(dir, &add, Some(&new)).is_none() {
@@ -788,10 +794,9 @@ fn main() -> Result<()> {
             {
                 0 => {}
                 n => eprintln!(
-                    "{n} versions gone from v/: git --git-dir {} --work-tree \
-                     {} checkout . brings them back",
-                    h.join("git").display(),
-                    h.join("v").display()
+                    "{n} versions gone from store/v/: git -C {} checkout v \
+                     brings them back",
+                    h.join("store").display()
                 ),
             }
             return Ok(());
@@ -1066,7 +1071,9 @@ fn report(who: &str, r: Result<usize>) {
 #[cfg(feature = "sync")]
 fn net(args: &[&str]) -> Result<std::process::Child> {
     let dir = home();
-    pasa::sync::net(&dir); // moved beside v/ here, where the child may not
+    // Moved into place here, where the child may not.
+    pasa::sync::net(&dir);
+    pasa::versions(&dir);
     let a: Vec<&str> = ["--net"].iter().chain(args).copied().collect();
     let mut c = pasa::confine::command(&dir, &std::env::current_exe()?, &a);
     c.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -1357,10 +1364,12 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// git runs nothing planted in `v/`: a repository made there before
-    /// moves beside it without its hooks or its other config (a monitor,
-    /// a pack command a push would run), and only versions are committed,
-    /// nothing else that lies in `v/`. The push still goes.
+    /// git runs nothing planted where the network side writes: a
+    /// repository made in `v/` before moves (with `v/`) to `store/.git`
+    /// without its hooks or its other config (a monitor, a pack command a
+    /// push would run), and only versions are committed, nothing else that
+    /// lies in `v/`. The push still goes; git's work tree is `store/`,
+    /// which holds no key.
     #[test]
     fn git_runs_nothing_planted_and_commits_versions_alone() {
         let d = std::env::temp_dir()
@@ -1405,10 +1414,16 @@ mod tests {
             .unwrap();
         super::record_in(&d);
         assert!(!ran.exists(), "something planted ran");
-        assert!(!v.join(".git").exists() && !d.join("git/hooks").exists());
+        let store = d.join("store");
+        assert!(!v.exists(), "v/ moved into store/");
+        assert!(
+            store.join(".git").is_dir() && !store.join(".git/hooks").exists()
+        );
+        assert!(!store.join("v/.git").exists());
         let tracked = super::git(&d, &["ls-files"], None).unwrap();
-        assert_eq!(String::from_utf8(tracked).unwrap(), format!("{version}\n"));
-        let cfg = fs::read_to_string(d.join("git/config")).unwrap();
+        let tracked = String::from_utf8(tracked).unwrap();
+        assert_eq!(tracked, format!("v/{version}\n"));
+        let cfg = fs::read_to_string(store.join(".git/config")).unwrap();
         assert!(cfg.contains("url = ") && cfg.contains("merge = "));
         assert!(!cfg.contains("receivepack") && !cfg.contains("fsmonitor"));
         let pushed = Command::new("git")
