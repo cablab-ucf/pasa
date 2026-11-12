@@ -449,6 +449,14 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 /// With quick unlock on: the YubiKey and the PIN; else, or if that
 /// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
+    let s = unlocked()?;
+    if s.retired() {
+        eprintln!("{}", pasa::RETIRED_SAY);
+    }
+    Ok(s)
+}
+
+fn unlocked() -> Result<Store> {
     // No store: said before any password is asked for.
     ensure!(home().join("key").exists(), pasa::NO_STORE);
     // Devices apart for a month, said where a person reads.
@@ -1193,7 +1201,9 @@ async fn sync(a: &[&str]) -> Result<()> {
             }
             eprintln!(
                 "A new store key: pair the other devices again (pasa pair \
-                 NAME here, join there), and forget {name} on each"
+                 NAME here, join there), and forget {name} on each. What \
+                 {name} knew it still knows: change those passwords at \
+                 their services"
             );
         }
         _ => bail!("{USAGE}"),

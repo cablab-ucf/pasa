@@ -1243,7 +1243,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                 }
             }
             TextButton({ go { host.forget(p); "$p: forgotten" } }) { Text("Forget") }
-            TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again" } }) { Text("Revoke") }
+            TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again. What it knew it still knows: change those passwords at their services." } }) { Text("Revoke") }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("ADD A DEVICE")

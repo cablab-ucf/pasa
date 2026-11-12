@@ -139,6 +139,20 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Where a rotation leaves word, sealed to the key it retires, for the
+/// devices still on it (hidden: a name part begins with a dot).
+const RETIRED: &str = ".pasa/retired/";
+
+/// What a device on a retired key is told, and why it writes nothing.
+pub const RETIRED_SAY: &str = "this device's store key was retired on \
+    another device (a revocation): pair again from it; nothing more is \
+    written under the old key";
+
+/// A store key's name in such word: 128 bits of its SHA-256.
+fn key_id(k: &[u8]) -> String {
+    HEXLOWER.encode(&Sha256::digest(k)[..16])
+}
+
 /// What is said where there is no store yet: both ways to have one.
 pub const NO_STORE: &str = "no store here: pasa init makes one; or pasa join \
     NAME CODE takes one from a device that has it (pasa pair NAME there)";
@@ -447,15 +461,27 @@ impl Store {
     }
 
     /// A new store key, first; every entry sealed again to it. History
-    /// stays under the keys it was written to.
+    /// stays under the keys it was written to. Devices still on the old key
+    /// find word of it, sealed to that key, at their next sync, and write
+    /// nothing more under it ([`Store::retired`]): they pair again.
     pub fn rotate(&mut self) -> Result<()> {
         let e = self
             .entries()?
             .into_values()
             .map(|v| Ok((v.name.clone(), self.body(&v)?)));
         let e = e.collect::<Result<Vec<_>>>()?;
+        let old = key_id(self.keys.first().context("no store key")?);
+        self.put(&format!("{RETIRED}{old}"), b"retired")?;
         self.add_keys(&rand::<32>())?;
         e.iter().try_for_each(|(n, b)| self.put(n, b))
+    }
+
+    /// Whether this device's store key was retired by a rotation on
+    /// another device (a revocation): nothing more is written under it.
+    pub fn retired(&self) -> bool {
+        let Some(k) = self.keys.first() else { return false };
+        let at = format!("{RETIRED}{}", key_id(k));
+        self.index().is_ok_and(|x| x.tips.contains_key(&at))
     }
 
     fn version(&self, file: &str) -> Result<impl Read + use<'_>> {
@@ -538,7 +564,8 @@ impl Store {
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
         let mut m: BTreeMap<_, _> =
             self.versions()?.into_iter().map(|v| (v.name.clone(), v)).collect();
-        m.retain(|_, v| v.size > 0);
+        // Word of retired keys is the store's own, not an entry.
+        m.retain(|n, v| v.size > 0 && !n.starts_with(RETIRED));
         Ok(m)
     }
 
@@ -735,6 +762,25 @@ impl Store {
     ) -> Result<()> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
+        // Nothing more under a key that may be retired: one a rotation or
+        // relock here replaced since this unlock, or one another device
+        // retired (word of it came by sync).
+        let loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
+        let now = fs::read(self.dir.join("key")).unwrap_or_default();
+        ensure!(
+            now == *loaded,
+            "the store key changed since this unlock (a rotation, a new \
+             password or a pairing): unlock again"
+        );
+        drop(loaded);
+        let newest = self.keys.first().context("no store key")?;
+        ensure!(
+            name.starts_with(RETIRED)
+                || !x
+                    .tips
+                    .contains_key(&format!("{RETIRED}{}", key_id(newest))),
+            "{RETIRED_SAY}"
+        );
         ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
         let mut v = Version {
             ms,
@@ -1321,13 +1367,14 @@ mod tests {
         let body = String::from_utf8(s.get("mail").unwrap().to_vec()).unwrap();
         assert_eq!(field(&body, "user").as_deref(), Some("me"));
         assert_eq!(field(&body, "pass").as_deref(), Some("b"));
-        assert_eq!(s.versions().unwrap().len(), 5);
+        // Four, mail sealed again, and word that the first key is retired.
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert!(s.conflicts().unwrap().is_empty());
         fs::write(d.join("v/0123456789abcdef0123456789abcdef"), b"not ours")
             .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
-        assert_eq!(s.versions().unwrap().len(), 5);
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert_eq!(s.unreadable.load(Relaxed), 1);
         s.lock(b"new", Some((&[9; 32], b"hmac"))).unwrap();
         let k = fs::read(d.join("key")).unwrap();
@@ -1347,6 +1394,55 @@ mod tests {
         assert!(b.lock(b"other", None).is_err());
         assert!(b.rotate().is_err());
         assert_eq!(Store::open(&d, b"pw", None).unwrap().keys().len(), 2);
+    }
+
+    /// A session opened before a rotation writes nothing more: its key
+    /// may be the one retired. Opened again, it writes.
+    #[test]
+    fn a_stale_session_writes_nothing() {
+        let d = dir("stale-write");
+        drop(Store::create(&d, b"pw", None).unwrap());
+        let mut a = Store::open(&d, b"pw", None).unwrap();
+        let b = Store::open(&d, b"pw", None).unwrap();
+        b.put("x", b"1").unwrap();
+        a.rotate().unwrap();
+        assert!(b.put("x", b"2").is_err(), "sealed to a retired key");
+        assert!(b.remove("x").is_err());
+        a.put("x", b"3").unwrap();
+        Store::open(&d, b"pw", None).unwrap().put("x", b"4").unwrap();
+    }
+
+    /// A device still on a key that another retired (a revocation) learns
+    /// it by sync, and writes nothing more under it; paired again, it does.
+    #[test]
+    fn a_retired_key_is_learnt_by_sync() {
+        let d = dir("retired");
+        let (a, b) = (d.join("a"), d.join("b"));
+        let s = Store::create(&a, b"pw", None).unwrap();
+        s.put("x", b"1").unwrap();
+        drop(s);
+        let sync = |from: &Path, to: &Path| {
+            fs::create_dir_all(to.join("v")).unwrap();
+            for e in fs::read_dir(from.join("v")).unwrap().flatten() {
+                fs::copy(e.path(), to.join("v").join(e.file_name())).unwrap();
+            }
+        };
+        sync(&a, &b);
+        fs::copy(a.join("key"), b.join("key")).unwrap();
+        Store::open(&b, b"pw", None).unwrap().put("y", b"2").unwrap();
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        sa.rotate().unwrap();
+        assert!(!sa.retired());
+        sync(&a, &b);
+        let sb = Store::open(&b, b"pw", None).unwrap();
+        assert!(sb.retired());
+        assert!(sb.put("y", b"3").is_err());
+        assert_eq!(&sb.get("x").unwrap()[..], b"1", "it still reads");
+        // Paired again: the key file that holds the new key.
+        fs::copy(a.join("key"), b.join("key")).unwrap();
+        let sb = Store::open(&b, b"pw", None).unwrap();
+        assert!(!sb.retired());
+        sb.put("y", b"3").unwrap();
     }
 
     /// Two devices changed one entry apart: the newer wins, and is flagged

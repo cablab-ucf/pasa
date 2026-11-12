@@ -2169,7 +2169,9 @@ impl App {
                         v.note = match sync::revoke(&mut v.s, &p.name) {
                             Ok(()) => format!(
                                 "{}: revoked. A new store key: pair the other \
-                                 devices again, and forget {} on each",
+                                 devices again, and forget {} on each. What it \
+                                 knew it still knows: change those passwords at \
+                                 their services",
                                 p.name, p.name
                             ),
                             Err(e) => format!("{e:#}"),
