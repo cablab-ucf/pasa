@@ -139,6 +139,10 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What is said where there is no store yet: both ways to have one.
+pub const NO_STORE: &str = "no store here: pasa init makes one; or pasa join \
+    NAME CODE takes one from a device that has it (pasa pair NAME there)";
+
 /// The YubiKey challenge in a key file, if it has one.
 pub fn challenge(key: &[u8]) -> Option<&[u8]> {
     (key.get(32) == Some(&1)).then(|| &key[..32])
@@ -268,7 +272,7 @@ impl Store {
 
     /// Open with the password and, if `key` asks, the YubiKey's response.
     pub fn open(dir: &Path, pw: &[u8], yk: Option<&[u8]>) -> Result<Store> {
-        let f = fs::read(dir.join("key")).context("no store: pasa init")?;
+        let f = fs::read(dir.join("key")).context(NO_STORE)?;
         let salt = f.get(..32).context("not a pasa key file")?;
         Store::unsealed(dir, kek(pw, salt, yk)?)
             .context("wrong password or key")
@@ -353,7 +357,7 @@ impl Store {
 
     /// With the key the password gives.
     fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
-        let f = fs::read(dir.join("key")).context("no store: pasa init")?;
+        let f = fs::read(dir.join("key")).context(NO_STORE)?;
         let (salt, sealed) =
             f.split_at_checked(33).context("not a pasa key file")?;
         let keys = open(&kek, sealed).context("the key does not open it")?;

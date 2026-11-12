@@ -15,7 +15,7 @@ pasa mail/work otp                # a field: pass, user, otp, ...
 ```sh
 pasa tui                          # one unlock: type to filter, Enter copies
 pasa gui                          # the same in a window (--features gui)
-nix run github:cablab-ucf/pasa -- gui   # NixOS, macOS: all three, nothing to install
+nix run github:cablab-ucf/pasa          # NixOS, macOS: the window (-- ARGS: pasa ARGS), nothing to install
 ```
 
 `pasa help` lists every command. An entry is text as in `pass`: the

@@ -387,6 +387,8 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 /// With quick unlock on: the YubiKey and the PIN; else, or if that
 /// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
+    // No store: said before any password is asked for.
+    ensure!(home().join("key").exists(), pasa::NO_STORE);
     // Devices apart for a month, said where a person reads.
     #[cfg(feature = "sync")]
     if std::io::stderr().is_terminal() {
@@ -420,7 +422,7 @@ fn open() -> Result<Store> {
 }
 
 fn unlock(pw: &[u8]) -> Result<Store> {
-    let k = std::fs::read(home().join("key")).context("no store: pasa init")?;
+    let k = std::fs::read(home().join("key")).context(pasa::NO_STORE)?;
     let yk = challenge(&k).map(yubikey).transpose()?;
     Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))
 }

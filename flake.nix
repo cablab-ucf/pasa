@@ -43,5 +43,14 @@
         pasa-gui = pasa pkgs true;   # cli, tui, gui
         pasa-cli = pasa pkgs false;  # cli, tui: no window libraries
       });
+      # `nix run` (or .#pasa-gui): the window; with arguments, pasa itself
+      # (`nix run . -- ls`).
+      apps = each (system: let
+        pkgs = nixpkgs.legacyPackages.${system};
+        gui = pkgs.writeShellScript "pasa-gui" ''
+          exec ${self.packages.${system}.pasa-gui}/bin/pasa "''${@:-gui}"
+        '';
+        app = { type = "app"; program = "${gui}"; meta.description = "pasa: the window"; };
+      in { default = app; pasa-gui = app; });
     };
 }
