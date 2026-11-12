@@ -86,7 +86,7 @@ fn now() -> u64 {
 }
 
 /// Whether sync is on here. Off unless turned on (pairing turns it on), as
-/// on the phone; off, nothing goes online: no serving, no listening, no
+/// on the phone; off, pasa opens no connection: no serving, no listening, no
 /// sync after a change.
 pub fn on(dir: &Path) -> bool {
     net(dir).join("on").exists()

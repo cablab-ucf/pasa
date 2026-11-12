@@ -1140,7 +1140,7 @@ fn net_side(a: &[&str]) -> Result<()> {
     net_go(&dir, a, got.trim())
 }
 
-/// `go`, while sync is on here: nothing goes online while it is off, and
+/// `go`, while sync is on here: no connection while it is off, and
 /// within seconds of the switch it starts or stops. A service running
 /// `pasa serve` follows the switch, as the window does.
 #[cfg(feature = "sync")]
@@ -1152,7 +1152,7 @@ async fn while_on<F: std::future::Future<Output = Result<()>>>(
     let tick = || tokio::time::sleep(std::time::Duration::from_secs(2));
     loop {
         if !on(dir) {
-            eprintln!("Offline: nothing goes online until pasa sync on");
+            eprintln!("Offline: pasa opens no connection until pasa sync on");
             while !on(dir) {
                 tick().await
             }
@@ -1294,7 +1294,7 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["sync", "off"] => {
             sync::set_on(&dir, false)?;
-            eprintln!("Offline: nothing goes online until pasa sync on");
+            eprintln!("Offline: pasa opens no connection until pasa sync on");
         }
         ["sync", ..] => {
             ensure!(sync::on(&dir), "offline: pasa sync on, then pasa sync");

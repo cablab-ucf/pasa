@@ -2125,7 +2125,7 @@ impl App {
                 Ok(()) if on => {
                     "Sync on: paired devices sync with this one".into()
                 }
-                Ok(()) => "Offline: nothing goes online".into(),
+                Ok(()) => "Offline: pasa opens no connection".into(),
                 Err(e) => format!("{e:#}"),
             };
             if on {
@@ -2134,7 +2134,7 @@ impl App {
         }
         let about = "Devices that hold this store sync with each other directly, \
                      sealed end to end. No account, no server keeps a copy. Off: \
-                     this computer never uses the network for it. Offline is \
+                     pasa opens no connection for it. Offline is \
                      fine; check in about once a month, and each device says \
                      which others it has not met for longer.";
         ui.label(RichText::new(about).small().color(l.muted));

@@ -1222,7 +1222,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             Column(Modifier.weight(1f).padding(end = 12.dp)) {
                 Text("Sync with my devices", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    "Devices that hold this store sync with each other directly, sealed end to end. No account, no server keeps a copy. Off: the app never uses the network. Offline is fine; check in about once a month, and each device says which others it has not met for longer.",
+                    "Devices that hold this store sync with each other directly, sealed end to end. No account, no server keeps a copy. Off: the app opens no connection for sync or pushes (a breach check asks its site only when asked). Offline is fine; check in about once a month, and each device says which others it has not met for longer.",
                     style = MaterialTheme.typography.bodySmall, color = muted,
                 )
             }

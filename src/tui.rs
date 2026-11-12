@@ -155,7 +155,7 @@ fn browse(mut v: View) -> Result<()> {
                         crate::aside(false);
                         "Sync on: paired devices sync with this one".into()
                     }
-                    Ok(()) => "Offline: nothing goes online".into(),
+                    Ok(()) => "Offline: pasa opens no connection".into(),
                     Err(e) => format!("{e:#}"),
                 };
             }

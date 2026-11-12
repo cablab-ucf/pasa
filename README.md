@@ -129,6 +129,12 @@ there `pasa set` (from stdin) and the window edit in memory.
 
 ## Keys
 
+- **Each way in opens the store alone.** The password (with the YubiKey
+  as well, if the store was made with `-y`: then both are needed); or a
+  security key and its PIN (`ctap`); or a YubiKey and pasa's PIN
+  (`quick`). The last two are other ways in beside the password, not
+  further factors after it: a store is as hard to open as the weakest way
+  set up on the device that holds it.
 - **Store keys**: 256 random bits each (hedged with the password, RFC
   8937), newest first; never derived.
 - **Their lock**: Argon2id (256 MiB, 4 passes) of the password, with the
@@ -194,10 +200,13 @@ pasa sync              # with every peer, all at once (also after each change)
 
 **Offline by default.** Each device has a switch, off until turned on
 (pairing turns it on): `pasa sync on|off`, the window's Devices or its
-status bar, `^S` in `pasa tui`, the phone's Devices. Off, nothing of the
-store goes online: no serving (`pasa serve` and its service wait, and
+status bar, `^S` in `pasa tui`, the phone's Devices. Off, pasa opens no
+connection of its own: no serving (`pasa serve` and its service wait, and
 start or stop within seconds of the switch), no listening, no sync after
-a change. Offline is the norm; check in about once a month. Each device
+a change; the phone leaves the push connection (its own broker stopped;
+another app of its group may keep one of its own). A breach check
+(`health --pwned`, Password health) asks its site only when asked to.
+Offline is the norm; check in about once a month. Each device
 keeps when each other last synced with it, and says which it has not met
 for a month: in the window's status bar and Devices, `pasa peers`, on a
 terminal's commands, and above the phone's list.
@@ -223,14 +232,18 @@ that differed is kept as `key.old`; its own hardware keys' files, which
 opened that one alone, go).
 
 **Syncing** sends versions, age files to the store key, as they are; the
-new device syncs at once, before anything is unlocked. It runs in a
-process of its own that sees `v/` and `net/` alone: never `key`, the
-rest of `~/.pasa` or of the computer. On Linux it confines itself by
-Landlock before it opens a socket (a kernel without Landlock: it says so
-and runs unconfined); on macOS its parent starts it inside the system
-sandbox (`sandbox-exec`), which keeps it out of `/Users`, `/Volumes` and
-the temporary directories but for `v/` and `net/`. The process that
-holds the store open (the window, a command) opens no socket. The window
+new device syncs at once, before anything is unlocked. On every platform
+what crosses the network is ciphertext: versions, and at pairing the
+sealed key files. Beyond that, and as far as the system allows (best
+effort), a computer runs it in a process of its own that sees `v/` and
+`net/` alone: never `key`, the rest of `~/.pasa` or of the computer. On
+Linux it confines itself by Landlock before it opens a socket (a kernel
+without Landlock: it says so and runs unconfined); on macOS its parent
+starts it inside the system sandbox (`sandbox-exec`), which keeps it out
+of `/Users`, `/Volumes` and the temporary directories but for `v/` and
+`net/`. The process that holds the store open (the window, a command)
+opens no socket. On Android the app is one process: its network code
+shares it with an unlocked store. The window
 serves while it is open, the Android app while it is on the screen; each
 sync tells the other device where this one serves, so after the first,
 either dials. A device not met yet, or not reached in 15 s, is said, not
@@ -254,7 +267,10 @@ A wake (after a change here, or Sync now; never otherwise) is an empty
 message to a peer's lane, through [pushir](https://github.com/cablab-ucf/pushir), which
 seals it: the relay sees a mailbox and 1024 random-looking bytes. It says
 "sync" and nothing else, so one lost, repeated or forged by a peer costs a
-sync at most; a device also syncs when its connection comes back. Every
+sync at most; a device also syncs when its connection comes back.
+What a relay sees is not hidden: the addresses of the devices that use
+it, their endpoint ids (each device keeps one), and when and how much
+they exchange; a pushir relay, a mailbox and when frames come. Every
 peer of a device holds its lane's secret, so `forget` and `revoke` make a
 new one, which the peers that stay get at their next sync (`listen` moves
 to it within a quarter of an hour, the Android app when it next starts).
@@ -263,7 +279,11 @@ to it within a quarter of an hour, the Android app when it next starts).
 sealed again to a new key. Keys travel by pairing alone, so pair the
 other devices again from here; what follows the rotation opens there
 only then. Forget it on every device it paired with. It keeps what it
-had: change the passwords it held. `forget NAME` ends a pairing alone.
+had: change the passwords it held, at their services. A session open
+here during the rotation writes nothing more until unlocked again; a
+device still on the old key finds word of it at its next sync, sealed to
+that key, and writes nothing more under it until paired again. `forget
+NAME` ends a pairing alone.
 
 ## Migrating
 
