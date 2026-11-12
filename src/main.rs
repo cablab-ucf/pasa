@@ -89,8 +89,7 @@ fn new_password() -> Result<Secret> {
     Ok(p)
 }
 
-/// The YubiKey's HMAC-SHA1 (slot 2) of `c`: on a reader (held to it, or
-/// its smart-card side plugged in), in this process; else by USB, ykman.
+/// Slot 2 HMAC-SHA1 of `c`: by PC/SC (NFC, or CCID plugged in), else ykman.
 fn yubikey(c: &[u8]) -> Result<Secret> {
     if let Some(mut k) = nfc::card(nfc::OTP) {
         match nfc::slot2(&mut k, c) {
@@ -102,8 +101,6 @@ fn yubikey(c: &[u8]) -> Result<Secret> {
     let o = Command::new("ykman")
         .args(["otp", "calculate", "2", &HEXLOWER.encode(c)])
         .output()?;
-    // ykman reaches slot 2 through the key's keyboard side, which macOS
-    // opens only to apps given Input Monitoring.
     let mac = match cfg!(target_os = "macos") {
         true => {
             "\nOn a Mac that needs Input Monitoring: add the YubiKey as \
@@ -119,9 +116,6 @@ fn yubikey(c: &[u8]) -> Result<Secret> {
     Ok(Zeroizing::new(HEXLOWER.decode(o.stdout.trim_ascii())?))
 }
 
-/// A new YubiKey made ready: `secret` (20 bytes) becomes its slot 2's
-/// HMAC-SHA1 secret. Only if the key says that slot is empty: never over
-/// what one holds. A spare is given the same secret, while it is at hand.
 fn key_setup(secret: &[u8]) -> Result<()> {
     let info = Command::new("ykman").args(["otp", "info"]).output();
     let info = info.context("ykman (YubiKey Manager) is needed for this")?;
@@ -130,8 +124,7 @@ fn key_setup(secret: &[u8]) -> Result<()> {
         "slot 2 of this YubiKey is in use, or no key is plugged in: nothing \
          was written"
     );
-    // The secret goes in where ykman asks for it, not as an argument
-    // any process can read.
+    // By stdin: any process can read argv.
     let mut c = Command::new("ykman")
         .args(["otp", "chalresp", "--force", "2"])
         .stdin(Stdio::piped())
@@ -151,14 +144,9 @@ fn key_setup(secret: &[u8]) -> Result<()> {
 
 const B64: data_encoding::Encoding = data_encoding::BASE64;
 
-/// What security keys are asked under: a name on the key, not an address.
 const RP: &str = "pasa";
 
-/// What `go` asks of a security key plugged in, by CTAP2 over USB from this
-/// process (Firefox's own, authenticator-rs): no tool to install, no
-/// server, no network, and nothing a system guards as a keyboard (macOS
-/// asks no Input Monitoring for it). `typed`: its PIN, from a window,
-/// tried once; `None`: asked here if the key wants one. `wait`: ms.
+/// `typed`: a window's PIN, tried once; `None`: prompt if the key wants one.
 fn ctap<T: Send + 'static>(
     typed: Option<&[u8]>,
     wait: u64,
@@ -199,7 +187,7 @@ fn ctap<T: Send + 'static>(
                 }
                 _ => continue,
             };
-            // Unanswered, `to` goes: the key is asked nothing more.
+            // Dropping `to` unanswered cancels the PIN request.
             let pin = match &typed {
                 Some(p) if !wrong && !p.is_empty() => Some(p.clone()),
                 Some(_) => {
@@ -224,7 +212,6 @@ fn ctap<T: Send + 'static>(
     let done = StateCallback::new(Box::new(move |r| {
         let _ = tx.send(r);
     }));
-    // A key on a reader (NFC) is used as it is held there; else USB's.
     let mut usb = AuthenticatorService::new()?;
     match nfc::card(nfc::FIDO).map(nfc::Fido::new) {
         Some(mut f) => {
@@ -247,7 +234,7 @@ fn ctap<T: Send + 'static>(
     })
 }
 
-/// Where a security key is asked: on a reader, or on USB (`wait`: ms).
+/// `Usb`'s u64: how long to wait, ms.
 enum Via<'a> {
     Usb(&'a mut AuthenticatorService, u64),
     Card(&'a mut nfc::Fido),
@@ -265,7 +252,7 @@ impl Via<'_> {
         match self {
             Via::Usb(m, t) => m.sign(t, ask, status, done),
             Via::Card(f) => {
-                // It answers in this thread; `done` has the outcome.
+                // Synchronous; the outcome goes to `done`.
                 let _ =
                     authenticator::ctap2::sign(f, ask, status, done, &|| true);
                 Ok(())
@@ -291,26 +278,20 @@ impl Via<'_> {
     }
 }
 
-/// `salt` as WebAuthn's PRF hands it to a key: SHA-256("WebAuthn PRF", 0,
-/// salt). The phone's way (Yubico's kit), and this one's since.
 fn prf(salt: &[u8]) -> [u8; 32] {
     let h =
         sha2::Sha256::new().chain_update(b"WebAuthn PRF\0").chain_update(salt);
     h.finalize().into()
 }
 
-/// The secrets of the security key plugged in, if it holds one of `keys`
-/// (credential, whether its PIN goes with it), for `salt`: which, and its
-/// secret for the salt as WebAuthn's PRF asks it, then as it is (keys
-/// added on a computer before). One touch.
+/// The answering key's credential and its secrets for [prf(salt), salt].
 fn fido_secret(
     keys: &[(Vec<u8>, bool)],
     salt: &[u8],
     typed: Option<&[u8]>,
 ) -> Result<(Vec<u8>, [Secret; 2])> {
     let raw: [u8; 32] = salt.try_into()?;
-    // With its PIN if it has one (as the phone asks), when any was
-    // added so.
+    // hmac-secret differs with and without UV: ask as the keys were added.
     let uv = match keys.iter().any(|k| k.1) {
         true => UserVerificationRequirement::Preferred,
         false => UserVerificationRequirement::Discouraged,
@@ -338,7 +319,7 @@ fn fido_secret(
     let out =
         got.extensions.hmac_get_secret.context("the key gave no secret")?;
     let two = out.output2.context("the key gave one secret of two")?;
-    // CTAP 2.0 keys may leave out which, asked with one.
+    // CTAP 2.0 may omit the credential when the allow list has one.
     let one = keys.first().filter(|_| keys.len() == 1).map(|k| k.0.clone());
     let cred = got.assertion.credentials.map(|c| c.id).or(one);
     let cred = cred.context("the key did not say which of its keys it is")?;
@@ -358,8 +339,6 @@ fn allow(keys: &[(Vec<u8>, bool)]) -> Vec<PublicKeyCredentialDescriptor> {
         .collect()
 }
 
-/// Whether a security key plugged in holds one of `keys`: asked without a
-/// touch or a PIN, a moment's wait.
 fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
     let probe = |via: Via, status, done| {
         let ask = SignArgs {
@@ -378,10 +357,7 @@ fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
     ctap(Some(b""), 1500, probe).is_ok()
 }
 
-/// Let the security key plugged in open the store on this device: a new
-/// credential on it (not one of those a key has room for only a few
-/// of), with its PIN if it has one, and the key the password opens sealed
-/// to its secret. `typed`: its PIN, from a window.
+/// Non-resident: a key has room for few resident credentials.
 pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
     let made = ctap(typed, 30_000, |via, status, done| {
         let ask = RegisterArgs {
@@ -420,8 +396,6 @@ pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
     s.fido_add(&salt, &cred, pin, &secret)
 }
 
-/// Open by the security key plugged in, if it is one of this store's:
-/// added here or where the store was paired from.
 pub(crate) fn unlock_fido(typed: Option<&[u8]>) -> Result<Store> {
     let f = pasa::fido(&home()).context("no security key opens this store")?;
     let (cred, secrets) = fido_secret(&f.keys, &f.salt, typed)?;
@@ -432,8 +406,6 @@ pub(crate) fn unlock_fido(typed: Option<&[u8]>) -> Result<Store> {
             return Ok(s);
         }
     }
-    // Added with its PIN and asked without (or the other way), its secret
-    // is another.
     ensure!(
         pin == f.keys.iter().any(|k| k.1),
         "this key's PIN was set or removed since it was added: use the \
@@ -442,14 +414,11 @@ pub(crate) fn unlock_fido(typed: Option<&[u8]>) -> Result<Store> {
     bail!("this security key does not open the store")
 }
 
-/// A new password and, with `yk`, a challenge and the YubiKey's response.
 fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
     let (pw, c) = (new_password()?, rand::<32>());
     Ok((pw, c, if yk { Some(yubikey(&c)?) } else { None }))
 }
 
-/// With quick unlock on: the YubiKey and the PIN; else, or if that
-/// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
     let s = unlocked()?;
     if s.retired() {
@@ -459,9 +428,7 @@ fn open() -> Result<Store> {
 }
 
 fn unlocked() -> Result<Store> {
-    // No store: said before any password is asked for.
     ensure!(home().join("key").exists(), pasa::NO_STORE);
-    // Devices apart for a month, said where a person reads.
     #[cfg(feature = "sync")]
     if std::io::stderr().is_terminal() {
         for (who, d) in pasa::sync::unseen(&home()) {
@@ -471,7 +438,6 @@ fn unlocked() -> Result<Store> {
             );
         }
     }
-    // A security key of this store's, plugged in: it opens it.
     if pasa::fido(&home()).is_some_and(|f| fido_here(&f.keys)) {
         match unlock_fido(None) {
             Ok(s) => return Ok(s),
@@ -499,19 +465,15 @@ fn unlock(pw: &[u8]) -> Result<Store> {
     Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))
 }
 
-/// By the YubiKey's answer to `c` and the PIN ([`Store::quick_on`]).
 fn unlock_quick(c: &[u8], pin: &[u8]) -> Result<Store> {
     Store::open_quick(&home(), pin, &yubikey(c)?)
 }
 
-/// Turn quick unlock on for the open store, with `pin` (empty: none).
 fn quick_on(s: &Store, pin: &[u8]) -> Result<()> {
     let c = rand::<32>();
     s.quick_on(pin, &c, &yubikey(&c)?)
 }
 
-/// An entry chosen with fzf, which is given the names alone: no secret,
-/// no preview. It draws on the terminal and says which.
 fn pick(s: &Store) -> Result<String> {
     let names = s.entries()?.into_keys();
     let names = names.filter(|n| !n.split('/').any(|c| c.starts_with('.')));
@@ -549,7 +511,6 @@ fn piped(cmd: &[&str], s: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Copy `s`; a detached child clears it in 45 s if it is still there.
 fn clip(s: &str) -> Result<()> {
     for (i, (copy, _)) in CLIPS.iter().enumerate() {
         if piped(copy, s.as_bytes()).is_err() {
@@ -580,18 +541,10 @@ fn clear_clipboard(i: usize) -> Result<()> {
     Ok(())
 }
 
-/// `old` edited in `$EDITOR` (else vi).
 fn edit(old: &[u8]) -> Result<Secret> {
     edit_with(&std::env::var("EDITOR").unwrap_or("vi".into()), old)
 }
 
-/// `old` edited in `ed`, in a directory of its own (owner alone) on a file
-/// system in memory where there is one (`$XDG_RUNTIME_DIR`, `/dev/shm`;
-/// macOS has none: its per-user temp dir), removed whole after, with what
-/// the editor left beside the file (swap, backup). Vim and Neovim also
-/// keep no swap, backup or undo file, and no history, elsewhere; another
-/// editor's own history is its own: `pasa set` and the window edit in
-/// memory.
 fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
     let ram = [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
     let ram = ram.into_iter().flatten().map(std::path::PathBuf::from);
@@ -636,10 +589,6 @@ fn generate(s: &Store, n: &str, pw: String) -> Result<String> {
     Ok(pw)
 }
 
-/// How often breaches hold `pw`. With `$PASA_PWNED` a local copy of
-/// haveibeenpwned's list (ordered by hash) answers and nothing leaves;
-/// else the site is asked: only 5 hex digits of the password's SHA-1
-/// leave, with curl, and the answer is padded.
 fn pwned(pw: &str) -> Result<u64> {
     if let Some(list) = std::env::var_os("PASA_PWNED") {
         return pasa::pwned_file(std::path::Path::new(&list), pw);
@@ -654,10 +603,6 @@ fn pwned(pw: &str) -> Result<u64> {
     Ok(pasa::pwned_count(&kept, &String::from_utf8_lossy(&o.stdout)))
 }
 
-/// `git` in `store/`, where the user made a repository (`git init
-/// ~/.pasa/store`): its work tree holds the versions (`v/`) and nothing
-/// of the keys. The network side may write in `v/`, never in `.git`;
-/// hooks never run. Its output, if it succeeded.
 fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
     let s = dir.join("store");
     if !s.join(".git").is_dir() {
@@ -677,19 +622,14 @@ fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
     o.status.success().then_some(o.stdout)
 }
 
-/// Commit the versions `store/v/` gained, and push, while sync is on, if
-/// that has somewhere to go. Only versions are staged (a name of 32 hex digits, an age file):
-/// nothing else that lies there. A file gone is never committed as gone:
-/// `ls` says so instead.
+/// Commits new versions alone; deletions are never staged: `ls` reports them.
 fn record() {
     record_in(&home())
 }
 
 fn record_in(dir: &Path) {
     let v = pasa::versions(dir);
-    // A repository in v/ (made there before 0.4.14, or by the network side,
-    // which may write there): git in store/ sees v/ as another repository
-    // and adds nothing, and pasa runs nothing of it nor moves it.
+    // v/.git (perhaps the network side's) hides v/ from git: run none of it.
     if v.join(".git").symlink_metadata().is_ok() {
         return eprintln!(
             "pasa: not committed: store/v/.git is in the way, and pasa runs \
@@ -721,7 +661,6 @@ fn record_in(dir: &Path) {
         ["user.name=pasa", "user.email=pasa@localhost", "commit.gpgsign=false"];
     let me = me.iter().flat_map(|c| ["-c", c]);
     let commit: Vec<&str> = me.chain(["commit", "-qm", "."]).collect();
-    // A push is a connection: only while sync is on.
     if git(dir, &commit, None).is_some() && pasa::sync::on(dir) {
         git(dir, &["push", "-q"], None);
     }
@@ -789,7 +728,6 @@ fn main() -> Result<()> {
         }
         ["ctap", "off"] => return pasa::fido_off(&home(), None),
         ["ctap", ..] => return fido_add(&unlock(&ask("Password: ")?)?, None),
-        // A new key, and with -s a spare: the same secret, held only here.
         ["key", ..] => {
             let secret = Zeroizing::new(pasa::rand::<20>());
             key_setup(&secret[..])?;
@@ -945,8 +883,7 @@ fn main() -> Result<()> {
                     all.push((e.header().mtime().unwrap_or(0), p, b));
                 }
             }
-            // A dated file is a version as it was then: oldest first, so
-            // each follows the one before it.
+            // Oldest first, so each version's parent is the one before.
             all.sort_by_key(|e| e.0);
             for (at, p, b) in all {
                 match at {
@@ -967,7 +904,6 @@ fn main() -> Result<()> {
                 let mut h = tar::Header::new_gnu();
                 h.set_size(b.len() as u64);
                 h.set_mode(0o600);
-                // When it was written, as `load` reads it back.
                 h.set_mtime(v.ms / 1000);
                 t.append_data(&mut h, n, &b[..])?;
             }
@@ -1029,12 +965,11 @@ fn report(who: &str, r: Result<usize>) {
     }
 }
 
-/// The network side ([`net_side`]) as a child that sees `v/` and `net/`
-/// alone; it ends when its stdin closes (this process ends, or drops it).
+/// The confined network side ([`net_side`]); it exits when its stdin closes.
 #[cfg(feature = "sync")]
 fn net(args: &[&str]) -> Result<std::process::Child> {
     let dir = home();
-    // Moved into place here, where the child may not.
+    // Migrate layouts here: the confined child cannot.
     pasa::sync::net(&dir);
     pasa::versions(&dir);
     let a: Vec<&str> = ["--net"].iter().chain(args).copied().collect();
@@ -1043,7 +978,6 @@ fn net(args: &[&str]) -> Result<std::process::Child> {
     Ok(c.spawn()?)
 }
 
-/// A network child's lines, as they come.
 #[cfg(feature = "sync")]
 fn lines(c: &mut std::process::Child) -> impl Iterator<Item = String> + use<> {
     use std::io::BufRead;
@@ -1066,7 +1000,6 @@ fn results(
     })
 }
 
-/// Run a network child to its end, saying what it brought.
 #[cfg(feature = "sync")]
 fn net_run(args: &[&str]) -> Result<()> {
     let mut c = net(args)?;
@@ -1075,7 +1008,6 @@ fn net_run(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Serve until `name` has synced once: it dials here.
 #[cfg(feature = "sync")]
 fn serve_until(name: &str) -> Result<()> {
     eprintln!("waiting for {name} to sync (Ctrl-C: later, by pasa serve)");
@@ -1090,9 +1022,7 @@ fn serve_until(name: &str) -> Result<()> {
     bail!("not served here: {name} syncs with whatever serves this store")
 }
 
-/// The network side, first thing confined to `v/` and `net/`: a sync,
-/// serving, listening, or a short code's half of a pairing (what it
-/// carries comes on stdin, sealed). It ends when its parent does.
+/// Confines itself first; `give` reads its payload from stdin's first line.
 #[cfg(feature = "sync")]
 fn net_side(a: &[&str]) -> Result<()> {
     let dir = home();
@@ -1110,9 +1040,6 @@ fn net_side(a: &[&str]) -> Result<()> {
     net_go(&dir, a, got.trim())
 }
 
-/// `go`, while sync is on here: no connection while it is off, and
-/// within seconds of the switch it starts or stops. A service running
-/// `pasa serve` follows the switch, as the window does.
 #[cfg(feature = "sync")]
 async fn while_on<F: std::future::Future<Output = Result<()>>>(
     dir: &std::path::Path,
@@ -1171,8 +1098,6 @@ async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
     Ok(())
 }
 
-/// A QR code's password: typed, or made here; said before the code shows,
-/// never beside it.
 #[cfg(feature = "sync")]
 fn qr_password(name: &str) -> Result<Secret> {
     let pw = ask("QR code password (Enter: make one): ")?;
@@ -1194,7 +1119,6 @@ async fn sync(a: &[&str]) -> Result<()> {
     let dir = home();
     match a {
         ["pair", name, ..] => {
-            // The key file as it is, never opened: no password here.
             let got = sync::offer(&dir, name)?;
             match a.contains(&"--qr") {
                 true => {
@@ -1231,7 +1155,6 @@ async fn sync(a: &[&str]) -> Result<()> {
             serve_until(name)?;
         }
         ["join", name, code] => {
-            // --scan: the QR code the other device shows, by the camera.
             let scanned = match *code {
                 #[cfg(feature = "scan")]
                 "--scan" => {
@@ -1252,8 +1175,6 @@ async fn sync(a: &[&str]) -> Result<()> {
                     Zeroizing::new(B64.decode(l.as_bytes())?)
                 }
             };
-            // Its key file, as it is; the store, as it is: the password
-            // opens them afterwards, here alone.
             sync::take(&dir, name, &got)?;
             net_run(&["sync"])?;
             eprintln!("The store is here: its password opens it (pasa ls)");
@@ -1306,8 +1227,6 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    /// An edit leaves nothing behind: the editor's swap and backup beside
-    /// the file go with its directory.
     #[test]
     fn an_edit_leaves_nothing_behind() {
         let d = std::env::temp_dir()
@@ -1328,11 +1247,6 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// A repository the network side planted in `v/` (or one made there
-    /// before) is neither run, nor moved, nor made the store's: nothing of
-    /// it runs, and nothing is committed while it is there. In the user's
-    /// `store/.git` only versions are committed, no hook runs, and the push
-    /// goes only while sync is on.
     #[test]
     fn git_runs_nothing_planted_and_commits_versions_alone() {
         let d = std::env::temp_dir()
@@ -1390,7 +1304,6 @@ mod tests {
         };
         super::record_in(&d);
         assert!(!store.join(".git").exists(), "v/.git is not made the store's");
-        // The user's repository, with a remote (and hooks of its own).
         git(&["init", "-q", "-b", "main", &at(&store)]);
         plant(&store.join(".git"));
         let s = at(&store);
@@ -1417,9 +1330,7 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
-    /// CTAP2's key agreement (PIN protocol 2), which carries a PIN and a
-    /// key's answer, runs on AWS-LC: what a key computes on its side, ours
-    /// computes too, and what each seals the other opens.
+    /// PIN protocol 2 on AWS-LC matches an OpenSSL model of the key's side.
     #[test]
     fn key_agreement_with_a_key_holds_on_aws_lc() {
         use authenticator::crypto::*;
@@ -1479,8 +1390,6 @@ mod tests {
         assert_eq!(cbc(symm::Mode::Decrypt, &back[..16], &back[16..]), [9; 32]);
     }
 
-    /// The salt a key is asked with is WebAuthn's PRF form, as the phone
-    /// (Yubico's kit) asks it: a key added there opens the store here.
     #[test]
     fn salts_go_to_keys_as_webauthn_prf_hands_them() {
         let salt: Vec<u8> = (0..32).collect();
