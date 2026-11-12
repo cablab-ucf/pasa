@@ -82,12 +82,20 @@ class MainActivity : ComponentActivity(), Host {
         answer?.fill(0)
         answer = null
         if (isChangingConfigurations || picking) return
-        if (setting("lock") == 0) lock() else main.postDelayed(locker, setting("lock") * 1000L)
+        if (setting("lock") == 0) lock() else {
+            left = android.os.SystemClock.elapsedRealtime()
+            main.postDelayed(locker, setting("lock") * 1000L)
+        }
     }
+
+    /** When the app left the screen, by the clock that runs while the phone sleeps: the handler's does not. */
+    private var left = 0L
 
     override fun onStart() {
         super.onStart()
         main.removeCallbacks(locker)
+        if (left != 0L && android.os.SystemClock.elapsedRealtime() - left >= setting("lock") * 1000L) lock()
+        left = 0
         here(sync)
     }
 
@@ -126,6 +134,7 @@ class MainActivity : ComponentActivity(), Host {
         get() = syncOn(this)
         set(on) {
             getSharedPreferences("pasa", 0).edit().putBoolean("sync", on).apply()
+            broker(this, on)
             if (on) push(this)
             here(on)
         }
@@ -348,5 +357,6 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun syncNow() = io { Native.sync(dir, false) }
     override suspend fun peers() = io { lines(Native.peers(dir)) }
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
+    override suspend fun revoke(name: String) = changed { Native.revoke(handle, name) }
     override suspend fun pair(name: String, qrPw: String?) = io { Native.pair(handle, name, qrPw) }
 }

@@ -168,9 +168,11 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| is_name(n))
         .collect();
-    tx.send(mine.iter().map(String::as_str).collect::<String>().as_bytes())
-        .await?;
-    let list = rx.recv(MAX).await?;
+    // Both lists at once: past a stream's window (2 MiB, some 65,000
+    // versions) each side would wait for the other to read.
+    let names = mine.iter().map(String::as_str).collect::<String>();
+    let (sent, list) = tokio::join!(tx.send(names.as_bytes()), rx.recv(MAX));
+    let list = (sent?, list?).1;
     let other: HashSet<String> = list
         .chunks(32)
         .filter_map(|c| String::from_utf8(c.to_vec()).ok())
@@ -545,6 +547,26 @@ mod tests {
         }
         let sd = Store::open(&desk, PW, None).unwrap();
         assert_eq!(&sd.get("mail/work").unwrap()[..], b"hunter2\nuser: me");
+    }
+
+    /// Lists past a stream's window (2 MiB: 70,000 names here) cross: each
+    /// side sends its own while it reads the other's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_lists_cross() {
+        let d = crate::tests::dir("lists");
+        let (a, b) = (d.join("a"), d.join("b"));
+        Store::create(&a, b"pw", None).unwrap();
+        pair(&a, "a", &b, "b");
+        for (side, x) in [(&a, 0u32), (&b, 1)] {
+            fs::create_dir_all(side.join("v")).unwrap();
+            for i in 0..70_000u32 {
+                let n = format!("{x:08x}{i:024x}");
+                fs::File::create(side.join("v").join(n)).unwrap();
+            }
+        }
+        let go = swap_once(&a, &b, "b", "a");
+        let took = timeout(Duration::from_secs(120), go).await;
+        assert_eq!(took.expect("the lists never crossed"), (0, 0));
     }
 
     /// Versions merge by union; a stray file stays. After a revoke the store

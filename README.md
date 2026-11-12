@@ -211,7 +211,7 @@ peer of a device holds its lane's secret, so `forget` and `revoke` make a
 new one, which the peers that stay get at their next sync (`listen` moves
 to it within a quarter of an hour, the Android app when it next starts).
 
-`revoke NAME` ends the pairing and rotates the store key: every entry is
+`revoke NAME` (Revoke in Devices) ends the pairing and rotates the store key: every entry is
 sealed again to a new key. Keys travel by pairing alone, so pair the
 other devices again from here; what follows the rotation opens there
 only then. Forget it on every device it paired with. It keeps what it
