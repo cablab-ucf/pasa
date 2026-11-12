@@ -42,7 +42,8 @@ pasa [show] NAME [FIELD]     entry, or a field: pass, user, otp, ...
 pasa cp NAME [FIELD]         to the clipboard for 45 s
 pasa pick [FIELD]            choose the entry with fzf, then as cp
 pasa set NAME                from stdin (a terminal: the password)
-pasa edit NAME               in $EDITOR
+pasa edit NAME               in $EDITOR, its file in memory where the system has room for
+                             it (not macOS); pasa set and the window never write it out
 pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: copy)
 pasa gen NAME [N] -w [-d] [-s CHARS] [-l]
                              ... of N speakable words (-d: dash-ed, -s: one of
@@ -579,20 +580,52 @@ fn clear_clipboard(i: usize) -> Result<()> {
     Ok(())
 }
 
+/// `old` edited in `$EDITOR` (else vi).
 fn edit(old: &[u8]) -> Result<Secret> {
-    let shm = std::path::Path::new("/dev/shm");
-    let d = if shm.is_dir() { shm.into() } else { std::env::temp_dir() };
-    let f = d.join(format!("pasa-{}", HEXLOWER.encode(&rand::<8>())));
-    pasa::write(&f, old)?;
-    let ed = std::env::var("EDITOR").unwrap_or("vi".into());
-    let ok = Command::new("sh")
-        .args(["-c", &format!("{ed} \"$1\""), "-"])
-        .arg(&f)
-        .status();
-    let new = std::fs::read(&f).map(Zeroizing::new);
-    std::fs::remove_file(&f)?;
-    ensure!(ok?.success(), "{ed} failed");
-    Ok(new?)
+    edit_with(&std::env::var("EDITOR").unwrap_or("vi".into()), old)
+}
+
+/// `old` edited in `ed`, in a directory of its own (owner alone) on a file
+/// system in memory where there is one (`$XDG_RUNTIME_DIR`, `/dev/shm`;
+/// macOS has none: its per-user temp dir), removed whole after, with what
+/// the editor left beside the file (swap, backup). Vim and Neovim also
+/// keep no swap, backup or undo file, and no history, elsewhere; another
+/// editor's own history is its own: `pasa set` and the window edit in
+/// memory.
+fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
+    let ram = [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
+    let ram = ram.into_iter().flatten().map(std::path::PathBuf::from);
+    let base =
+        ram.into_iter().find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+    let d = base.join(format!("pasa-{}", HEXLOWER.encode(&rand::<8>())));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&d)?;
+    let f = d.join("entry");
+    let run = || -> Result<Secret> {
+        pasa::write(&f, old)?;
+        let prog = ed.split_whitespace().next().unwrap_or("vi");
+        let v =
+            Command::new(prog).arg("--version").stdin(Stdio::null()).output();
+        let vim = v.is_ok_and(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.starts_with("VIM") || s.starts_with("NVIM")
+        });
+        let quiet = match vim {
+            true => " -n -i NONE --cmd 'set nobackup nowritebackup noundofile'",
+            false => "",
+        };
+        let ok = Command::new("sh")
+            .args(["-c", &format!("{ed}{quiet} \"$1\""), "-"])
+            .arg(&f)
+            .status();
+        ensure!(ok?.success(), "{ed} failed");
+        Ok(Zeroizing::new(std::fs::read(&f)?))
+    };
+    let new = run();
+    std::fs::remove_dir_all(&d)?;
+    new
 }
 
 /// `pw` as the new password of `n`, its other lines kept.
@@ -1302,6 +1335,27 @@ async fn sync(a: &[&str]) -> Result<()> {
 mod tests {
     use std::fs;
     use std::process::Command;
+
+    /// An edit leaves nothing behind: the editor's swap and backup beside
+    /// the file go with its directory.
+    #[test]
+    fn an_edit_leaves_nothing_behind() {
+        let d = std::env::temp_dir()
+            .join(format!("pasa-ed-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let ed = d.join("ed.sh");
+        let script = "#!/bin/sh\nprintf 'new\\n' > \"$1\"\n\
+                      cp \"$1\" \"$1.swp\"; cp \"$1\" \"$1~\"\n\
+                      dirname \"$1\" > \"$0.at\"\n";
+        fs::write(&ed, script).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&ed, mode).unwrap();
+        let new = super::edit_with(ed.to_str().unwrap(), b"old\n").unwrap();
+        assert_eq!(&new[..], b"new\n");
+        let at = fs::read_to_string(d.join("ed.sh.at")).unwrap();
+        assert!(!std::path::Path::new(at.trim()).exists(), "left behind");
+        fs::remove_dir_all(&d).unwrap();
+    }
 
     /// git runs nothing planted in `v/`: a repository made there before
     /// moves beside it without its hooks or its other config (a monitor,

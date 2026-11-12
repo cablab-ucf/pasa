@@ -119,6 +119,14 @@ there by itself, its hooks dropped and its config cut to its remotes and
 branches. A version deleted from `v/` is then named by `pasa ls` and
 restored by `git --git-dir ~/.pasa/git --work-tree ~/.pasa/v checkout .`.
 
+`pasa edit` (and `^E` in the terminal browser) hands `$EDITOR` a file in a directory of its own (the owner
+alone), on a file system in memory where there is one (Linux:
+`$XDG_RUNTIME_DIR`, `/dev/shm`), removed whole after, with whatever the
+editor left beside it (swap, backup). Vim and Neovim are told to keep no
+swap, backup, undo file or history. Another editor's own history, and on
+macOS (no file system in memory) the per-user temp dir, are beyond that:
+there `pasa set` (from stdin) and the window edit in memory.
+
 ## Keys
 
 - **Store keys**: 256 random bits each (hedged with the password, RFC
