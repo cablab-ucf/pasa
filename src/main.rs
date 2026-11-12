@@ -42,10 +42,11 @@ pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
                              password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
-pasa pair NAME [--qr]        for a new device, called NAME here: a code to type, or a QR
-                             code (offline) after its password; serve until it has synced
-pasa join NAME CODE          take the code device NAME shows (a QR code's: and its
-                             password), then the store's password; dial it
+pasa pair NAME [--qr]        hand the key file, as it is, to a new device called NAME
+                             here: a code to type, or a QR code (offline) after its
+                             password; serve until it has synced. No store password asked
+pasa join NAME CODE          take the code device NAME shows (a QR code: its password
+                             too), then sync. The store's password opens it afterwards
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 
 fn ask(p: &str) -> Result<Secret> {
@@ -229,7 +230,7 @@ pub(crate) fn unlock_fido(typed: Option<&[u8]>) -> Result<Store> {
     let (cred, pin) =
         key.context("this security key is not one of this store's")?;
     let secret = fido_secret(&dev, cred, &f.salt, *pin, typed)?;
-    adopted(Store::open_fido(&home(), cred, &secret)?)
+    Store::open_fido(&home(), cred, &secret)
 }
 
 /// A new password and, with `yk`, a challenge and the YubiKey's response.
@@ -266,25 +267,18 @@ fn open() -> Result<Store> {
 fn unlock(pw: &[u8]) -> Result<Store> {
     let k = std::fs::read(home().join("key")).context("no store: pasa init")?;
     let yk = challenge(&k).map(yubikey).transpose()?;
-    adopted(Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))?)
+    Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))
 }
 
 /// By the YubiKey's answer to `c` and the PIN ([`Store::quick_on`]).
 fn unlock_quick(c: &[u8], pin: &[u8]) -> Result<Store> {
-    adopted(Store::open_quick(&home(), pin, &yubikey(c)?)?)
+    Store::open_quick(&home(), pin, &yubikey(c)?)
 }
 
 /// Turn quick unlock on for the open store, with `pin` (empty: none).
 fn quick_on(s: &Store, pin: &[u8]) -> Result<()> {
     let c = rand::<32>();
     s.quick_on(pin, &c, &yubikey(&c)?)
-}
-
-#[allow(unused_mut)]
-fn adopted(mut s: Store) -> Result<Store> {
-    #[cfg(feature = "sync")]
-    pasa::sync::adopt(&mut s)?;
-    Ok(s)
 }
 
 fn text(b: &[u8]) -> Result<&str> {
@@ -820,9 +814,8 @@ async fn sync(a: &[&str]) -> Result<()> {
     let dir = home();
     match a {
         ["pair", name, ..] => {
-            // Only sealed: the key file, and the pairing's keys under the
-            // store key. The store is closed again before the code shows.
-            let got = sync::offer(&mut open()?, name)?;
+            // The key file as it is, never opened: no password here.
+            let got = sync::offer(&dir, name)?;
             match a.contains(&"--qr") {
                 true => {
                     let pw = qr_password(name)?;
@@ -869,10 +862,11 @@ async fn sync(a: &[&str]) -> Result<()> {
                     Zeroizing::new(B64.decode(l.as_bytes())?)
                 }
             };
-            let t = sync::take(&dir, name, &got)?;
-            eprintln!("Now the store's password, to open the pairing:");
-            sync::taken(&mut open()?, t)?;
+            // Its key file, as it is; the store, as it is: the password
+            // opens them afterwards, here alone.
+            sync::take(&dir, name, &got)?;
             net_run(&["sync"])?;
+            eprintln!("The store is here: its password opens it (pasa ls)");
         }
         ["sync", ..] => net_run(a)?,
         ["serve"] | ["listen"] => net_run(a)?,
@@ -883,6 +877,10 @@ async fn sync(a: &[&str]) -> Result<()> {
         ["revoke", name] => {
             sync::revoke(&mut open()?, name)?;
             net_run(&["sync", "--news"])?;
+            eprintln!(
+                "A new store key: pair the other devices again (pasa pair \
+                 NAME here, join there), and forget {name} on each"
+            );
         }
         _ => bail!("{USAGE}"),
     }

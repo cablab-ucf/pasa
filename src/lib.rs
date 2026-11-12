@@ -1,4 +1,4 @@
-//! A store: `key`, `dev` and `v/`. Every file sealed here is a standard
+//! A store: `key` and `v/`. Every file sealed here is a standard
 //! age file to a random 256-bit key used as its passphrase (age's own
 //! scrypt recipient, at N = 2: the key needs no stretching). Symmetric,
 //! so post-quantum; `age -d` opens any of them; pasa implements no crypto.
@@ -6,10 +6,8 @@
 //! - `v/NAME`: one version of one entry, named by its hash: `ms parent
 //!   size name\n`, the body, padding. Files never change, so copies merge
 //!   by union. Size 0 deletes.
-//! - `key`: the store keys, newest first; `dev`: this device's hand-over
-//!   keys (one per pairing).
-//!   Both sealed to Argon2id(password, YubiKey response); `dev` never
-//!   leaves the device.
+//! - `key`: the store keys, newest first, sealed to Argon2id(password,
+//!   YubiKey response). A pairing hands it over as it is, never opened.
 
 #![forbid(unsafe_code)]
 
@@ -223,8 +221,6 @@ pub struct Store {
     keys: Vec<Secret>,
     ids: Vec<age::scrypt::Identity>,
     newest: age::scrypt::Recipient,
-    /// This device's hand-over key for each pairing.
-    pub(crate) hands: BTreeMap<String, Secret>,
     kek: Secret,
     salt: Vec<u8>,
     /// The key file as read or last written: never overwrite a newer one.
@@ -238,23 +234,14 @@ impl Store {
     fn new(
         dir: &Path,
         keys: Vec<Secret>,
-        dev: &[u8],
         kek: Secret,
         salt: Vec<u8>,
     ) -> Result<Store> {
-        let hands = std::str::from_utf8(dev)?.lines().filter_map(|l| {
-            let (n, k) = l.split_once(' ')?;
-            Some((
-                n.into(),
-                Zeroizing::new(HEXLOWER.decode(k.as_bytes()).ok()?),
-            ))
-        });
         Ok(Store {
             dir: dir.into(),
             ids: keys.iter().map(|k| identity(k)).collect(),
             newest: recipient(keys.first().context("no store key")?),
             keys,
-            hands: hands.collect(),
             kek,
             salt,
             loaded: Mutex::new(fs::read(dir.join("key")).unwrap_or_default()),
@@ -271,7 +258,7 @@ impl Store {
     ) -> Result<Store> {
         ensure!(!dir.join("key").exists(), "{} holds a store", dir.display());
         let mut s =
-            Store::new(dir, vec![hedged(pw)], b"", Default::default(), vec![])?;
+            Store::new(dir, vec![hedged(pw)], Default::default(), vec![])?;
         s.lock(pw, yk)?;
         Ok(s)
     }
@@ -373,8 +360,7 @@ impl Store {
         );
         let keys =
             keys.chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
-        let dev = fs::read(dir.join("dev")).ok().and_then(|d| open(&kek, &d));
-        Store::new(dir, keys, &dev.unwrap_or_default(), kek, salt.to_vec())
+        Store::new(dir, keys, kek, salt.to_vec())
     }
 
     /// Seal the keys to `pw` and a YubiKey's (challenge, response).
@@ -393,8 +379,8 @@ impl Store {
         Ok(())
     }
 
-    /// Write `key` and `dev` under a lock, unless `key` changed since we
-    /// read it (another process rotated or relocked: unlock again).
+    /// Write `key` under a lock, unless it changed since we read it
+    /// (another process rotated, relocked or paired: unlock again).
     pub(crate) fn save(&self) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
         let mut lock = fs::OpenOptions::new();
@@ -415,12 +401,6 @@ impl Store {
             now == *loaded,
             "the key file changed since this unlock: unlock again"
         );
-        let hands = self
-            .hands
-            .iter()
-            .map(|(n, k)| format!("{n} {}\n", HEXLOWER.encode(k)));
-        let dev = Zeroizing::new(hands.collect::<String>().into_bytes());
-        write(&self.dir.join("dev"), &seal(&self.kek, &dev)?)?;
         let keys: Secret = Zeroizing::new(
             self.keys.iter().flat_map(|k| k.iter().copied()).collect(),
         );
@@ -430,7 +410,7 @@ impl Store {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "sync"))]
+    #[cfg(test)]
     pub(crate) fn keys(&self) -> &[Secret] {
         &self.keys
     }
