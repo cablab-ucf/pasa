@@ -28,7 +28,9 @@ One binary is the command line, the terminal browser and the window. A
 release has it for Linux (x86-64, glibc) and macOS (Apple silicon, with
 `pasa.app`); elsewhere, and on NixOS, build it: the flake's `pasa-gui`
 (default) or `pasa-cli` (no window libraries), or `cargo install --locked
---path . --features gui`. `pasa.app` is signed ad hoc, by no Apple account:
+--path . --features gui`. Built on Linux it needs libudev and libclang
+(Debian: `libudev-dev libclang-dev`); the flake brings both. `pasa.app` is
+signed ad hoc, by no Apple account:
 after a download, `xattr -dr com.apple.quarantine pasa.app`.
 
 The window is laid out as the Android app is: a first run asks for the

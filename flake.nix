@@ -19,7 +19,10 @@
         buildFeatures = lib.optional gui "gui";
         doCheck = false;
         preBuild = "unset AWS_LC_SYS_USE_SYSTEM"; # aws-lc as Cargo.lock pins it, not nixpkgs' copy
-        nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optional linux pkgs.pkg-config
+        # Linux: pkg-config finds libudev (security keys); bindgen, with its
+        # libclang, writes V4L2's bindings (the camera) at build time.
+        nativeBuildInputs = [ pkgs.makeWrapper ]
+          ++ lib.optionals linux [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ]
           ++ lib.optional (gui && linux) pkgs.copyDesktopItems;
         buildInputs = lib.optional linux pkgs.udev; # libudev: security keys over USB
         desktopItems = lib.optional (gui && linux) (pkgs.makeDesktopItem {
