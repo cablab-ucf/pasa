@@ -1,5 +1,4 @@
-//! libapasa.so: pasa for com.apasa.Native (errors become RuntimeExceptions),
-//! and pushir's org.pushir.Native.
+//! libapasa.so: com.apasa.Native, and pushir's org.pushir.Native linked in.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -17,19 +16,16 @@ use std::sync::{LazyLock, Mutex};
 
 static STORES: LazyLock<Mutex<HashMap<jlong, Store>>> =
     LazyLock::new(Default::default);
-// Without a runtime nothing here can sync: the panic is the app's
-// exception (`run`).
+// First used inside `run`, which turns this panic into a Java exception.
 #[allow(clippy::expect_used)]
 static RT: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("tokio"));
 
-/// The open stores; a panic elsewhere while they were held leaves them as
-/// they were, not unusable.
+/// Ignores poisoning: a panic while held leaves the stores intact.
 fn stores() -> std::sync::MutexGuard<'static, HashMap<jlong, Store>> {
     STORES.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Any error, as a Java exception's message.
 #[derive(Debug)]
 struct Fail(String);
 
@@ -95,7 +91,6 @@ pub extern "system" fn Java_com_apasa_Native_challenge<'l>(
     })
 }
 
-/// `create`: a new store; `chal`/`resp`: a YubiKey's, or null.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_open<'l>(
     mut env: EnvUnowned<'l>,
@@ -118,15 +113,13 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
     })
 }
 
-/// An opened store's handle.
 fn opened(st: Store) -> Result<jlong> {
     let h = jlong::from_be_bytes(pasa::rand());
     stores().insert(h, st);
     Ok(h)
 }
 
-/// Quick unlock, if it is on here: the YubiKey's challenge, then 1 if a
-/// PIN goes with its answer; else null.
+/// The 32-byte challenge, then 1 if a PIN goes with it; null if off.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_quick<'l>(
     mut env: EnvUnowned<'l>,
@@ -143,7 +136,6 @@ pub extern "system" fn Java_com_apasa_Native_quick<'l>(
     })
 }
 
-/// Open by the YubiKey's answer and the PIN (empty: none).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_openQuick<'l>(
     mut env: EnvUnowned<'l>,
@@ -159,8 +151,6 @@ pub extern "system" fn Java_com_apasa_Native_openQuick<'l>(
     })
 }
 
-/// Turn quick unlock on for an open store: a PIN (empty: none), and the
-/// YubiKey's answer to a fresh 32-byte challenge.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_quickOn<'l>(
     mut env: EnvUnowned<'l>,
@@ -190,9 +180,6 @@ pub extern "system" fn Java_com_apasa_Native_quickOff<'l>(
     })
 }
 
-/// The security keys that open the store here: the salt, then a line a
-/// key (its credential, a space, 1 if its PIN goes with it), hex; "" if
-/// none.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_fido<'l>(
     mut env: EnvUnowned<'l>,
@@ -214,7 +201,6 @@ pub extern "system" fn Java_com_apasa_Native_fido<'l>(
     })
 }
 
-/// The salt a security key is asked with for an open store.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_fidoSalt<'l>(
     mut env: EnvUnowned<'l>,
@@ -226,7 +212,6 @@ pub extern "system" fn Java_com_apasa_Native_fidoSalt<'l>(
     })
 }
 
-/// Let a security key open an open store here ([`pasa::Store::fido_add`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_fidoAdd<'l>(
     mut env: EnvUnowned<'l>,
@@ -246,7 +231,6 @@ pub extern "system" fn Java_com_apasa_Native_fidoAdd<'l>(
     })
 }
 
-/// Open by a security key's answer ([`pasa::Store::open_fido`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_openFido<'l>(
     mut env: EnvUnowned<'l>,
@@ -263,7 +247,6 @@ pub extern "system" fn Java_com_apasa_Native_openFido<'l>(
     })
 }
 
-/// No security key opens the store here any more.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_fidoOff<'l>(
     mut env: EnvUnowned<'l>,
@@ -313,7 +296,6 @@ pub extern "system" fn Java_com_apasa_Native_get<'l>(
     })
 }
 
-/// An empty body deletes.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_put<'l>(
     mut env: EnvUnowned<'l>,
@@ -351,7 +333,6 @@ pub extern "system" fn Java_com_apasa_Native_generate<'l>(
     run(&mut env, |e| Ok(e.new_string(pasa::generate(len as usize, symbols))?))
 }
 
-/// A guess at a typed password's bits ([`pasa::strength`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_strength<'l>(
     _: EnvUnowned<'l>,
@@ -361,8 +342,7 @@ pub extern "system" fn Java_com_apasa_Native_strength<'l>(
     pasa::strength(&pw.to_string()) as i32
 }
 
-/// When an entry was made and last changed: milliseconds, a line each;
-/// empty if there is none.
+/// Made and changed (ms), a line each; "" if none.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_times<'l>(
     mut env: EnvUnowned<'l>,
@@ -377,9 +357,6 @@ pub extern "system" fn Java_com_apasa_Native_times<'l>(
     })
 }
 
-/// Weak passwords as `weak`, tab, name, tab, bits; shared ones as
-/// `reused`, then the names, tabs between; expired ones as `expired`,
-/// tab, name: a line each.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_health<'l>(
     mut env: EnvUnowned<'l>,
@@ -397,7 +374,6 @@ pub extern "system" fn Java_com_apasa_Native_health<'l>(
     })
 }
 
-/// The store in numbers: what each counts, a tab, the count; a line each.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_stats<'l>(
     mut env: EnvUnowned<'l>,
@@ -412,8 +388,6 @@ pub extern "system" fn Java_com_apasa_Native_stats<'l>(
     })
 }
 
-/// For a breach lookup: what of the password's SHA-1 is sent, then what
-/// is kept, a line each ([`pasa::pwned_key`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_pwnedKey<'l>(
     mut env: EnvUnowned<'l>,
@@ -426,7 +400,6 @@ pub extern "system" fn Java_com_apasa_Native_pwnedKey<'l>(
     })
 }
 
-/// How often the lookup's answer lists what was kept.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_pwnedCount<'l>(
     _: EnvUnowned<'l>,
@@ -437,7 +410,6 @@ pub extern "system" fn Java_com_apasa_Native_pwnedCount<'l>(
     pasa::pwned_count(&kept.to_string(), &text.to_string()) as jlong
 }
 
-/// A password to say aloud ([`pasa::speakable`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_speakable<'l>(
     mut env: EnvUnowned<'l>,
@@ -452,7 +424,6 @@ pub extern "system" fn Java_com_apasa_Native_speakable<'l>(
     })
 }
 
-/// Delete an entry and what is attached to it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_remove<'l>(
     mut env: EnvUnowned<'l>,
@@ -463,7 +434,6 @@ pub extern "system" fn Java_com_apasa_Native_remove<'l>(
     run(&mut env, |_| with(h, |s| s.remove(&name.to_string())))
 }
 
-/// An entry and what is attached to it, under a new name.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_rename<'l>(
     mut env: EnvUnowned<'l>,
@@ -475,8 +445,7 @@ pub extern "system" fn Java_com_apasa_Native_rename<'l>(
     run(&mut env, |_| with(h, |s| s.rename(&from.to_string(), &to.to_string())))
 }
 
-/// An entry's versions, newest first: milliseconds, U+001F, the text;
-/// U+001E between versions.
+/// Newest first; times in ms.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_history<'l>(
     mut env: EnvUnowned<'l>,
@@ -494,7 +463,6 @@ pub extern "system" fn Java_com_apasa_Native_history<'l>(
     })
 }
 
-/// The names of the files attached to an entry, one a line.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_files<'l>(
     mut env: EnvUnowned<'l>,
@@ -508,7 +476,6 @@ pub extern "system" fn Java_com_apasa_Native_files<'l>(
     })
 }
 
-/// An entry's bytes as they are: an attached file's.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_bytes<'l>(
     mut env: EnvUnowned<'l>,
@@ -522,7 +489,6 @@ pub extern "system" fn Java_com_apasa_Native_bytes<'l>(
     })
 }
 
-/// Keep bytes as an entry: an attached file.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_keep<'l>(
     mut env: EnvUnowned<'l>,
@@ -537,8 +503,6 @@ pub extern "system" fn Java_com_apasa_Native_keep<'l>(
     })
 }
 
-/// An entry's text as its form: password, user, url, otpauth URI, tags,
-/// expiry date, other fields and notes, U+001F between them.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_form<'l>(
     mut env: EnvUnowned<'l>,
@@ -570,7 +534,6 @@ fn form(form: &JString) -> pasa::Form {
     }
 }
 
-/// The entry's text of a form.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_text<'l>(
     mut env: EnvUnowned<'l>,
@@ -580,7 +543,6 @@ pub extern "system" fn Java_com_apasa_Native_text<'l>(
     run(&mut env, |e| Ok(e.new_string(form(&f).text())?))
 }
 
-/// Why a form may not be saved as it is ([`pasa::Form::problem`]), or "".
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_problem<'l>(
     mut env: EnvUnowned<'l>,
@@ -590,7 +552,6 @@ pub extern "system" fn Java_com_apasa_Native_problem<'l>(
     run(&mut env, |e| Ok(e.new_string(form(&f).problem().unwrap_or_default())?))
 }
 
-/// The paired devices' names, one a line.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_peers<'l>(
     mut env: EnvUnowned<'l>,
@@ -604,8 +565,7 @@ pub extern "system" fn Java_com_apasa_Native_peers<'l>(
     })
 }
 
-/// Each paired device, a line: `name \t days since it last synced here \t
-/// 1` if that is a month or more ([`sync::APART`]), else `0`.
+/// Per device: name, days since it last synced here, 1 if past [`sync::APART`].
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_seen<'l>(
     mut env: EnvUnowned<'l>,
@@ -634,8 +594,6 @@ pub extern "system" fn Java_com_apasa_Native_forget<'l>(
     })
 }
 
-/// A device lost or stolen: forgotten here and a new store key made, which
-/// the other devices take by pairing again ([`sync::revoke`]).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_revoke<'l>(
     mut env: EnvUnowned<'l>,
@@ -650,9 +608,7 @@ pub extern "system" fn Java_com_apasa_Native_revoke<'l>(
     })
 }
 
-/// Let a device pair, called `name` here: its code, carrying the key file as
-/// it is (the store stays as it is). With `qr_pw` an offline QR code's text
-/// under that password; else a short code.
+/// A code carrying the key file as is; `qr_pw`: an offline QR's text under it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     mut env: EnvUnowned<'l>,
@@ -674,7 +630,6 @@ pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     })
 }
 
-/// While the app shows (and sync is on): paired devices dial here.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_serve<'l>(
     mut env: EnvUnowned<'l>,
@@ -686,7 +641,7 @@ pub extern "system" fn Java_com_apasa_Native_serve<'l>(
         Mutex::new(None);
     run(&mut env, |_| {
         let mut s = SERVING.lock().unwrap_or_else(|p| p.into_inner());
-        // Ended, its endpoint and key's lock let go, before another starts.
+        // Await the old server so its endpoint and key lock are free.
         if let Some(h) = s.take() {
             h.abort();
             let _ = RT.block_on(h);
@@ -717,8 +672,6 @@ pub extern "system" fn Java_com_apasa_Native_join<'l>(
             true => RT.block_on(sync::unqr(&code, &pw))?,
             false => RT.block_on(sync::fetch(&code))?,
         };
-        // The key file and the store, as they are: the password opens
-        // them afterwards.
         sync::take(dir, &name, &got)?;
         Ok(e.new_string(report(RT.block_on(sync::sync(dir, false))?))?)
     })
@@ -737,7 +690,6 @@ pub extern "system" fn Java_com_apasa_Native_sync<'l>(
     })
 }
 
-/// This device's pushir lane secret for pasa.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_lane<'l>(
     mut env: EnvUnowned<'l>,
@@ -749,7 +701,6 @@ pub extern "system" fn Java_com_apasa_Native_lane<'l>(
     })
 }
 
-/// The mailbox pushir gave this device, for peers to wake it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_mailbox<'l>(
     mut env: EnvUnowned<'l>,
@@ -763,9 +714,7 @@ pub extern "system" fn Java_com_apasa_Native_mailbox<'l>(
     })
 }
 
-/// A push on our lane (a peer's wake, or the connection back from a gap):
-/// sync, and say how it went. One at a time: a push during a sync waits,
-/// and those that pile up behind it make one sync, not one each.
+/// Syncs on a push; pushes during a sync wait and coalesce into one more.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_wake<'l>(
     mut env: EnvUnowned<'l>,

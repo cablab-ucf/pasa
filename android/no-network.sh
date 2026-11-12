@@ -1,8 +1,5 @@
 #!/bin/sh
-# The hardware-key code reaches no network: neither what the app says to a
-# key (Yubikey.kt, Fido.kt) nor Yubico's library (every yubikit artifact
-# Gradle resolved for the build) names a class that could open a connection.
-# Run after a build; CI does, so a change that breaks this fails there.
+# Run after a build: it scans the yubikit artifacts in Gradle's cache.
 set -eu
 cd "$(dirname "$0")"
 if grep -nE 'java\.net\.|javax\.net\.|okhttp|android\.net\.' \

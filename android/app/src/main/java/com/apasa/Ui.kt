@@ -93,33 +93,27 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/** An entry as its form: the same fields the desktop window shows. */
 data class Form(
     val pass: String = "", val user: String = "", val url: String = "",
     val otp: String = "", val notes: String = "", val tags: String = "",
-    /** A date, YYYY-MM-DD; and every other `name: value` line. */
+    /** [expires]: YYYY-MM-DD; [more]: every other `name: value` line. */
     val expires: String = "", val more: String = "",
 )
 
-/** Entries with a weak password and its bits; those sharing one; those past their date. */
 data class Health(
     val weak: List<Pair<String, Int>> = listOf(), val reused: List<List<String>> = listOf(),
     val expired: List<String> = listOf(),
 )
 
-/** A hardware key's part: none; a tap (and PIN) that opens the store beside the password; or needed with the password. */
+/** Quick: a tap (and PIN) opens the store beside the password; Both: a second factor with it. */
 enum class Key { None, Quick, Both }
 
-/** How an empty key is said where it can be set up: the screens offer that on these words. */
+/** [Doing] offers to set the key up on errors starting with this. */
 const val EMPTY_KEY = "Slot 2 of this YubiKey is empty."
 
-/** The symbols that may stand between speakable words (pasa::SEPS). */
+/** As pasa::SEPS. */
 const val SEPS = "-_.!#%&*+=?^~,:;"
 
-/**
- * How a password is made: characters, or words to say aloud (22 bits each) with one of [seps]
- * between two (none: CapitalWords) and, with [leet], some letters as @ 3 1 0 $ 7.
- */
 data class Gen(
     val words: Boolean = false, val len: Int = 24, val symbols: Boolean = true,
     val count: Int = 4, val seps: String = "", val leet: Boolean = false,
@@ -129,7 +123,6 @@ data class Gen(
         else (len * kotlin.math.log2(if (symbols) 80.0 else 62.0)).toInt()
 }
 
-/** Field by field, the lines of [was] that went (-), and those of [now]: kept ( ) or new (+). */
 fun changes(was: Form, now: Form): List<Pair<String, List<Pair<Char, String>>>> {
     val of = { f: Form ->
         listOf(
@@ -143,42 +136,31 @@ fun changes(was: Form, now: Form): List<Pair<String, List<Pair<Char, String>>>> 
     }
 }
 
-/** What the screens ask of the app: the store, the clipboard, the key, the camera. */
 interface Host {
     val hasStore: Boolean
     val needsKey: Boolean
     val open: Boolean
     val version: String
     var sync: Boolean
-    /** Quick unlock here: null if off, else whether a PIN goes with the tap. */
+    /** null: off; else whether a PIN goes with the tap. */
     val quick: Boolean?
-    /** The phone has NFC and it is switched off: a key can then only be plugged in. */
     val nfcOff: Boolean
-    /** Security keys (FIDO2) that open the store on this phone, and whether a PIN goes with any of them. */
     val fidoKeys: Int
     val fidoPin: Boolean
-    /** The key tapped opens the open store from now on (its [pin], if it has one); a spare is added the same way, at any time. */
     suspend fun fidoAdd(pin: String)
     fun fidoOff()
-    /** A setting kept on this phone: "clip" and "lock", seconds; "theme": 0 the phone's, 1 dark, 2 light. */
+    /** "clip", "lock": seconds; "theme": 0 the phone's, 1 dark, 2 light. */
     fun setting(name: String): Int
     fun set(name: String, value: Int)
-    /**
-     * Sets up the next YubiKey tapped, if its slot 2 is empty, with a new secret; [spare]: with the secret
-     * of the key set up just before, so either opens what the other does.
-     */
+    /** A new secret into an empty slot 2; [spare]: the previous key's secret again. */
     suspend fun setUpKey(spare: Boolean)
-    /** Open the phone's NFC settings. */
     fun nfcSettings()
     suspend fun create(pw: String, key: Key, pin: String)
     suspend fun unlock(pw: String)
-    /**
-     * Waits for a key and opens the store with whatever it is good for here: true once it is open; false
-     * if it is the quick-unlock key and a PIN is set, its answer kept for [unlockQuick]. [pin]: a CTAP2 key's own.
-     */
+    /** False if quick unlock now wants its PIN ([unlockQuick]); [pin]: a CTAP2 key's own. */
     suspend fun tapKey(pin: String): Boolean
     suspend fun unlockQuick(pin: String)
-    /** Quick unlock on with [pin] (empty: none), or off (null). */
+    /** null: off; "": on without a PIN. */
     suspend fun setQuick(pin: String?)
     suspend fun join(name: String, code: String, pw: String)
     fun scan(got: (String) -> Unit)
@@ -188,38 +170,32 @@ interface Host {
     suspend fun put(name: String, body: String)
     suspend fun remove(name: String)
     suspend fun rename(from: String, to: String)
-    /** Each version of [name], newest first: when (ms) and its text. */
+    /** Newest first: (ms, text). */
     suspend fun history(name: String): List<Pair<Long, String>>
     suspend fun files(name: String): List<String>
-    /** Pick a file and keep it with [name]; [done] says how it went. */
     fun attach(name: String, done: (String) -> Unit)
-    /** Write [name]'s file [file] where the user says. */
     fun save(name: String, file: String, done: (String) -> Unit)
     fun form(body: String): Form
     fun text(f: Form): String
-    /** Why [f] may not be saved as it is, or "": saved only as what it reads back as. */
+    /** Why [f] would not read back as it is, or "". */
     fun problem(f: Form): String
     fun code(body: String): String
     fun generate(g: Gen): String
-    /** A guess at a typed password's bits. */
     fun strength(pw: String): Int
-    /** When [name] was made and last changed (ms). */
+    /** (made, changed) in ms. */
     suspend fun times(name: String): Pair<Long, Long>?
     suspend fun health(): Health
-    /** The store in numbers: what each counts, and the count. */
     suspend fun stats(): List<Pair<String, String>>
-    /** How often known breaches hold [pw]: asks haveibeenpwned.com. */
     suspend fun pwned(pw: String): Long
     fun open(url: String)
     fun copy(text: String)
     suspend fun syncNow(): String
     suspend fun peers(): List<String>
-    /** Each paired device: days since it last synced here, and whether that is a month or more. */
+    /** Device to (days since it last synced here, a month or more). */
     suspend fun seen(): Map<String, Pair<Long, Boolean>>
     suspend fun forget(name: String)
-    /** A device lost or stolen: forgotten, and a new store key here, which the other devices get by pairing again. */
     suspend fun revoke(name: String)
-    /** A pairing code for the device called [name], which dials here: with [qrPw], an offline QR code's text under it; else a short code. */
+    /** With [qrPw], an offline QR code's text under it; else a short code. */
     suspend fun pair(name: String, qrPw: String?): String
     /** Bumped as syncs bring versions. */
     val news: Int
@@ -235,9 +211,7 @@ sealed interface Screen {
     data object Settings : Screen
 }
 
-/** Where the app is; [back] says whether it had somewhere to go back to. */
 class Nav {
-    /** Edit holds changes not saved; and whether leaving it is being asked about. */
     var unsaved by mutableStateOf(false)
     var asking by mutableStateOf(false)
     var screen by mutableStateOf<Screen>(Screen.List)
@@ -246,7 +220,6 @@ class Nav {
     val atTop get() = screen == Screen.List && !joining
 
     fun back() {
-        // Not thrown away without a word.
         if (screen is Screen.Edit && unsaved && !asking) {
             asking = true
             return
@@ -262,7 +235,7 @@ class Nav {
     }
 }
 
-// The colours the desktop window uses.
+// The desktop window's colours.
 private val Dark = darkColorScheme(
     primary = Color(0xFF5FB89A), onPrimary = Color(0xFF06281E),
     background = Color(0xFF101512), onBackground = Color(0xFFE6ECE8),
@@ -303,10 +276,8 @@ fun Pasa(host: Host, nav: Nav, dark: Boolean = isSystemInDarkTheme()) {
     }
 }
 
-/** Something being done: whether it still is, what went wrong, how to start it, how to stop it. */
 private data class Work(val busy: Boolean, val err: String, val go: (suspend () -> Unit) -> Unit, val stop: () -> Unit)
 
-/** Runs what [Work.go] is given, busy meanwhile; what went wrong, in the app's words. */
 @Composable
 private fun rememberJob(): Work {
     var busy by remember { mutableStateOf(false) }
@@ -335,7 +306,7 @@ private fun rememberJob(): Work {
 @Composable
 private fun Label(t: String) = Text(t, style = MaterialTheme.typography.labelMedium, color = muted)
 
-/** The app's mark: a padlock that reads as the letter a (the launcher icon's paths). */
+/** The launcher icon's paths. */
 @Composable
 private fun Logo(size: Dp, modifier: Modifier = Modifier) {
     val (ink, hole) = MaterialTheme.colorScheme.primary to MaterialTheme.colorScheme.background
@@ -357,7 +328,6 @@ private fun Logo(size: Dp, modifier: Modifier = Modifier) {
     }
 }
 
-/** A small drawn sign on a button that says what it does to a screen reader: "Copy", "Open", "Edit". */
 @Composable
 private fun Sign(what: String, tint: Color = MaterialTheme.colorScheme.primary, act: () -> Unit) = Box(
     Modifier.size(44.dp).clickable(onClick = act).semantics { contentDescription = what }, contentAlignment = Alignment.Center,
@@ -366,13 +336,11 @@ private fun Sign(what: String, tint: Color = MaterialTheme.colorScheme.primary, 
         val (w, pen) = size.width to Stroke(size.width * 0.09f, cap = StrokeCap.Round)
         val r = androidx.compose.ui.geometry.CornerRadius(w * 0.12f)
         when (what) {
-            // Two sheets, one behind the other.
             "Copy" -> {
                 drawRoundRect(tint, Offset(w * 0.34f, w * 0.30f), Size(w * 0.56f, w * 0.62f), r, style = pen)
                 drawLine(tint, Offset(w * 0.12f, w * 0.68f), Offset(w * 0.12f, w * 0.10f), pen.width, StrokeCap.Round)
                 drawLine(tint, Offset(w * 0.12f, w * 0.10f), Offset(w * 0.62f, w * 0.10f), pen.width, StrokeCap.Round)
             }
-            // An arrow leaving a box.
             "Open" -> {
                 drawLine(tint, Offset(w * 0.42f, w * 0.14f), Offset(w * 0.14f, w * 0.14f), pen.width, StrokeCap.Round)
                 drawLine(tint, Offset(w * 0.14f, w * 0.14f), Offset(w * 0.14f, w * 0.86f), pen.width, StrokeCap.Round)
@@ -382,7 +350,6 @@ private fun Sign(what: String, tint: Color = MaterialTheme.colorScheme.primary, 
                 drawLine(tint, Offset(w * 0.60f, w * 0.12f), Offset(w * 0.88f, w * 0.12f), pen.width, StrokeCap.Round)
                 drawLine(tint, Offset(w * 0.88f, w * 0.12f), Offset(w * 0.88f, w * 0.40f), pen.width, StrokeCap.Round)
             }
-            // A pencil, point down.
             else -> {
                 drawLine(tint, Offset(w * 0.20f, w * 0.80f), Offset(w * 0.26f, w * 0.58f), pen.width, StrokeCap.Round)
                 drawLine(tint, Offset(w * 0.20f, w * 0.80f), Offset(w * 0.42f, w * 0.74f), pen.width, StrokeCap.Round)
@@ -394,7 +361,6 @@ private fun Sign(what: String, tint: Color = MaterialTheme.colorScheme.primary, 
     }
 }
 
-/** An eye, struck through while what it watches is hidden. */
 @Composable
 private fun Eye(open: Boolean, tint: Color) = Canvas(Modifier.size(22.dp)) {
     val (w, h) = size.width to size.height
@@ -403,19 +369,12 @@ private fun Eye(open: Boolean, tint: Color) = Canvas(Modifier.size(22.dp)) {
     if (!open) drawLine(tint, Offset(w * 0.15f, h * 0.85f), Offset(w * 0.85f, h * 0.15f), w * 0.09f)
 }
 
-/**
- * A field. [secret]: hidden, with an eye to show it ([shown]). [error]: what is wrong with it, said under it.
- * [prose]: text to spell-check and capitalise, as notes are; everything else is typed as it is.
- * [done]: what the keyboard's Done does.
- */
 @Composable
 private fun Field(
     v: String, set: (String) -> Unit, label: String, secret: Boolean = false, lines: Int = 1,
     error: String = "", prose: Boolean = false, done: (() -> Unit)? = null,
     shown: MutableState<Boolean> = remember { mutableStateOf(false) },
-    /** A PIN of digits alone: the number pad. */
     digits: Boolean = false,
-    /** Takes the keyboard as it appears. */
     focus: Boolean = false,
     trailing: (@Composable () -> Unit)? = null,
 ) = run {
@@ -450,7 +409,6 @@ private fun Primary(text: String, enabled: Boolean = true, go: () -> Unit) =
         Text(text, fontWeight = FontWeight.SemiBold)
     }
 
-/** What so many bits are called, and their colour: under 40 poor, under 65 weak, under 100 good. */
 private fun grade(bits: Int) = when {
     bits < 40 -> "Poor" to Color(0xFFE5604F)
     bits < 65 -> "Weak" to Color(0xFFE0A040)
@@ -458,10 +416,7 @@ private fun grade(bits: Int) = when {
     else -> "Excellent" to Color(0xFF4FB286)
 }
 
-/**
- * A bar that fills and turns from red to green as a password's bits grow. With a [goal] (the store's own
- * password: 256) the bar is full there, and says how far it is: a suggestion, nothing is refused.
- */
+/** [goal] is a suggestion: nothing below it is refused. */
 @Composable
 private fun Meter(bits: Int, goal: Int = 0) = Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
     val (name, colour) = grade(bits)
@@ -477,10 +432,6 @@ private fun Meter(bits: Int, goal: Int = 0) = Column(verticalArrangement = Arran
     Text(said, style = MaterialTheme.typography.bodySmall, color = colour)
 }
 
-/**
- * The name, one card in the middle for what the app wants first, and the other way in, small, in the corner.
- * While [work] is busy the card says [wait] and offers to stop.
- */
 @Composable
 private fun Front(
     title: String, work: Work, ask: String = "", link: String = "", other: () -> Unit = {},
@@ -512,7 +463,6 @@ private fun Front(
     }
 }
 
-/** Under what was asked for: that it is being done, with a way to stop; or why it failed. */
 @Composable
 private fun Doing(work: Work, wait: String = "", host: Host? = null) {
     if (work.busy) {
@@ -523,9 +473,7 @@ private fun Doing(work: Work, wait: String = "", host: Host? = null) {
         }
     }
     if (work.err.isNotEmpty()) Text(work.err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-    // What is wrong, and where to put it right.
     if (host != null && host.nfcOff && work.err.contains("NFC")) OutlinedButton(host::nfcSettings) { Text("Open NFC settings") }
-    // A new key, taken on: set up here, and a spare with it, now or never (the secret is not kept).
     var setUp by remember { mutableStateOf(false) }
     if (host != null && work.err.startsWith(EMPTY_KEY)) OutlinedButton({ work.go { host.setUpKey(false); setUp = true } }) { Text("Set up this key") }
     if (host != null && setUp && !work.busy && work.err.isEmpty()) {
@@ -538,7 +486,6 @@ private fun Doing(work: Work, wait: String = "", host: Host? = null) {
     }
 }
 
-/** Before a key is asked for: that NFC is off, and where to turn it on. */
 @Composable
 private fun NfcOff(host: Host) {
     if (!host.nfcOff) return
@@ -553,7 +500,7 @@ private fun Create(host: Host, nav: Nav) {
     var key by remember { mutableStateOf(Key.None) }
     var pin by remember { mutableStateOf("") }
     val shown = remember { mutableStateOf(false) }
-    // A generated password and its bits: known, where a typed one's are guessed.
+    // A generated password's bits are known; a typed one's only guessed.
     var made by remember { mutableStateOf("" to 0) }
     val work = rememberJob()
     val ok = pw.isNotEmpty() && pw == again && !work.busy
@@ -576,7 +523,7 @@ private fun Create(host: Host, nav: Nav) {
             shown.value = true
         }) { Text("Generate one and show it") }
         if (pw.isNotEmpty() && pw == made.first) {
-            // In full, as the field cuts it off: four words a line.
+            // The field cuts it off: shown whole, four words a line.
             Text(
                 pw.split('-').chunked(4).joinToString("-\n") { it.joinToString("-") },
                 Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background, RoundedCornerShape(10.dp)).padding(12.dp),
@@ -624,13 +571,12 @@ private fun Join(host: Host, nav: Nav) {
         )
         Field(name, { name = it }, "A name for that device", error = if (name.isBlank()) "It needs a name" else "")
         Field(code, { code = it }, "Code") { TextButton({ host.scan { code = it } }) { Text("Scan") } }
-        // A QR code, once scanned, asks for its password, keyboard up; a typed code has none.
+        // Only a QR code carries a password.
         if (code.trim().startsWith("PAIRIR1:")) Field(pw, { pw = it }, "The QR code's password", secret = true, done = join, focus = true)
         Primary("Join", enabled = ok, go = join)
     }
 }
 
-/** One of a few ways, with what it means. */
 @Composable
 private fun Choice(title: String, about: String, on: Boolean, pick: () -> Unit) =
     Row(Modifier.fillMaxWidth().clickable(onClick = pick), verticalAlignment = Alignment.CenterVertically) {
@@ -641,11 +587,7 @@ private fun Choice(title: String, about: String, on: Boolean, pick: () -> Unit) 
         }
     }
 
-/**
- * Every way in at once: the password, always; and any key of this store's (the quick-unlock YubiKey, a
- * CTAP2 key), tapped at any time with nothing pressed first. While the app listens, Android does not
- * open the web address a YubiKey carries.
- */
+/** Listens for any key of the store from the start, so a tap never opens the YubiKey's URL. */
 @Composable
 private fun Unlock(host: Host) {
     var pw by remember { mutableStateOf("") }
@@ -653,11 +595,9 @@ private fun Unlock(host: Host) {
     val work = rememberJob()
     val keys = host.quick != null || host.fidoKeys > 0
     val tap = "Hold your YubiKey still against the phone, or plug it in"
-    // What the listening ran into, and a way to start it again.
     var heard by remember { mutableStateOf("") }
     var again by remember { mutableIntStateOf(0) }
-    // After a tap. 1: the quick-unlock key is read, its answer kept, and the PIN is wanted. 2: a CTAP2 key
-    // wants its own PIN before it answers, so it is typed and the key tapped again.
+    // 1: quick key read, its PIN wanted. 2: a CTAP2 key wants its PIN, then a second tap.
     var stage by remember { mutableIntStateOf(0) }
     val typed by rememberUpdatedState(pin)
     val stuck = heard.isNotEmpty() && (host.nfcOff || "NFC" in heard)
@@ -673,7 +613,7 @@ private fun Unlock(host: Host) {
             } catch (e: Throwable) {
                 heard = e.message?.removePrefix("Rust error: ") ?: "It failed"
                 if ("has a PIN" in heard) stage = 2
-                // No way to a key at all: said, with Try again; anything else, the next tap may do better.
+                // NFC off: stop and offer Try again; else keep listening.
                 if (host.nfcOff || "NFC" in heard) break
                 delay(400)
             }
@@ -685,7 +625,6 @@ private fun Unlock(host: Host) {
         if (keys) {
             if (stage == 1) {
                 Text("The key is read. Now the PIN:", color = MaterialTheme.colorScheme.primary)
-                // The number pad, if the PIN that was set is digits alone.
                 Field(pin, { pin = it }, "PIN", secret = true, done = byPin, digits = host.setting("pinDigits") == 1, focus = true)
                 Primary("Unlock", enabled = !work.busy, go = byPin)
                 TextButton({ stage = 0; pin = ""; again++ }) { Text("Tap another key") }
@@ -706,7 +645,6 @@ private fun Unlock(host: Host) {
     }
 }
 
-/** A screen under the list: back, its name, what it does. */
 @Composable
 private fun Page(title: String, nav: Nav, action: String = "", act: () -> Unit = {}, body: @Composable () -> Unit) = Column(Modifier.fillMaxSize()) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -781,7 +719,6 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
     }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.padding(start = 12.dp, end = 4.dp, top = 10.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-            // The app's mark: about it, and its settings.
             Box(
                 Modifier.padding(end = 8.dp).size(44.dp).clickable { nav.screen = Screen.Settings }.semantics { contentDescription = "About and settings" },
                 contentAlignment = Alignment.Center,
@@ -832,8 +769,7 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
             if (names.isEmpty()) "No entries yet. New adds the first." else "Nothing matches.",
             Modifier.fillMaxWidth().padding(32.dp), color = muted,
         )
-        // Entries of no group first; then each group under its name, a group within a group further in.
-        // A tap on a name folds what is under it (not while searching: what matches shows).
+        // Ungrouped first, then groups depth-first ('/' sorts lowest); searching ignores folds.
         val groups = shown.groupBy { it.substringBeforeLast('/', "") }
         val paths = groups.keys.filter { it.isNotEmpty() }.flatMap { g -> g.split('/').runningReduce { a, b -> "$a/$b" } }
             .distinct().sortedBy { it.replace('/', '\u0001') }
@@ -867,9 +803,7 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
                             val under = listOf(f.user, f.url.substringAfter("://")).filter { it.isNotEmpty() }.joinToString("  \u00B7  ")
                             if (under.isNotEmpty()) Text(under, style = MaterialTheme.typography.bodyMedium, color = muted, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
-                        // The password's grade, as a dot.
                         if (f.pass.isNotEmpty()) Box(Modifier.padding(start = 12.dp).size(10.dp).background(grade(host.strength(f.pass)).second, RoundedCornerShape(5.dp)))
-                        // What can be done with an entry, under a long press.
                         DropdownMenu(held, { held = false }) {
                             val item = @Composable { t: String, act: () -> Unit -> DropdownMenuItem({ Text(t) }, { held = false; act() }) }
                             if (f.user.isNotEmpty()) item("Copy username") { copy("Username", f.user) }
@@ -887,7 +821,6 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
     }
 }
 
-/** One field of an entry: what it is, its value, its copy. */
 @Composable
 private fun Shown(label: String, value: String, mono: Boolean = false, act: String = "Copy", more: @Composable () -> Unit = {}, copy: (() -> Unit)? = null) =
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -966,7 +899,6 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     var name by remember { mutableStateOf(old) }
     var f by remember { mutableStateOf(if (old.isEmpty()) Form(pass = host.generate(nav.gen)) else Form()) }
     val show = remember { mutableStateOf(old.isEmpty()) }
-    // As it was when this opened: leaving with something changed is asked about first.
     var was by remember { mutableStateOf(name to f) }
     LaunchedEffect(old) { if (old.isNotEmpty()) { f = host.form(host.get(old)); was = name to f } }
     nav.unsaved = (name to f) != was
@@ -980,7 +912,6 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     var making by remember { mutableStateOf(false) }
     val wrong = host.problem(f)
     if (making) Generator(host, nav, { _, _ -> }, { f = f.copy(pass = it); show.value = true; making = false }) { making = false }
-    // The user names most entries have, to pick from.
     val users by produceState(listOf<String>()) {
         value = host.names().mapNotNull { n -> runCatching { host.form(host.get(n)).user }.getOrNull()?.takeIf { it.isNotEmpty() } }
             .groupingBy { it }.eachCount().entries.sortedByDescending { it.value }.map { it.key }.take(5)
@@ -1044,7 +975,6 @@ private fun Edit(host: Host, nav: Nav, old: String, go: (suspend () -> String) -
     }
 }
 
-/** One of two ways, the chosen one filled. */
 @Composable
 private fun Way(text: String, on: Boolean, pick: () -> Unit) =
     if (on) Button(pick, shape = RoundedCornerShape(10.dp)) { Text(text) }
@@ -1063,7 +993,6 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
     var n by remember { mutableIntStateOf(0) }
     val made = remember(g, n) { host.generate(g) }
     var pw by remember(made) { mutableStateOf(made) }
-    // Of the password as it stands, at every change of it.
     val bits = host.strength(pw)
     AlertDialog(
         close, title = { Text("Password generator") },
@@ -1107,7 +1036,6 @@ private fun Generator(host: Host, nav: Nav, copy: (String, String) -> Unit, use:
     )
 }
 
-/** Weak, shared and, if asked, breached passwords. */
 @Composable
 private fun Health(host: Host, nav: Nav) {
     val found by produceState<Health?>(null) { value = runCatching { host.health() }.getOrNull() }
@@ -1160,12 +1088,11 @@ private fun Health(host: Host, nav: Nav) {
     }
 }
 
-/** What an entry was, version by version, and a way back. */
 @Composable
 private fun History(host: Host, nav: Nav, name: String, copy: (String, String) -> Unit, go: (suspend () -> String) -> Unit) {
     val all by produceState(listOf<Pair<Long, String>>(), name) { value = runCatching { host.history(name) }.getOrDefault(listOf()) }
     val date = remember { java.text.SimpleDateFormat("yyyy-MM-dd  HH:mm") }
-    // The version looked at (none: -1), the one it is compared with, and whether passwords show.
+    // seen: the version open (-1: none); with: the one it is compared with.
     var seen by remember(name) { mutableIntStateOf(-1) }
     var with by remember(name) { mutableIntStateOf(0) }
     var show by remember { mutableStateOf(false) }
@@ -1185,7 +1112,7 @@ private fun History(host: Host, nav: Nav, name: String, copy: (String, String) -
                 Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp)).padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
-                // The older of the two is what was, whichever was tapped.
+                // The higher index is older, so it is `was`, whichever was tapped.
                 val other = all.getOrNull(with)?.takeIf { with != i }
                 val then = other?.let { date.format(java.util.Date(it.first)) }
                 Label(if (then == null) "AS IT WAS" else if (with < i) "$at  TO  $then" else "$then  TO  $at")
@@ -1252,7 +1179,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             val n = name.trim()
             go { pairing = n to host.pair(n, pw); qrPw = null; host.sync = true; on = true; "" }
         }
-        // A QR code's password comes first, never beside the code: a camera on the screen would read both.
+        // Its password first, never beside the code: a camera on the screen would read both.
         OutlinedButton({ pairing = null; qrPw = host.generate(Gen(words = true, count = 2, seps = "-")) }, enabled = name.isNotBlank()) { Text("Show a QR code") }
         OutlinedButton({ qrPw = null; show(null) }, enabled = name.isNotBlank()) { Text("Show a code to type") }
         qrPw?.let { pw ->
@@ -1288,7 +1215,6 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
         }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-    // One of a few values, the chosen one filled.
     val pick = @Composable { name: String, title: String, about: String, of: List<Pair<Int, String>> ->
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(title, style = MaterialTheme.typography.bodyLarge)
@@ -1302,7 +1228,6 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     pick("lock", "Locking", "The store locks when the app has been off the screen this long.", listOf(0 to "At once", 60 to "1 min", 300 to "5 min"))
     pick("theme", "Looks", "Dark or light.", listOf(0 to "As the phone", 1 to "Dark", 2 to "Light"))
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-    // Security keys (FIDO2): added one at a time, a spare at any time.
     var keyPin by remember { mutableStateOf("") }
     val keys = rememberJob()
     Text("Security keys: CTAP2 (FIDO2 without the network)", style = MaterialTheme.typography.bodyLarge)

@@ -1,10 +1,5 @@
-//! `kdbx2pasa A.kdbx [B.kdbx ...] [-k KEYFILE] | pasa load`: every entry
-//! with its history, dated as KeePass dated it, its attachments, and
-//! `.kdbx.json` (the first database, whole), as tar.
-//!
-//! Several databases are copies of one that went apart (sync conflicts):
-//! an entry is the same by its id in each, and its versions from all of
-//! them make one history by time, the newest being the entry.
+//! KeePass to the tar `pasa load` reads. Copies that went apart merge by entry
+//! UUID, under the newest name; `.kdbx.json` keeps the first database whole.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -13,7 +8,6 @@ use keepass::{Database, DatabaseKey, db::Entry, db::GroupRef};
 use std::collections::{BTreeMap, HashSet};
 use std::{fmt::Write, fs::File};
 
-/// What goes into the tar: a name, a time in seconds, the bytes.
 type Item = (String, u64, Vec<u8>);
 
 fn text(e: &Entry) -> Result<String> {
@@ -24,7 +18,7 @@ fn text(e: &Entry) -> Result<String> {
         if !["Title", "Password", "Notes"].contains(&k.as_str())
             && !v.is_empty()
         {
-            // A name pasa saves as it is: letters, digits and _.
+            // pasa field names are letters, digits and _.
             let plain =
                 |c: char| if c.is_ascii_alphanumeric() { c } else { '_' };
             let k = match k.as_str() {
@@ -40,7 +34,7 @@ fn text(e: &Entry) -> Result<String> {
     if e.times.expires == Some(true) {
         writeln!(b, "expires: {}", e.times.expiry.date())?;
     }
-    // An empty line, then the notes: notes whatever they say.
+    // After a blank line, notes are never parsed as fields.
     if let Some(n) = e.get("Notes").filter(|n| !n.is_empty()) {
         writeln!(b, "\n{n}")?;
     }
@@ -52,8 +46,7 @@ fn at(e: &Entry) -> u64 {
     t.map_or(0, |t| t.and_utc().timestamp().max(0) as u64)
 }
 
-/// One entry as the databases have it: each version (when, where, its
-/// text), and the newest one's attachments.
+/// An entry across databases: versions (time, name, text), the newest's files.
 #[derive(Default)]
 struct Seen {
     versions: Vec<(u64, String, String)>,
@@ -66,7 +59,6 @@ fn walk(
     bin: Option<uuid::Uuid>,
     to: &mut BTreeMap<uuid::Uuid, Seen>,
 ) -> Result<()> {
-    // What was deleted there stays deleted here.
     if Some(g.id().uuid()) == bin {
         return Ok(());
     }
@@ -90,8 +82,6 @@ fn walk(
     Ok(())
 }
 
-/// The entries of `dbs` as one: each one's versions oldest first, under
-/// the name its newest version has.
 fn merge(dbs: &[Database]) -> Result<Vec<Item>> {
     let mut seen = BTreeMap::new();
     for db in dbs {
@@ -100,15 +90,14 @@ fn merge(dbs: &[Database]) -> Result<Vec<Item>> {
     let (mut out, mut names) = (vec![], HashSet::new());
     for mut e in seen.into_values() {
         e.versions.sort();
-        // The copies share most versions; a save that changed nothing
-        // tells nothing.
+        // Drops copies' shared versions and saves that changed nothing.
         e.versions.dedup_by(|b, a| a.2 == b.2);
         let Some(last) = e.versions.last() else { continue };
         let dots = |c: &str| {
             if c == "." || c == ".." { format!("_{c}") } else { c.into() }
         };
         let name: Vec<String> = last.1.split('/').map(dots).collect();
-        // Two entries of one title in one group are two entries here too.
+        // Same-titled entries in one group stay apart.
         let free = |i: &u32| match i {
             0 => name.join("/"),
             i => format!("{} ({})", name.join("/"), i + 1),
@@ -161,7 +150,6 @@ mod tests {
     use chrono::DateTime;
     use keepass::db::Value;
 
-    /// The entry as it is becomes history; then it is `pw` at `day`.
     fn change(db: &mut Database, id: keepass::db::EntryId, pw: &str, day: i64) {
         let mut root = db.root_mut();
         let mut e = root.entry_mut(id).unwrap();
@@ -184,7 +172,6 @@ mod tests {
         let id = e.id();
         change(&mut base, id, "one", 1);
         change(&mut base, id, "two", 2);
-        // Two devices go on from there, apart.
         let (mut a, mut b) = (base.clone(), base.clone());
         change(&mut a, id, "three-on-a", 3);
         change(&mut b, id, "four-on-b", 4);
@@ -194,7 +181,6 @@ mod tests {
             let mut moved = root.entry_mut(id).unwrap();
             moved.set("Title", Value::unprotected("post"));
         }
-        // As files, as they would come: written, and read back.
         let dir = std::env::temp_dir();
         let filed = |(i, db): (usize, Database)| {
             let key = || DatabaseKey::new().with_password("kdbx");
@@ -215,8 +201,6 @@ mod tests {
                 (n, at / 86_400, pw.lines().next().unwrap().to_string())
             })
             .collect();
-        // One entry, under its newest version's name; every version once,
-        // by time, whichever copy had it; the newest is the entry.
         let want = ["one", "two", "three-on-a", "four-on-b", "five-on-a"];
         let pws: Vec<&str> = got.iter().skip(1).map(|g| &*g.2).collect();
         assert_eq!(pws, want);
