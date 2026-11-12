@@ -39,16 +39,18 @@ pub fn net(dir: &Path) -> PathBuf {
 }
 
 /// A pairing: its transport key, the peer's endpoint if it serves, its
-/// pushir lane if it listens.
+/// pushir lane if it listens, when it last synced with this device (Unix
+/// seconds; paired, if never).
 pub struct Peer {
     pub name: String,
     pub psk: [u8; 32],
     pub id: Option<PublicKey>,
     pub lane: Option<Lane>,
+    pub seen: Option<u64>,
 }
 
-/// `psk endpoint lane name`, a line each (before 0.4.10 a device id came
-/// before the name).
+/// `psk endpoint lane seen name`, a line each; the name last, as before
+/// `seen` came (and before 0.4.10, when a device id stood there).
 pub fn peers(dir: &Path) -> Vec<Peer> {
     let f = fs::read_to_string(net(dir).join("peers")).unwrap_or_default();
     let peer = |l: &str| {
@@ -58,7 +60,9 @@ pub fn peers(dir: &Path) -> Vec<Peer> {
         let id = w.get(1)?.parse().ok();
         let lane = w.get(2)?.parse().ok();
         let name = w[3..].last()?.to_string();
-        Some(Peer { psk, id, lane, name })
+        let seen =
+            w.get(3).filter(|_| w.len() > 4).and_then(|s| s.parse().ok());
+        Some(Peer { psk, id, lane, seen, name })
     };
     f.lines().filter_map(peer).collect()
 }
@@ -67,12 +71,60 @@ fn save(dir: &Path, ps: &[Peer]) -> Result<()> {
     let line = |p: &Peer| {
         let m = p.lane.as_ref().map_or("-".into(), Lane::to_string);
         let id = p.id.map_or("-".into(), |k| k.to_string());
-        format!("{} {id} {m} {}\n", HEXLOWER.encode(&p.psk), p.name)
+        let seen = p.seen.map_or("-".into(), |t| t.to_string());
+        format!("{} {id} {m} {seen} {}\n", HEXLOWER.encode(&p.psk), p.name)
     };
     write(
         &net(dir).join("peers"),
         ps.iter().map(line).collect::<String>().as_bytes(),
     )
+}
+
+fn now() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    t.map_or(0, |d| d.as_secs())
+}
+
+/// Whether sync is on here. Off unless turned on (pairing turns it on), as
+/// on the phone; off, nothing goes online: no serving, no listening, no
+/// sync after a change.
+pub fn on(dir: &Path) -> bool {
+    net(dir).join("on").exists()
+}
+
+pub fn set_on(dir: &Path, on: bool) -> Result<()> {
+    let at = net(dir).join("on");
+    if on {
+        return write(&at, b"");
+    }
+    match fs::remove_file(&at) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// How long devices may stay apart before each says so: a month. Offline
+/// the rest of the time is the point.
+pub const APART: u64 = 30 * 86_400;
+
+/// Each peer: its name, the days since it last synced here (paired, if
+/// never), and whether that is [`APART`] or longer. One paired before that
+/// was kept counts from when the pairings last changed.
+pub fn apart(dir: &Path) -> Vec<(String, u64, bool)> {
+    let now = now();
+    let m = fs::metadata(net(dir).join("peers")).and_then(|m| m.modified());
+    let t = m.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    let since = t.map_or(now, |d| d.as_secs());
+    let one = |p: Peer| {
+        let s = now.saturating_sub(p.seen.unwrap_or(since));
+        (p.name, s / 86_400, s >= APART)
+    };
+    peers(dir).into_iter().map(one).collect()
+}
+
+/// The peers a month apart or more: each, with the days.
+pub fn unseen(dir: &Path) -> Vec<(String, u64)> {
+    apart(dir).into_iter().filter(|a| a.2).map(|a| (a.0, a.1)).collect()
 }
 
 fn named(name: &str) -> Result<()> {
@@ -207,7 +259,7 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     Ok((theirs, id, t?))
 }
 
-/// Keep what a swap learnt of `name`.
+/// Keep what a swap learnt of `name`, and that it synced now.
 fn learnt(
     dir: &Path,
     name: &str,
@@ -216,12 +268,10 @@ fn learnt(
 ) {
     let mut ps = peers(dir);
     let Some(p) = ps.iter_mut().find(|p| p.name == name) else { return };
-    let before = (p.lane.clone(), p.id);
     p.lane = lane.unwrap_or(p.lane.take());
     p.id = id.or(p.id);
-    if before != (p.lane.clone(), p.id) {
-        let _ = save(dir, &ps);
-    }
+    p.seen = Some(now());
+    let _ = save(dir, &ps);
 }
 
 /// Wake every listening peer but `except`: an empty message to its lane,
@@ -397,7 +447,18 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
     let ctap = fs::read_to_string(dir.join("ctap")).ok();
     let ctap = ctap.and_then(|t| crate::ctap_packed(&t)).unwrap_or_default();
     let (psk, id) = (rand::<32>(), key(dir, "node")?.public());
-    add(dir, Peer { name: name.into(), psk, id: None, lane: None })?;
+    add(
+        dir,
+        Peer {
+            name: name.into(),
+            psk,
+            id: None,
+            lane: None,
+            seen: Some(now()),
+        },
+    )?;
+    // Pairing is for syncing: on, as on the phone.
+    set_on(dir, true)?;
     let n = 64 + KEYS.len() + 12 + f.len() + quick.len() + ctap.len();
     let mut out = Zeroizing::new(Vec::with_capacity(n));
     out.extend_from_slice(id.as_bytes());
@@ -458,7 +519,17 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
             true => {}
         }
     }
-    add(dir, Peer { name: name.into(), psk: psk.try_into()?, id, lane: None })
+    add(
+        dir,
+        Peer {
+            name: name.into(),
+            psk: psk.try_into()?,
+            id,
+            lane: None,
+            seen: Some(now()),
+        },
+    )?;
+    set_on(dir, true)
 }
 
 /// A QR code's text: what [`offer`] made, under `pw` (pairir: Argon2id,
@@ -641,6 +712,43 @@ mod tests {
             take(&desk, "x", &[got[..64].to_vec(), KEYS.to_vec()].concat())
                 .is_err()
         );
+    }
+
+    /// Sync is off until turned on, and pairing turns it on (as on the
+    /// phone). Each device keeps when each other last synced with it, and
+    /// says which are a month apart; a pairing from before that was kept
+    /// counts from when the pairings last changed. The name stays last on
+    /// its line, where 0.4.12 reads it.
+    #[test]
+    fn off_until_on_and_a_month_apart_is_said() {
+        let d = crate::tests::dir("apart");
+        let (a, b) = (d.join("a"), d.join("b"));
+        Store::create(&a, b"pw", None).unwrap();
+        assert!(!on(&a) && !on(&b));
+        pair(&a, "a", &b, "b");
+        assert!(on(&a) && on(&b));
+        set_on(&b, false).unwrap();
+        set_on(&b, false).unwrap();
+        assert!(!on(&b) && on(&a));
+        assert_eq!(apart(&b), [("a".to_string(), 0, false)]);
+        assert!(unseen(&b).is_empty());
+        let mut ps = peers(&b);
+        ps[0].seen = Some(now() - 31 * 86_400);
+        save(&b, &ps).unwrap();
+        assert_eq!(unseen(&b), [("a".to_string(), 31)]);
+        let line = fs::read_to_string(net(&b).join("peers")).unwrap();
+        assert_eq!(line.trim_end().split(' ').next_back(), Some("a"));
+        // Before `seen`: the file's own date.
+        let old: Vec<&str> = line.split(' ').collect();
+        let old = [&old[..3], &old[4..]].concat().join(" ");
+        fs::write(net(&b).join("peers"), old).unwrap();
+        assert_eq!(peers(&b)[0].seen, None);
+        assert!(unseen(&b).is_empty());
+        let f = fs::File::options().write(true).open(net(&b).join("peers"));
+        let then =
+            std::time::SystemTime::now() - Duration::from_secs(40 * 86_400);
+        f.unwrap().set_modified(then).unwrap();
+        assert_eq!(unseen(&b), [("a".to_string(), 40)]);
     }
 
     /// Lists past a stream's window (2 MiB: 70,000 names here) cross: each

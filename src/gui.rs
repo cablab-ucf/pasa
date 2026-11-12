@@ -328,7 +328,7 @@ struct Pairing {
 /// The camera looking for a QR code, beside the window: the frame it last
 /// saw, and what it found or why it stopped.
 struct Scanning {
-    frame: Arc<Mutex<Option<Vec<u8>>>>,
+    frame: Arc<Mutex<Option<crate::scan::Frame>>>,
     found: Arc<Mutex<Option<Result<String, String>>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     img: Option<egui::TextureHandle>,
@@ -905,12 +905,28 @@ impl App {
     /// text goes in the Code field, and its password is asked for.
     fn scan(&mut self, ui: &mut Ui) {
         let l = look(ui);
+        // A picture of the code (a photo of the other screen), dropped on
+        // the window: read here, as camera frames are.
+        let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
+        if let Some(p) = dropped.first().map(|f| f.path().to_path_buf()) {
+            let got = crate::scan::picture(&p).map(|f| crate::scan::read(&f));
+            match got {
+                Ok(Some(t)) => (self.code, self.said) = (t, String::new()),
+                Ok(None) => {
+                    self.said = "No QR code read in that picture".into()
+                }
+                Err(e) => self.said = format!("{e:#}"),
+            }
+            self.scanning = None;
+        }
         let Some(s) = &mut self.scanning else {
             let tip = "The camera reads the code the other device shows: \
                        nothing goes online, no frame is kept";
             if ui.button("Scan with the camera").on_hover_text(tip).clicked() {
                 self.scanning = Some(Scanning::start(ui.ctx()));
             }
+            let or = "Or drop a picture of the code on this window";
+            ui.label(RichText::new(or).small().color(l.muted));
             return;
         };
         // Taken out of the lock first: the result outlives the guard.
@@ -927,8 +943,7 @@ impl App {
         if let Some(f) =
             s.frame.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
-            let img =
-                ColorImage::from_gray([crate::scan::W, crate::scan::H], &f);
+            let img = ColorImage::from_gray([f.w, f.h], &f.px);
             match &mut s.img {
                 Some(t) => t.set(img, egui::TextureOptions::LINEAR),
                 None => {
@@ -940,7 +955,9 @@ impl App {
         let say = "Hold the other device's QR code to the camera";
         ui.label(RichText::new(say).small().color(l.muted));
         if let Some(t) = &s.img {
-            ui.image((t.id(), vec2(352.0, 198.0)));
+            let [w, h] = t.size();
+            let h = 352.0 * h as f32 / w.max(1) as f32;
+            ui.image((t.id(), vec2(352.0, h)));
         }
         if ui.button("Stop the camera").clicked() {
             self.scanning = None;
@@ -1176,13 +1193,34 @@ impl App {
 
         let foot =
             Frame::new().fill(l.card).inner_margin(Margin::symmetric(12, 5));
+        // Devices apart for a month say so here, until they check in.
+        let apart = sync::unseen(&home());
         Panel::bottom("status").frame(foot).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&v.note).small().color(l.muted));
+                match (v.note.is_empty(), apart.first()) {
+                    (true, Some((who, d))) => {
+                        let more = apart.len() - 1;
+                        let and = if more > 0 { format!(" (and {more} more)") } else { String::new() };
+                        let say = format!("Not synced with {who} for {d} days{and}: check in, in Devices");
+                        ui.label(RichText::new(say).small().color(l.bad));
+                    }
+                    _ => {
+                        ui.label(RichText::new(&v.note).small().color(l.muted));
+                    }
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let n =
                         format!("{} of {} entries", rows.len(), v.names.len());
                     ui.label(RichText::new(n).small().color(l.muted));
+                    let (say, c) = match sync::on(&home()) {
+                        true => ("Sync on", l.accent),
+                        false => ("Offline", l.muted),
+                    };
+                    let tip = "Devices: sync on or off, and when each last synced";
+                    let b = Button::new(RichText::new(say).small().color(c)).frame(false);
+                    if ui.add(b).on_hover_text(tip).clicked() {
+                        self.win = Win::Devices;
+                    }
                 });
             })
         });
@@ -1291,6 +1329,12 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for i in range {
                             let at = rows[i];
+                            // Deleted this frame (in the entry pane, drawn
+                            // first), or by a sync since: the list is
+                            // shorter; the next frame draws it anew.
+                            if at >= v.names.len() {
+                                continue;
+                            }
                             let m = self.meta(&v, at).clone();
                             let (rect, r) = ui.allocate_exact_size(
                                 vec2(width, 30.0),
@@ -1495,6 +1539,7 @@ impl App {
                             s.remove(name)?;
                             Ok(format!("{name}: deleted; its history stays"))
                         });
+                        ui.ctx().request_repaint();
                     }
                     self.armed ^= true;
                 }
@@ -2069,16 +2114,43 @@ impl App {
     fn devices(&mut self, ui: &mut Ui, v: &mut View) {
         let l = look(ui);
         ui.heading("Devices");
+        let mut on = sync::on(&home());
+        if ui.checkbox(&mut on, "Sync with my devices").changed() {
+            v.note = match sync::set_on(&home(), on) {
+                Ok(()) if on => {
+                    "Sync on: paired devices sync with this one".into()
+                }
+                Ok(()) => "Offline: nothing goes online".into(),
+                Err(e) => format!("{e:#}"),
+            };
+            if on {
+                self.sync_now(ui.ctx(), false);
+            }
+        }
         let about = "Devices that hold this store sync with each other directly, \
-                     sealed end to end. No account, no server keeps a copy.";
+                     sealed end to end. No account, no server keeps a copy. Off: \
+                     this computer never uses the network for it. Offline is \
+                     fine; check in about once a month, and each device says \
+                     which others it has not met for longer.";
         ui.label(RichText::new(about).small().color(l.muted));
-        let peers = sync::peers(&home());
+        let (peers, apart) = (sync::peers(&home()), sync::apart(&home()));
         if peers.is_empty() {
             ui.label(RichText::new("No other device yet.").color(l.muted));
         }
         for p in &peers {
             ui.horizontal(|ui| {
                 ui.label(&p.name);
+                let a = apart.iter().find(|a| a.0 == p.name);
+                let (when, c) = match a.map(|a| (a.1, a.2)) {
+                    Some((d, true)) => {
+                        (format!("not synced for {d} days: check in"), l.bad)
+                    }
+                    Some((0, _)) => ("synced today".into(), l.muted),
+                    Some((1, _)) => ("synced yesterday".into(), l.muted),
+                    Some((d, _)) => (format!("synced {d} days ago"), l.muted),
+                    None => (String::new(), l.muted),
+                };
+                ui.label(RichText::new(when).small().color(c));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Forget").clicked() {
                         v.note = match sync::forget(&home(), &p.name) {
@@ -2103,7 +2175,7 @@ impl App {
                 });
             });
         }
-        if !peers.is_empty() && ui.button("Sync now").clicked() {
+        if on && !peers.is_empty() && ui.button("Sync now").clicked() {
             v.note = "Syncing".into();
             self.sync_now(ui.ctx(), true);
         }
@@ -2129,7 +2201,7 @@ impl App {
     /// `news`, those that listen woken to dial here); what it said, shown
     /// once back.
     fn sync_now(&self, ctx: &Context, news: bool) {
-        if !sync::net(&home()).join("peers").exists() {
+        if !sync::net(&home()).join("peers").exists() || !sync::on(&home()) {
             return;
         }
         let (out, ctx) = (self.synced.clone(), ctx.clone());
@@ -2152,11 +2224,14 @@ impl App {
         });
     }
 
-    /// Serve while the window is open, once paired: devices dial here. The
-    /// network side is a process of its own that sees `v/` and `net/`
-    /// alone; what it brings shows at once, and is said.
+    /// Serve while the window is open, once paired and with sync on:
+    /// devices dial here. The network side is a process of its own that
+    /// sees `v/` and `net/` alone, and stops serving within seconds of sync
+    /// going off (and serves again when it comes back on); what it brings
+    /// shows at once, and is said.
     fn serve(&mut self, ctx: &Context) {
-        if self.serving || !sync::net(&home()).join("peers").exists() {
+        let paired = sync::net(&home()).join("peers").exists();
+        if self.serving || !paired || !sync::on(&home()) {
             return;
         }
         self.serving = true;

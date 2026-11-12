@@ -1,6 +1,6 @@
 [package]
 name = "pasa"
-version = "0.4.12"
+version = "0.4.13"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -18,8 +18,8 @@ members = ["kdbx2pasa", "apasa-jni"]
 [features]
 default = ["sync", "tui", "scan", "fido"]
 sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode", "dep:landlock"]
-# A QR code by the camera (desktop; Android scans with ZXing).
-scan = ["sync", "dep:rqrr", "dep:rxing"]
+# A QR code by the camera, or in a picture (desktop; Android scans with ZXing).
+scan = ["sync", "dep:rqrr", "dep:rxing", "dep:nokhwa", "dep:image"]
 # Security keys by CTAP2 over USB, in-process (desktop; Android: Yubico's kit).
 fido = ["dep:authenticator"]
 tui = ["dep:crossterm"]
@@ -49,6 +49,10 @@ qrcode = { version = "0.14", default-features = false, optional = true }
 # the other misses.
 rqrr = { version = "0.11", optional = true }
 rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"], optional = true }
+# The camera, in this process: AVFoundation (macOS), V4L2 (Linux). Its own
+# MJPEG decoder (C) left out: `image` (Rust) reads JPEG and PNG.
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"], optional = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
 # CTAP2 to security keys over USB HID: Firefox's own, with RustCrypto. No
 # tool to install, no keyboard access (macOS asks no Input Monitoring).
 authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"], optional = true }

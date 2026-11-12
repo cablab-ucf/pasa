@@ -604,6 +604,24 @@ pub extern "system" fn Java_com_apasa_Native_peers<'l>(
     })
 }
 
+/// Each paired device, a line: `name \t days since it last synced here \t
+/// 1` if that is a month or more ([`sync::APART`]), else `0`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_seen<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let a = sync::apart(Path::new(&dir.to_string()));
+        let line = |(n, d, late): (String, u64, bool)| {
+            format!("{n}\t{d}\t{}", late as u8)
+        };
+        let lines: Vec<String> = a.into_iter().map(line).collect();
+        Ok(e.new_string(lines.join("\n"))?)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_forget<'l>(
     mut env: EnvUnowned<'l>,

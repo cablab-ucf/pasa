@@ -214,6 +214,8 @@ interface Host {
     fun copy(text: String)
     suspend fun syncNow(): String
     suspend fun peers(): List<String>
+    /** Each paired device: days since it last synced here, and whether that is a month or more. */
+    suspend fun seen(): Map<String, Pair<Long, Boolean>>
     suspend fun forget(name: String)
     /** A device lost or stolen: forgotten, and a new store key here, which the other devices get by pairing again. */
     suspend fun revoke(name: String)
@@ -763,6 +765,9 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
     var q by remember { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
     val names by produceState(listOf<String>(), tick) { value = host.names() }
+    val late by produceState(listOf<Pair<String, Long>>(), tick) {
+        value = host.seen().filter { it.value.second }.map { it.key to it.value.first }
+    }
     var tag by remember { mutableStateOf("") }
     val forms by produceState(mapOf<String, Form>(), names, tick) {
         value = names.associateWith { runCatching { host.form(host.get(it)) }.getOrDefault(Form()) }
@@ -815,6 +820,14 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
             if (shown.size == names.size) "${names.size} entries" else "${shown.size} of ${names.size} entries",
             Modifier.padding(start = 20.dp, top = 6.dp), style = MaterialTheme.typography.labelMedium, color = muted,
         )
+        late.firstOrNull()?.let { (who, d) ->
+            val more = if (late.size > 1) " (and ${late.size - 1} more)" else ""
+            Text(
+                "Not synced with $who for $d days$more: check in",
+                Modifier.fillMaxWidth().clickable { nav.screen = Screen.Devices }.padding(start = 20.dp, top = 4.dp, end = 20.dp),
+                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.error,
+            )
+        }
         if (shown.isEmpty()) Text(
             if (names.isEmpty()) "No entries yet. New adds the first." else "Nothing matches.",
             Modifier.fillMaxWidth().padding(32.dp), color = muted,
@@ -1200,6 +1213,7 @@ private fun History(host: Host, nav: Nav, name: String, copy: (String, String) -
 private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) -> Unit) {
     var on by remember { mutableStateOf(host.sync) }
     val peers by produceState(listOf<String>(), tick) { value = host.peers() }
+    val seen by produceState(mapOf<String, Pair<Long, Boolean>>(), tick) { value = host.seen() }
     var name by remember { mutableStateOf("") }
     var pairing by remember { mutableStateOf<Pair<String, String>?>(null) }
     var qrPw by remember { mutableStateOf<String?>(null) }
@@ -1208,7 +1222,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             Column(Modifier.weight(1f).padding(end = 12.dp)) {
                 Text("Sync with my devices", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    "Devices that hold this store sync with each other directly, sealed end to end. No account, no server keeps a copy. Off: the app never uses the network.",
+                    "Devices that hold this store sync with each other directly, sealed end to end. No account, no server keeps a copy. Off: the app never uses the network. Offline is fine; check in about once a month, and each device says which others it has not met for longer.",
                     style = MaterialTheme.typography.bodySmall, color = muted,
                 )
             }
@@ -1219,7 +1233,15 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
         Label("PAIRED DEVICES")
         if (peers.isEmpty()) Text("No other device yet.", color = muted)
         for (p in peers) Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(p, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+            Column(Modifier.weight(1f)) {
+                Text(p, style = MaterialTheme.typography.bodyLarge)
+                seen[p]?.let { (d, late) ->
+                    Text(
+                        when { late -> "Not synced for $d days: check in"; d == 0L -> "Synced today"; d == 1L -> "Synced yesterday"; else -> "Synced $d days ago" },
+                        style = MaterialTheme.typography.bodySmall, color = if (late) MaterialTheme.colorScheme.error else muted,
+                    )
+                }
+            }
             TextButton({ go { host.forget(p); "$p: forgotten" } }) { Text("Forget") }
             TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again" } }) { Text("Revoke") }
         }
