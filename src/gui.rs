@@ -361,8 +361,8 @@ struct App {
     peer: String,
     code: String,
     pair_pw: Zeroizing<String>,
-    /// A pairing taken, until the unlock that opens its keys.
-    taken: Option<sync::Taken>,
+    /// A pairing taken: the store comes, and its password opens it.
+    joined: bool,
     /// Done at the next frame, once this one has said so.
     job: Option<Job>,
     said: String,
@@ -608,14 +608,15 @@ impl eframe::App for App {
         ui.ctx().request_repaint_after(idle);
         self.serve(&ui.ctx().clone());
         if let Some(job) = self.job.take() {
-            let was = self.v.is_some();
+            let was = (self.v.is_some(), self.joined);
             self.said = self
                 .work(job)
                 .err()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_default();
-            // Just opened: a sync, which shows what it brought when done.
-            if !was && self.v.is_some() {
+            // Just joined, or opened: a sync, which shows what it brought
+            // when done. Joined, the store comes before the password.
+            if was != (self.v.is_some(), self.joined) {
                 self.sync_now(ui.ctx(), false);
             }
             ui.ctx().request_repaint();
@@ -688,10 +689,7 @@ impl App {
                 }
             }
             Job::Unlock => {
-                let mut s = crate::unlock(self.pw.as_bytes())?;
-                if let Some(t) = self.taken.take() {
-                    sync::taken(&mut s, t)?;
-                }
+                let s = crate::unlock(self.pw.as_bytes())?;
                 (self.v, self.pairing) = (Some(View::new(s)), None);
             }
             Job::Join => {
@@ -712,7 +710,8 @@ impl App {
                         Zeroizing::new(crate::B64.decode(l.as_bytes())?)
                     }
                 };
-                self.taken = Some(sync::take(&home(), &peer, &got)?);
+                sync::take(&home(), &peer, &got)?;
+                self.joined = true;
             }
         }
         (self.pw, self.pw2, self.pair_pw) = Default::default();
@@ -849,11 +848,8 @@ impl App {
     fn unlock(&mut self, ui: &mut Ui) {
         let key = std::fs::read(home().join("key")).unwrap_or_default();
         let yk = pasa::challenge(&key).is_some();
-        let title = if self.taken.is_some() {
-            "Joined: now its password"
-        } else {
-            "Unlock"
-        };
+        let title =
+            if self.joined { "Joined: now its password" } else { "Unlock" };
         card(ui, "A small password store", title, |ui| {
             let pw = field(ui, "Password", &mut self.pw, true);
             let enter = entered(ui, &pw);
@@ -1995,11 +1991,11 @@ impl App {
             let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));
             let (code, img, end, state) = Default::default();
             self.pairing = Some(Pairing { name, pw, code, img, end, state });
-            if !qr && let Err(e) = self.show_code(ui.ctx(), v) {
+            if !qr && let Err(e) = self.show_code(ui.ctx()) {
                 (self.pairing, v.note) = (None, format!("{e:#}"));
             }
         }
-        if let Err(e) = self.pairing(ui, v) {
+        if let Err(e) = self.pairing(ui) {
             (self.pairing, v.note) = (None, format!("{e:#}"));
         }
     }
@@ -2068,9 +2064,9 @@ impl App {
 
     /// The short code, from the network side, which takes what the
     /// pairing hands over (all of it sealed) and waits for its taker.
-    fn show_code(&mut self, ctx: &Context, v: &mut View) -> Result<()> {
+    fn show_code(&mut self, ctx: &Context) -> Result<()> {
         let p = self.pairing.as_mut().context("no pairing")?;
-        let got = sync::offer(&mut v.s, &p.name)?;
+        let got = sync::offer(&home(), &p.name)?;
         let mut c = crate::net(&["give"])?;
         let mut i = c.stdin.take().context("stdin")?;
         std::io::Write::write_all(&mut i, crate::B64.encode(&got).as_bytes())?;
@@ -2092,7 +2088,7 @@ impl App {
 
     /// The pairing: a QR code's password, then the code alone; or the
     /// short code; and how it is going.
-    fn pairing(&mut self, ui: &mut Ui, v: &mut View) -> Result<()> {
+    fn pairing(&mut self, ui: &mut Ui) -> Result<()> {
         let l = look(ui);
         let ctx = ui.ctx().clone();
         let Some(p) = &mut self.pairing else { return Ok(()) };
@@ -2135,7 +2131,7 @@ impl App {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         if show {
             let pw = p.pw.take().unwrap_or_default();
-            let got = sync::offer(&mut v.s, &p.name)?;
+            let got = sync::offer(&home(), &p.name)?;
             let qr = self.rt()?.block_on(sync::qr(&got, &pw))?;
             let p = self.pairing.as_mut().context("no pairing")?;
             (p.img, p.code) = (Some(qr_image(&ctx, &qr)?), qr);

@@ -21,11 +21,12 @@ pasa on Android: a thin Compose UI over the same Rust (`apasa-jni`).
   after each change, and when that connection comes back, and serves while
   it is on the screen. Devices, Add a device shows a QR code (its password
   first, never beside it) or a code to type; Join a store scans one and
-  then asks for its password.
+  then asks for its password, and syncs; the store's password opens it
+  after. Neither pairing nor syncing asks for that password or the key.
 - Unlike the desktop, the network side runs inside the app's process:
   Android gives an app no way to keep part of itself from the app's own
   files (the network process an isolated one could not open sockets), so
-  it could read `key` and `dev`, sealed, and the memory of an open store.
+  it could read `key`, sealed, and the memory of an open store.
 
 ```sh
 rustup target add aarch64-linux-android x86_64-linux-android

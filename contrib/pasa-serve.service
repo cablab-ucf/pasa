@@ -1,5 +1,5 @@
 # pasa serve, seeing only v/ (age files) and net/ (its endpoint key, the
-# pairings' transport keys, hand-overs): nothing that opens a version. Its
+# pairings' transport keys): nothing that opens a version. Its
 # network side confines itself to those two as well (Landlock). First:
 #   mkdir -p ~/.pasa/v ~/.pasa/net
 #   cp contrib/pasa-serve.service ~/.config/systemd/user/

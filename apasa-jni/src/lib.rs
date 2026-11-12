@@ -15,8 +15,6 @@ use std::sync::{LazyLock, Mutex};
 
 static STORES: LazyLock<Mutex<HashMap<jlong, Store>>> =
     LazyLock::new(Default::default);
-/// A pairing taken, in memory until the unlock that opens its keys.
-static PENDING: Mutex<Option<sync::Taken>> = Mutex::new(None);
 static RT: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("tokio"));
 
@@ -109,13 +107,8 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
     })
 }
 
-/// An opened store's handle: a joined pairing's hand-over key sealed into
-/// it, what peers handed over adopted.
-fn opened(mut st: Store) -> Result<jlong> {
-    if let Some(t) = PENDING.lock().unwrap().take() {
-        sync::taken(&mut st, t)?;
-    }
-    sync::adopt(&mut st)?;
+/// An opened store's handle.
+fn opened(st: Store) -> Result<jlong> {
     let h = jlong::from_be_bytes(pasa::rand());
     STORES.lock().unwrap().insert(h, st);
     Ok(h)
@@ -612,8 +605,9 @@ pub extern "system" fn Java_com_apasa_Native_forget<'l>(
     })
 }
 
-/// Let a device pair, called `name` here: its code. With `qr_pw` an
-/// offline QR code's text under that password; else a short code.
+/// Let a device pair, called `name` here: its code, carrying the key file as
+/// it is (the store stays as it is). With `qr_pw` an offline QR code's text
+/// under that password; else a short code.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     mut env: EnvUnowned<'l>,
@@ -625,9 +619,8 @@ pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     run(&mut env, |e| {
         let name = name.to_string();
         let pw = (!qr_pw.is_null()).then(|| qr_pw.to_string());
-        let mut stores = STORES.lock().unwrap();
-        let got = sync::offer(stores.get_mut(&h).context("locked")?, &name)?;
-        drop(stores);
+        let dir = STORES.lock().unwrap().get(&h).context("locked")?.dir.clone();
+        let got = sync::offer(&dir, &name)?;
         let code = match pw {
             Some(pw) => RT.block_on(sync::qr(&got, &pw))?,
             None => RT.block_on(sync::give(&got))?.0,
@@ -679,12 +672,9 @@ pub extern "system" fn Java_com_apasa_Native_join<'l>(
             true => RT.block_on(sync::unqr(&code, &pw))?,
             false => RT.block_on(sync::fetch(&code))?,
         };
-        let t = sync::take(dir, &name, &got)?;
-        // Into the open store at once, else at the unlock that follows.
-        match STORES.lock().unwrap().values_mut().next() {
-            Some(st) => sync::taken(st, t)?,
-            None => *PENDING.lock().unwrap() = Some(t),
-        }
+        // The key file and the store, as they are: the password opens
+        // them afterwards.
+        sync::take(dir, &name, &got)?;
         Ok(e.new_string(report(RT.block_on(sync::sync(dir, false))?))?)
     })
 }
