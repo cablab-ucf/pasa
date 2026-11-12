@@ -107,10 +107,17 @@ two devices changing an entry apart show up in `pasa ls` until an edit
 follows the winner. A file alone tells nothing: not its entry, not its
 history. Back up `~/.pasa` with anything.
 
-`git init ~/.pasa/v` and pasa commits each new version there, and pushes
-if a remote is set (`git push -u` once): a remote holds what `serve` does,
-ciphertext, and learns when you change things. A version deleted from
-`v/` is then named by `pasa ls` and restored by `git checkout .`.
+`git init --bare ~/.pasa/git` and pasa commits each new version of `v/`
+there, and pushes if a remote is set (`git --git-dir ~/.pasa/git remote
+add origin URL`, then `git ... push -u` once): a remote holds what `serve`
+does, ciphertext, and learns when you change things. The repository lies
+beside `v/`, never in it, since the network side may write in `v/`: no
+hook or config of its can run where the keys are. Hooks never run, and
+only versions are committed (a name of 32 hex digits, an age file), not
+whatever else lies in `v/`. One made in `v/` before (`v/.git`) moves
+there by itself, its hooks dropped and its config cut to its remotes and
+branches. A version deleted from `v/` is then named by `pasa ls` and
+restored by `git --git-dir ~/.pasa/git --work-tree ~/.pasa/v checkout .`.
 
 ## Keys
 
