@@ -21,6 +21,7 @@ cat > "$a/Info.plist" <<EOF
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$3</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSCameraUsageDescription</key><string>Scans the QR code another device shows to pair: the frames stay on this Mac, and nothing goes online.</string>
 </dict></plist>
 EOF
 ln -s pasa.app/Contents/MacOS/pasa "$2/pasa"

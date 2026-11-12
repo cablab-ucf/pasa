@@ -19,7 +19,9 @@
         buildFeatures = lib.optional gui "gui";
         doCheck = false;
         preBuild = "unset AWS_LC_SYS_USE_SYSTEM"; # aws-lc as Cargo.lock pins it, not nixpkgs' copy
-        nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optional (gui && linux) pkgs.copyDesktopItems;
+        nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optional linux pkgs.pkg-config
+          ++ lib.optional (gui && linux) pkgs.copyDesktopItems;
+        buildInputs = lib.optional linux pkgs.udev; # libudev: security keys over USB
         desktopItems = lib.optional (gui && linux) (pkgs.makeDesktopItem {
           name = "pasa"; desktopName = "pasa"; exec = "pasa gui"; categories = [ "Utility" "Security" ];
         });

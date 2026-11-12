@@ -789,6 +789,45 @@ pub fn fido(dir: &Path) -> Option<Fido> {
     (salt.len() == 32 && !keys.is_empty()).then_some(Fido { salt, keys })
 }
 
+/// `b` after its length (4 bytes, big-endian), onto `out`.
+pub fn frame(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend((b.len() as u32).to_be_bytes());
+    out.extend(b);
+}
+
+/// The next of what [`frame`] framed, `b` moved past it.
+pub fn unframe<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let (n, rest) = b.split_first_chunk::<4>()?;
+    let (f, rest) = rest.split_at_checked(u32::from_be_bytes(*n) as usize)?;
+    *b = rest;
+    Some(f)
+}
+
+/// The file `ctap` in half the room, for a pairing: frames of its salt,
+/// then of each key's credential, PIN (a byte) and sealed key.
+pub fn ctap_packed(text: &str) -> Option<Vec<u8>> {
+    let mut l = text.lines();
+    let mut out = vec![];
+    frame(&mut out, &HEXLOWER.decode(l.next()?.as_bytes()).ok()?);
+    for (cred, pin, sealed) in l.filter_map(fido_line) {
+        for b in [&cred[..], &[pin as u8], &sealed] {
+            frame(&mut out, b);
+        }
+    }
+    Some(out)
+}
+
+/// The file `ctap` again, from what [`ctap_packed`] made.
+pub fn ctap_unpacked(mut b: &[u8]) -> Option<String> {
+    let mut out = HEXLOWER.encode(unframe(&mut b)?) + "\n";
+    while !b.is_empty() {
+        let (c, p, s) = (unframe(&mut b)?, unframe(&mut b)?, unframe(&mut b)?);
+        let (c, s) = (HEXLOWER.encode(c), HEXLOWER.encode(s));
+        out += &format!("{c} {} {s}\n", (p == [1]) as u8);
+    }
+    Some(out)
+}
+
 /// The security key with credential `cred` opens nothing here any more;
 /// `None`: none does.
 pub fn fido_off(dir: &Path, cred: Option<&[u8]>) -> Result<()> {

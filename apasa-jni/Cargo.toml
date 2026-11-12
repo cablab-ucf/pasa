@@ -1,6 +1,6 @@
 [package]
 name = "apasa-jni"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 jni = "0.22"
-pasa = { path = ".." }
+pasa = { path = "..", default-features = false, features = ["sync"] }
 # org.pushir.Native, for the shared push connection (android/pushir).
 pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "3e91f07d51eb6b08cd807640b4edc10cde16b716", features = ["jni"] }
 zeroize = "1"

@@ -5,10 +5,29 @@ use data_encoding::HEXLOWER;
 use pasa::{Secret, Store, challenge, field, home, rand};
 use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Mutex};
 use zeroize::Zeroizing;
+
+use authenticator::authenticatorservice::{
+    AuthenticatorService, RegisterArgs, SignArgs,
+};
+use authenticator::crypto::COSEAlgorithm;
+use authenticator::ctap2::attestation::AuthenticatorDataFlags;
+use authenticator::ctap2::server::{
+    AuthenticationExtensionsClientInputs, HMACGetSecretInput,
+    PublicKeyCredentialDescriptor, PublicKeyCredentialParameters,
+    PublicKeyCredentialUserEntity, RelyingParty, ResidentKeyRequirement,
+    Transport, UserVerificationRequirement,
+};
+use authenticator::statecallback::StateCallback;
+use authenticator::{Pin, StatusPinUv, StatusUpdate};
+use sha2::Digest;
 
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "scan")]
+mod scan;
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(any(feature = "tui", feature = "gui"))]
@@ -39,17 +58,19 @@ pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
 pasa ctap | ctap off         let the security key plugged in open the store here beside
                              the password, by CTAP2 (FIDO2 without the network: only
                              this machine and the key, over USB); again for a spare, at
-                             any time. off: none does. Needs libfido2's tools.
+                             any time. off: none does. Pairing brings them along
 pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
                              spare with the same secret, now or never: have both at hand
 pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
                              password still opens it alone, so make it long
 pasa keys                    the store keys: age -d takes them as passphrases
-pasa pair NAME [--qr]        hand the key file, as it is, to a new device called NAME
-                             here: a code to type, or a QR code (offline) after its
-                             password; serve until it has synced. No store password asked
-pasa join NAME CODE          take the code device NAME shows (a QR code: its password
-                             too), then sync. The store's password opens it afterwards
+pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys' too), to
+                             a new device called NAME here: a code to type, or a QR code
+                             (offline) after its password; serve until it has synced. No
+                             store password asked
+pasa join NAME CODE|--scan   take the code device NAME shows (a QR code: its password
+                             too; --scan: by the camera, with ffmpeg), then sync. The
+                             store's password opens it afterwards
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 
 fn ask(p: &str) -> Result<Secret> {
@@ -68,10 +89,19 @@ fn yubikey(c: &[u8]) -> Result<Secret> {
     let o = Command::new("ykman")
         .args(["otp", "calculate", "2", &HEXLOWER.encode(c)])
         .output()?;
+    // ykman reaches slot 2 through the key's keyboard side, which macOS
+    // opens only to apps given Input Monitoring.
+    let mac = match cfg!(target_os = "macos") {
+        true => {
+            "\nOn a Mac that needs Input Monitoring: add the YubiKey as \
+                 a security key instead (pasa ctap), which needs nothing."
+        }
+        false => "",
+    };
     ensure!(
         o.status.success(),
-        "ykman: {}",
-        String::from_utf8_lossy(&o.stderr)
+        "ykman: {}{mac}",
+        String::from_utf8_lossy(&o.stderr).trim()
     );
     Ok(Zeroizing::new(HEXLOWER.decode(o.stdout.trim_ascii())?))
 }
@@ -106,134 +136,244 @@ fn key_setup(secret: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// One of libfido2's tools (fido2-token, fido2-cred, fido2-assert) on
-/// `input`, its lines out. CTAP2 goes between this computer and the key
-/// alone: no server, no network. `pin`: given where the tool asks for
-/// it (a window has no terminal for it to ask on); `None`: it asks on
-/// the terminal itself.
-fn fido_tool(
-    tool: &str,
-    flags: &[&str],
-    dev: &str,
-    input: &str,
-    pin: Option<&[u8]>,
-) -> Result<Vec<String>> {
-    // The input holds nothing secret: random bytes, a name, the
-    // credential and the salt the `ctap` file has in the clear.
-    let at = home().join(format!(".ctap-{}", HEXLOWER.encode(&rand::<4>())));
-    pasa::write(&at, input.as_bytes())?;
-    // Away from the terminal, the tool reads the PIN where we write it.
-    let detach =
-        pin.is_some() && Command::new("setsid").arg("-V").output().is_ok();
-    let mut c = Command::new(if detach { "setsid" } else { tool });
-    c.args(detach.then_some(["-w", tool]).into_iter().flatten());
-    c.args(flags).arg("-i").arg(&at).arg(dev);
-    c.stdout(Stdio::piped()).stderr(Stdio::piped());
-    c.stdin(if pin.is_some() { Stdio::piped() } else { Stdio::inherit() });
-    let run = c.spawn().and_then(|mut c| {
-        if let (Some(pin), Some(mut i)) = (pin, c.stdin.take()) {
-            i.write_all(&[pin, b"\n"].concat())?;
-        }
-        c.wait_with_output()
-    });
-    let _ = std::fs::remove_file(&at);
-    let o = run.with_context(|| {
-        format!("{tool} (libfido2's tools) is needed for security keys")
-    })?;
-    let said = String::from_utf8_lossy(&o.stderr);
-    ensure!(o.status.success(), "{}", said.trim());
-    Ok(String::from_utf8(o.stdout)?.lines().map(Into::into).collect())
-}
-
-/// The security key plugged in (the first, of several), and whether it
-/// has a PIN.
-fn fido_key() -> Result<(String, bool)> {
-    let l = Command::new("fido2-token").arg("-L").output();
-    let l = l.context(
-        "fido2-token (libfido2's tools) is needed for security keys",
-    )?;
-    let l = String::from_utf8_lossy(&l.stdout).into_owned();
-    let dev = l.lines().next().and_then(|l| l.split_once(": "));
-    let dev = dev.context("no security key is plugged in")?.0.to_string();
-    let i = Command::new("fido2-token").args(["-I", &dev]).output()?;
-    let i = String::from_utf8_lossy(&i.stdout).into_owned();
-    let options = i.lines().find(|l| l.starts_with("options:"));
-    let pin =
-        options.is_some_and(|o| o.split([' ', ',']).any(|w| w == "clientPin"));
-    Ok((dev, pin))
-}
-
 const B64: data_encoding::Encoding = data_encoding::BASE64;
 
-/// The key's secret for credential `cred` and `salt` (hmac-secret): with
-/// its PIN if the credential was made with one, since the secret differs.
-fn fido_secret(
-    dev: &str,
-    cred: &[u8],
-    salt: &[u8],
-    pin: bool,
+/// What security keys are asked under: a name on the key, not an address.
+const RP: &str = "pasa";
+
+/// What `go` asks of a security key plugged in, by CTAP2 over USB from this
+/// process (Firefox's own, authenticator-rs): no tool to install, no
+/// server, no network, and nothing a system guards as a keyboard (macOS
+/// asks no Input Monitoring for it). `typed`: its PIN, from a window,
+/// tried once; `None`: asked here if the key wants one. `wait`: ms.
+fn ctap<T: Send + 'static>(
     typed: Option<&[u8]>,
-) -> Result<Secret> {
-    let input = format!(
-        "{}\npasa\n{}\n{}\n",
-        B64.encode(&rand::<32>()),
-        B64.encode(cred),
-        B64.encode(salt)
-    );
-    let args: &[&str] =
-        if pin { &["-G", "-h", "-t", "pin=true"] } else { &["-G", "-h"] };
-    eprintln!("Touch your security key");
-    let out =
-        fido_tool("fido2-assert", args, dev, &input, typed.filter(|_| pin))?;
-    let secret = out.get(4).context("the key gave no secret")?;
-    let secret = Zeroizing::new(B64.decode(secret.as_bytes())?);
-    ensure!(secret.len() == 32, "the key gave no secret");
-    Ok(secret)
+    wait: u64,
+    go: impl FnOnce(
+        &mut AuthenticatorService,
+        u64,
+        Sender<StatusUpdate>,
+        StateCallback<authenticator::Result<T>>,
+    ) -> authenticator::Result<()>,
+) -> Result<T> {
+    let mut m = AuthenticatorService::new()?;
+    m.add_u2f_usb_hid_platform_transports();
+    let (status, said) = channel();
+    let text =
+        |p: &[u8]| Zeroizing::new(String::from_utf8_lossy(p).into_owned());
+    let typed = typed.map(text);
+    let why = Arc::new(Mutex::new(None));
+    let told = why.clone();
+    std::thread::spawn(move || {
+        for s in said {
+            let tell = |w: &'static str| {
+                *told.lock().unwrap_or_else(|p| p.into_inner()) = Some(w);
+            };
+            let (to, wrong) = match s {
+                StatusUpdate::PresenceRequired => {
+                    eprintln!("Touch your security key");
+                    continue;
+                }
+                StatusUpdate::PinUvError(StatusPinUv::PinRequired(to)) => {
+                    (to, false)
+                }
+                StatusUpdate::PinUvError(StatusPinUv::InvalidPin(to, _)) => {
+                    (to, true)
+                }
+                StatusUpdate::PinUvError(StatusPinUv::PinBlocked)
+                | StatusUpdate::PinUvError(StatusPinUv::PinAuthBlocked) => {
+                    tell(
+                        "its PIN is blocked after wrong tries: use the password",
+                    );
+                    continue;
+                }
+                _ => continue,
+            };
+            // Unanswered, `to` goes: the key is asked nothing more.
+            let pin = match &typed {
+                Some(p) if !wrong && !p.is_empty() => Some(p.clone()),
+                Some(_) => {
+                    tell(match wrong {
+                        true => "wrong PIN",
+                        false => "this key has a PIN: type it, then try again",
+                    });
+                    None
+                }
+                None => {
+                    let q =
+                        if wrong { "Wrong PIN; again: " } else { "Its PIN: " };
+                    ask(q).ok().filter(|p| !p.is_empty()).map(|p| text(&p))
+                }
+            };
+            if let Some(p) = pin {
+                let _ = to.send(Pin::new(&p));
+            }
+        }
+    });
+    let (tx, rx) = channel();
+    let done = StateCallback::new(Box::new(move |r| {
+        let _ = tx.send(r);
+    }));
+    go(&mut m, wait, status, done)?;
+    let got = rx.recv()?;
+    let why = *why.lock().unwrap_or_else(|p| p.into_inner());
+    got.map_err(|e| {
+        anyhow::anyhow!(
+            "the security key: {}",
+            why.map_or(e.to_string(), String::from)
+        )
+    })
 }
 
-/// Whether the key holds `cred`, asked without a touch.
-fn fido_holds(dev: &str, cred: &[u8]) -> bool {
-    let input =
-        format!("{}\npasa\n{}\n", B64.encode(&rand::<32>()), B64.encode(cred));
-    fido_tool("fido2-assert", &["-G", "-t", "up=false"], dev, &input, None)
-        .is_ok()
+/// `salt` as WebAuthn's PRF hands it to a key: SHA-256("WebAuthn PRF", 0,
+/// salt). The phone's way (Yubico's kit), and this one's since.
+fn prf(salt: &[u8]) -> [u8; 32] {
+    let h =
+        sha2::Sha256::new().chain_update(b"WebAuthn PRF\0").chain_update(salt);
+    h.finalize().into()
+}
+
+/// The secrets of the security key plugged in, if it holds one of `keys`
+/// (credential, whether its PIN goes with it), for `salt`: which, and its
+/// secret for the salt as WebAuthn's PRF asks it, then as it is (keys
+/// added on a computer before). One touch.
+fn fido_secret(
+    keys: &[(Vec<u8>, bool)],
+    salt: &[u8],
+    typed: Option<&[u8]>,
+) -> Result<(Vec<u8>, [Secret; 2])> {
+    let raw: [u8; 32] = salt.try_into()?;
+    // With its PIN if it has one (as the phone asks), when any was
+    // added so.
+    let uv = match keys.iter().any(|k| k.1) {
+        true => UserVerificationRequirement::Preferred,
+        false => UserVerificationRequirement::Discouraged,
+    };
+    let got = ctap(typed, 30_000, |m, t, status, done| {
+        let ask = SignArgs {
+            client_data_hash: rand::<32>(),
+            origin: RP.into(),
+            relying_party_id: RP.into(),
+            allow_list: allow(keys),
+            user_verification_req: uv,
+            user_presence_req: true,
+            extensions: AuthenticationExtensionsClientInputs {
+                hmac_get_secret: Some(HMACGetSecretInput {
+                    salt1: prf(salt),
+                    salt2: Some(raw),
+                }),
+                ..Default::default()
+            },
+            pin: None,
+            use_ctap1_fallback: false,
+        };
+        m.sign(t, ask, status, done)
+    })?;
+    let out =
+        got.extensions.hmac_get_secret.context("the key gave no secret")?;
+    let two = out.output2.context("the key gave one secret of two")?;
+    // CTAP 2.0 keys may leave out which, asked with one.
+    let one = keys.first().filter(|_| keys.len() == 1).map(|k| k.0.clone());
+    let cred = got.assertion.credentials.map(|c| c.id).or(one);
+    let cred = cred.context("the key did not say which of its keys it is")?;
+    Ok((
+        cred,
+        [Zeroizing::new(out.output1.to_vec()), Zeroizing::new(two.to_vec())],
+    ))
+}
+
+fn allow(keys: &[(Vec<u8>, bool)]) -> Vec<PublicKeyCredentialDescriptor> {
+    let usb = || vec![Transport::USB];
+    keys.iter()
+        .map(|k| PublicKeyCredentialDescriptor {
+            id: k.0.clone(),
+            transports: usb(),
+        })
+        .collect()
+}
+
+/// Whether a security key plugged in holds one of `keys`: asked without a
+/// touch or a PIN, a moment's wait.
+fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
+    let probe = |m: &mut AuthenticatorService, t, status, done| {
+        let ask = SignArgs {
+            client_data_hash: rand::<32>(),
+            origin: RP.into(),
+            relying_party_id: RP.into(),
+            allow_list: allow(keys),
+            user_verification_req: UserVerificationRequirement::Discouraged,
+            user_presence_req: false,
+            extensions: Default::default(),
+            pin: None,
+            use_ctap1_fallback: false,
+        };
+        m.sign(t, ask, status, done)
+    };
+    ctap(Some(b""), 1500, probe).is_ok()
 }
 
 /// Let the security key plugged in open the store on this device: a new
 /// credential on it (not one of those a key has room for only a few
-/// of), and the key the password opens sealed to its secret. `typed`:
-/// its PIN, from a window.
+/// of), with its PIN if it has one, and the key the password opens sealed
+/// to its secret. `typed`: its PIN, from a window.
 pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
-    let (dev, pin) = fido_key()?;
-    let input = format!(
-        "{}\npasa\npasa\n{}\n",
-        B64.encode(&rand::<32>()),
-        B64.encode(&rand::<16>())
-    );
-    eprintln!("Touch your security key");
-    let out = fido_tool(
-        "fido2-cred",
-        &["-M", "-h"],
-        &dev,
-        &input,
-        typed.filter(|_| pin),
-    )?;
-    let cred = out.get(4).context("the key made no credential")?;
-    let cred = B64.decode(cred.as_bytes())?;
+    let made = ctap(typed, 30_000, |m, t, status, done| {
+        let ask = RegisterArgs {
+            client_data_hash: rand::<32>(),
+            relying_party: RelyingParty {
+                id: RP.into(),
+                name: Some(RP.into()),
+            },
+            origin: RP.into(),
+            user: PublicKeyCredentialUserEntity {
+                id: rand::<16>().to_vec(),
+                name: Some(RP.into()),
+                display_name: Some(RP.into()),
+            },
+            pub_cred_params: vec![PublicKeyCredentialParameters {
+                alg: COSEAlgorithm::ES256,
+            }],
+            exclude_list: vec![],
+            user_verification_req: UserVerificationRequirement::Preferred,
+            resident_key_req: ResidentKeyRequirement::Discouraged,
+            extensions: AuthenticationExtensionsClientInputs {
+                hmac_create_secret: Some(true),
+                ..Default::default()
+            },
+            pin: None,
+            use_ctap1_fallback: false,
+        };
+        m.register(t, ask, status, done)
+    })?;
+    let a = made.att_obj.auth_data;
+    let pin = a.flags.contains(AuthenticatorDataFlags::USER_VERIFIED);
+    let cred = a.credential_data.context("the key made no credential")?;
+    let cred = cred.credential_id;
     let salt = s.fido_salt();
-    s.fido_add(&salt, &cred, pin, &fido_secret(&dev, &cred, &salt, pin, typed)?)
+    let (_, [secret, _]) = fido_secret(&[(cred.clone(), pin)], &salt, typed)?;
+    s.fido_add(&salt, &cred, pin, &secret)
 }
 
-/// Open by the security key plugged in, if it is one of this store's.
+/// Open by the security key plugged in, if it is one of this store's:
+/// added here or where the store was paired from.
 pub(crate) fn unlock_fido(typed: Option<&[u8]>) -> Result<Store> {
     let f = pasa::fido(&home()).context("no security key opens this store")?;
-    let (dev, _) = fido_key()?;
-    let one = f.keys.len() == 1;
-    let key = f.keys.iter().find(|k| one || fido_holds(&dev, &k.0));
-    let (cred, pin) =
-        key.context("this security key is not one of this store's")?;
-    let secret = fido_secret(&dev, cred, &f.salt, *pin, typed)?;
-    Store::open_fido(&home(), cred, &secret)
+    let (cred, secrets) = fido_secret(&f.keys, &f.salt, typed)?;
+    let k = f.keys.iter().find(|k| k.0 == cred);
+    let pin = k.context("this security key is not one of this store's")?.1;
+    for s in &secrets {
+        if let Ok(s) = Store::open_fido(&home(), &cred, s) {
+            return Ok(s);
+        }
+    }
+    // Added with its PIN and asked without (or the other way), its secret
+    // is another.
+    ensure!(
+        pin == f.keys.iter().any(|k| k.1),
+        "this key's PIN was set or removed since it was added: use the \
+         password, then add the key again"
+    );
+    bail!("this security key does not open the store")
 }
 
 /// A new password and, with `yk`, a challenge and the YubiKey's response.
@@ -246,7 +386,7 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 /// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
     // A security key of this store's, plugged in: it opens it.
-    if pasa::fido(&home()).is_some() && fido_key().is_ok() {
+    if pasa::fido(&home()).is_some_and(|f| fido_here(&f.keys)) {
         match unlock_fido(None) {
             Ok(s) => return Ok(s),
             Err(e) => eprintln!("{e:#}"),
@@ -889,6 +1029,16 @@ async fn sync(a: &[&str]) -> Result<()> {
             serve_until(name)?;
         }
         ["join", name, code] => {
+            // --scan: the QR code the other device shows, by the camera.
+            let scanned = match *code {
+                #[cfg(feature = "scan")]
+                "--scan" => {
+                    eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
+                    crate::scan::scan()?
+                }
+                c => c.to_string(),
+            };
+            let code = scanned.trim();
             let got = match code.starts_with("PAIRIR1:") {
                 true => {
                     let pw = ask("QR code password: ")?;
@@ -923,4 +1073,18 @@ async fn sync(a: &[&str]) -> Result<()> {
         _ => bail!("{USAGE}"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The salt a key is asked with is WebAuthn's PRF form, as the phone
+    /// (Yubico's kit) asks it: a key added there opens the store here.
+    #[test]
+    fn salts_go_to_keys_as_webauthn_prf_hands_them() {
+        let salt: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            data_encoding::HEXLOWER.encode(&super::prf(&salt)),
+            "dc1f4f3b3d759586245d5de7e2e115d2a056a2df27109db7cef9b4b3a89bb106"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "kdbx2pasa"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "KeePass to pasa and back: kdbx2pasa | pasa load; pasa dump | pasa2kdbx"

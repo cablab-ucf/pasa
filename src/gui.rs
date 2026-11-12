@@ -6,10 +6,10 @@
 use crate::view::View;
 use anyhow::{Context as _, Result};
 use eframe::egui::{
-    self, Align, Align2, Area, Button, CentralPanel, Color32, ComboBox,
-    Context, FontId, Frame, Grid, Id, Key, Layout, Margin, Modal, Panel,
-    Response, RichText, ScrollArea, Sense, Slider, Stroke, TextEdit, TextStyle,
-    Theme, ThemePreference, Ui, Visuals, pos2, vec2,
+    self, Align, Align2, Area, Button, CentralPanel, Color32, ColorImage,
+    ComboBox, Context, FontId, Frame, Grid, Id, Key, Layout, Margin, Modal,
+    Panel, Response, RichText, ScrollArea, Sense, Slider, Stroke, TextEdit,
+    TextStyle, Theme, ThemePreference, Ui, Visuals, pos2, vec2,
 };
 use pasa::{Form, Store, home, sync};
 use std::collections::{BTreeSet, HashMap};
@@ -325,6 +325,53 @@ struct Pairing {
     state: String,
 }
 
+/// The camera looking for a QR code, beside the window: the frame it last
+/// saw, and what it found or why it stopped.
+struct Scanning {
+    frame: Arc<Mutex<Option<Vec<u8>>>>,
+    found: Arc<Mutex<Option<Result<String, String>>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    img: Option<egui::TextureHandle>,
+}
+
+impl Scanning {
+    fn start(ctx: &Context) -> Scanning {
+        let s = Scanning {
+            frame: Default::default(),
+            found: Default::default(),
+            stop: Default::default(),
+            img: None,
+        };
+        let (frame, found, stop) =
+            (s.frame.clone(), s.found.clone(), s.stop.clone());
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let go = || -> Result<String> {
+                let mut c = crate::scan::Camera::open()?;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let f = c.frame()?;
+                    if let Some(t) = crate::scan::read(&f) {
+                        return Ok(t);
+                    }
+                    *frame.lock().unwrap_or_else(|p| p.into_inner()) = Some(f);
+                    ctx.request_repaint();
+                }
+                anyhow::bail!("stopped")
+            };
+            let r = go().map_err(|e| format!("{e:#}"));
+            *found.lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
+            ctx.request_repaint();
+        });
+        s
+    }
+}
+
+impl Drop for Scanning {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// `text` as a QR code, a module a pixel, with its quiet zone.
 fn qr_image(ctx: &Context, text: &str) -> Result<egui::TextureHandle> {
     let c = qrcode::QrCode::new(text)?;
@@ -389,6 +436,8 @@ struct App {
     generator: Generator,
     device: String,
     pairing: Option<Pairing>,
+    /// The camera, while it looks for a QR code.
+    scanning: Option<Scanning>,
     /// What syncs said, beside the window, until shown.
     synced: Arc<Mutex<Option<String>>>,
     /// Whether this window serves (from the first pairing on).
@@ -827,6 +876,7 @@ impl App {
             ui.label(RichText::new(how).small().color(l.muted));
             field(ui, "A name for that device", &mut self.peer, false);
             let mut pw = field(ui, "Code", &mut self.code, false);
+            self.scan(ui);
             // A QR code's text asks for its password; a typed code has none.
             if self.code.trim().starts_with("PAIRIR1:") {
                 pw = field(
@@ -848,6 +898,52 @@ impl App {
         });
         if corner(ui, "No store yet?", "Create one") {
             (self.joining, self.said) = (false, String::new());
+        }
+    }
+
+    /// Scan the other device's QR code with the camera, offline: its
+    /// text goes in the Code field, and its password is asked for.
+    fn scan(&mut self, ui: &mut Ui) {
+        let l = look(ui);
+        let Some(s) = &mut self.scanning else {
+            let tip = "The camera reads the code the other device shows: \
+                       nothing goes online, no frame is kept";
+            if ui.button("Scan with the camera").on_hover_text(tip).clicked() {
+                self.scanning = Some(Scanning::start(ui.ctx()));
+            }
+            return;
+        };
+        // Taken out of the lock first: the result outlives the guard.
+        let r = s.found.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(r) = r {
+            match r {
+                Ok(t) => (self.code, self.said) = (t, String::new()),
+                Err(e) if e == "stopped" => {}
+                Err(e) => self.said = e,
+            }
+            self.scanning = None;
+            return;
+        }
+        if let Some(f) =
+            s.frame.lock().unwrap_or_else(|p| p.into_inner()).take()
+        {
+            let img =
+                ColorImage::from_gray([crate::scan::W, crate::scan::H], &f);
+            match &mut s.img {
+                Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                None => {
+                    let o = egui::TextureOptions::LINEAR;
+                    s.img = Some(ui.ctx().load_texture("camera", img, o));
+                }
+            }
+        }
+        let say = "Hold the other device's QR code to the camera";
+        ui.label(RichText::new(say).small().color(l.muted));
+        if let Some(t) = &s.img {
+            ui.image((t.id(), vec2(352.0, 198.0)));
+        }
+        if ui.button("Stop the camera").clicked() {
+            self.scanning = None;
         }
     }
 
@@ -889,15 +985,16 @@ impl App {
                     field(ui, "PIN", &mut self.pin, true);
                 }
                 ui.horizontal_wrapped(|ui| {
+                    if keys.is_some()
+                        && ui.button("Unlock with a security key").clicked()
+                    {
+                        let say = "Plug in your security key and touch it";
+                        self.begin(ui, Job::Fido, say);
+                    }
                     if quick.is_some()
                         && ui.button("Unlock with the YubiKey").clicked()
                     {
                         self.begin(ui, Job::Quick, "Touch your YubiKey");
-                    }
-                    if keys.is_some()
-                        && ui.button("Unlock with a security key").clicked()
-                    {
-                        self.begin(ui, Job::Fido, "Touch your security key");
                     }
                 });
             }
@@ -2220,11 +2317,12 @@ impl App {
             RichText::new("Security keys: CTAP2 (FIDO2 without the network)")
                 .strong(),
         );
-        let how = "A security key of any make opens the store on this machine, \
-                   beside the password. Only this machine and the key take \
-                   part, over USB: no server, no account, no network, so it \
-                   works offline. The key's secret never leaves it. Add a \
-                   spare at any time.";
+        let how = "A security key of any make (a YubiKey is one) opens the \
+                   store on this machine, beside the password, plugged in. \
+                   Only this machine and the key take part, over USB: no \
+                   server, no account, no network, nothing to install. The \
+                   key's secret never leaves it. Keys added on a phone come \
+                   along when it pairs this machine. Add a spare at any time.";
         ui.label(RichText::new(how).small().color(l.muted));
         let keys = pasa::fido(&home()).map_or(0, |f| f.keys.len());
         ui.horizontal(|ui| {
@@ -2250,7 +2348,14 @@ impl App {
         ui.separator();
         ui.label(RichText::new("Quick unlock").strong());
         let how = "A tap of your YubiKey and a PIN open the store on this \
-                   machine. The password still opens it alone: keep it long.";
+                   machine, by its slot 2 (ykman). The password still opens \
+                   it alone: keep it long.";
+        #[cfg(target_os = "macos")]
+        let how = format!(
+            "{how} On a Mac ykman reads slot 2 through the key's keyboard \
+             side, which macOS guards (Input Monitoring): add the YubiKey \
+             as a security key above instead, which asks for nothing."
+        );
         ui.label(RichText::new(how).small().color(l.muted));
         match pasa::quick(&home()) {
             Some((_, pin)) => {
