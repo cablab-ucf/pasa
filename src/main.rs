@@ -658,12 +658,13 @@ fn git_moved(dir: &Path) {
     let keep = keep.map(|o| o.stdout).unwrap_or_default();
     let kept = |k: &str| {
         let p: Vec<&str> = k.split('.').collect();
-        match p[..] {
-            ["remote", _, "url" | "pushurl" | "fetch"] => true,
-            ["branch", _, "remote" | "merge"] => true,
-            ["core", "repositoryformatversion"] | ["extensions", _] => true,
-            _ => false,
-        }
+        matches!(
+            p[..],
+            ["remote", _, "url" | "pushurl" | "fetch"]
+                | ["branch", _, "remote" | "merge"]
+                | ["core", "repositoryformatversion"]
+                | ["extensions", _]
+        )
     };
     if std::fs::rename(&old, &new).is_err() {
         return;
