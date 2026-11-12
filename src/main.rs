@@ -567,9 +567,16 @@ fn main() -> Result<()> {
                 .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
             h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
             h.expired.iter().for_each(|n| println!("expired {n}"));
-            for n in s.entries()?.into_keys().filter(|_| flag("--pwned")) {
+            // Passwords alone: not what is attached, nor an empty one.
+            let asked = |n: &String| {
+                flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
+            };
+            for n in s.entries()?.into_keys().filter(asked) {
                 let pw =
                     pasa::Form::parse(text(&s.get(&n)?).unwrap_or("")).pass;
+                if pw.is_empty() {
+                    continue;
+                }
                 match pwned(&pw)? {
                     0 => {}
                     times => println!("pwned   {n}: in breaches {times} times"),

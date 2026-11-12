@@ -14,7 +14,7 @@ use eframe::egui::{
 use pasa::{Form, Store, home, sync};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
 /// The colours both apps share.
@@ -343,7 +343,8 @@ fn qr_image(ctx: &Context, text: &str) -> Result<egui::TextureHandle> {
 struct App {
     v: Option<View>,
     prefs: Prefs,
-    used: Option<Instant>,
+    /// By the clock that runs while the machine sleeps.
+    used: Option<SystemTime>,
     // Before the store is open.
     pw: Zeroizing<String>,
     pw2: Zeroizing<String>,
@@ -460,6 +461,9 @@ fn field(
 
 /// `body` as `file` in the downloads folder, under a name not yet there.
 fn saved(file: &str, body: &[u8]) -> Result<String> {
+    // A name, never a path: an entry's name is whatever a device wrote.
+    let file = std::path::Path::new(file).file_name().context("no name")?;
+    let file = &*file.to_string_lossy();
     let dir =
         std::env::var_os("XDG_DOWNLOAD_DIR").map(std::path::PathBuf::from);
     let home = || std::env::home_dir().unwrap_or_default().join("Downloads");
@@ -599,10 +603,12 @@ impl eframe::App for App {
         }
         // Left alone: locked, the store and what was typed dropped.
         if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
-            self.used = Some(Instant::now());
+            self.used = Some(SystemTime::now());
         }
         let idle = Duration::from_secs(self.prefs.lock * 60);
-        if self.v.is_some() && self.used.is_some_and(|t| t.elapsed() > idle) {
+        // Asleep counts as left alone; so does a clock set back.
+        let left = |t: SystemTime| t.elapsed().map_or(true, |e| e > idle);
+        if self.v.is_some() && self.used.is_some_and(left) {
             self.lock();
         }
         ui.ctx().request_repaint_after(idle);
@@ -1575,15 +1581,16 @@ impl App {
             if let Some(found) =
                 &*self.breached.lock().unwrap_or_else(|p| p.into_inner())
             {
-                part(ui, format!("IN KNOWN BREACHES: {}", found.len()));
+                let hit = found.iter().filter(|f| f.1 > 0).count();
+                part(ui, format!("IN KNOWN BREACHES: {hit}"));
                 for (name, times) in found {
+                    let said = match times {
+                        0 => "could not be checked".into(),
+                        n => format!("seen {n} times"),
+                    };
                     ui.horizontal(|ui| {
                         ui.label(name);
-                        ui.label(
-                            RichText::new(format!("seen {times} times"))
-                                .small()
-                                .color(l.bad),
-                        );
+                        ui.label(RichText::new(said).small().color(l.bad));
                     });
                 }
             }
@@ -1615,11 +1622,14 @@ impl App {
                         .pass,
                     )
                 })
+                .filter(|p| !p.1.is_empty())
                 .collect();
             let (out, ctx) = (self.breached.clone(), ui.ctx().clone());
             std::thread::spawn(move || {
                 let hit = |(n, pw): &(String, String)| match crate::pwned(pw) {
-                    Ok(0) | Err(_) => None,
+                    Ok(0) => None,
+                    // Not asked is not clean: 0 says so.
+                    Err(_) => Some((n.clone(), 0)),
                     Ok(times) => Some((n.clone(), times)),
                 };
                 *out.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -1978,6 +1988,20 @@ impl App {
                             Ok(()) => format!("{}: forgotten", p.name),
                             Err(e) => format!("{e:#}"),
                         };
+                    }
+                    let lost = "Lost or stolen: forget it and make a new \
+                                store key; then pair the other devices again";
+                    if ui.small_button("Revoke").on_hover_text(lost).clicked() {
+                        v.note = match sync::revoke(&mut v.s, &p.name) {
+                            Ok(()) => format!(
+                                "{}: revoked. A new store key: pair the other \
+                                 devices again, and forget {} on each",
+                                p.name, p.name
+                            ),
+                            Err(e) => format!("{e:#}"),
+                        };
+                        crate::record();
+                        crate::aside(true);
                     }
                 });
             });

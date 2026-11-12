@@ -472,7 +472,15 @@ impl Store {
         let mut x = self.index.lock().unwrap_or_else(|p| p.into_inner());
         let v = self.dir.join("v");
         let mtime = fs::metadata(&v).and_then(|m| m.modified()).ok();
-        if x.mtime.is_some() && x.mtime == mtime {
+        // A listing made within the directory's own two seconds may be
+        // behind it (a sync writes beside us, in the same tick).
+        let settled = |m: &SystemTime| {
+            m.elapsed().is_ok_and(|e| e > std::time::Duration::from_secs(2))
+        };
+        if x.mtime.is_some()
+            && x.mtime == mtime
+            && mtime.as_ref().is_some_and(settled)
+        {
             return Ok(x);
         }
         let names = fs::read_dir(&v)
@@ -517,8 +525,9 @@ impl Store {
             .context("damaged version")?;
         let at =
             b.iter().position(|&c| c == b'\n').context("damaged version")? + 1;
-        ensure!(b.len() >= at + v.size, "damaged version");
-        Ok(Zeroizing::new(b[at..at + v.size].to_vec()))
+        // A size from another device: no sum that can overflow.
+        let body = b.get(at..).and_then(|b| b.get(..v.size));
+        Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
     }
 
     /// Each entry's newest version, deleted ones left out.
@@ -681,7 +690,7 @@ impl Store {
         let mut x = self.index()?;
         let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
         let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
-        let ms = now.max(x.last + 1);
+        let ms = now.max(x.last.saturating_add(1));
         self.keep(&mut x, name, body, ms, parent)
     }
 
@@ -1336,6 +1345,20 @@ mod tests {
         let pt = open(&s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
         assert_eq!(pt.len(), 256, "padded");
+    }
+
+    /// A version another device sealed with a size or a time at the end
+    /// of the range is damaged, not a crash; what follows it is written.
+    #[test]
+    fn sizes_and_times_from_elsewhere_overflow_nothing() {
+        let d = dir("overflow");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        let line = format!("{} - {} x\n", u64::MAX, usize::MAX);
+        let ct = seal(&s.keys()[0], line.as_bytes()).unwrap();
+        write(&d.join("v").join(name_of(&ct)), &ct).unwrap();
+        assert!(s.get("x").is_err(), "damaged");
+        s.put("y", b"after").unwrap();
+        assert_eq!(&s.get("y").unwrap()[..], b"after");
     }
 
     #[test]
