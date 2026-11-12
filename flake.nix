@@ -19,11 +19,13 @@
         buildFeatures = lib.optional gui "gui";
         doCheck = false;
         preBuild = "unset AWS_LC_SYS_USE_SYSTEM"; # aws-lc as Cargo.lock pins it, not nixpkgs' copy
+        # CMake builds AWS-LC (security keys' key agreement), not pasa.
         # Linux: pkg-config finds libudev (security keys); bindgen, with its
         # libclang, writes V4L2's bindings (the camera) at build time.
-        nativeBuildInputs = [ pkgs.makeWrapper ]
+        nativeBuildInputs = [ pkgs.makeWrapper pkgs.cmake ]
           ++ lib.optionals linux [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ]
           ++ lib.optional (gui && linux) pkgs.copyDesktopItems;
+        dontUseCmakeConfigure = true;
         # libudev: security keys over USB; pcsc-lite: keys on NFC readers.
         buildInputs = lib.optionals linux [ pkgs.udev pkgs.pcsclite ];
         desktopItems = lib.optional (gui && linux) (pkgs.makeDesktopItem {

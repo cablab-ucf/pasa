@@ -1416,6 +1416,68 @@ mod tests {
         fs::remove_dir_all(&d).unwrap();
     }
 
+    /// CTAP2's key agreement (PIN protocol 2), which carries a PIN and a
+    /// key's answer, runs on AWS-LC: what a key computes on its side, ours
+    /// computes too, and what each seals the other opens.
+    #[test]
+    fn key_agreement_with_a_key_holds_on_aws_lc() {
+        use authenticator::crypto::*;
+        use openssl::{bn::BigNumContext, derive::Deriver, ec, nid, pkey};
+        use openssl::{hash::MessageDigest, sign::Signer, symm};
+        let g =
+            ec::EcGroup::from_curve_name(nid::Nid::X9_62_PRIME256V1).unwrap();
+        let (k, mut ctx) =
+            (ec::EcKey::generate(&g).unwrap(), BigNumContext::new().unwrap());
+        let form = ec::PointConversionForm::UNCOMPRESSED;
+        let sec1 = k.public_key().to_bytes(&g, form, &mut ctx).unwrap();
+        let ours = COSEKey {
+            alg: COSEAlgorithm::ECDH_ES_HKDF256,
+            key: COSEKeyType::EC2(
+                COSEEC2Key::from_sec1_uncompressed(Curve::SECP256R1, &sec1)
+                    .unwrap(),
+            ),
+        };
+        let shared =
+            PinUvAuthProtocol::from_id(2).unwrap().encapsulate(&ours).unwrap();
+        let COSEKeyType::EC2(c) = &shared.client_input().key else { panic!() };
+        let point = [&[4][..], &c.x, &c.y].concat();
+        let point = ec::EcPoint::from_bytes(&g, &point, &mut ctx).unwrap();
+        let theirs = ec::EcKey::from_public_key(&g, &point).unwrap();
+        let (k, theirs) = (
+            pkey::PKey::from_ec_key(k).unwrap(),
+            pkey::PKey::from_ec_key(theirs).unwrap(),
+        );
+        let mut d = Deriver::new(&k).unwrap();
+        d.set_peer(&theirs).unwrap();
+        let z = d.derive_to_vec().unwrap();
+        let hmac = |key: &[u8], m: &[u8]| {
+            let key = pkey::PKey::hmac(key).unwrap();
+            let mut s = Signer::new(MessageDigest::sha256(), &key).unwrap();
+            s.update(m).unwrap();
+            s.sign_to_vec().unwrap()
+        };
+        let prk = hmac(&[0; 32], &z);
+        let (mac, aes) = (
+            hmac(&prk, b"CTAP2 HMAC key\x01"),
+            hmac(&prk, b"CTAP2 AES key\x01"),
+        );
+        assert_eq!(shared.authenticate(b"m").unwrap(), hmac(&mac, b"m"));
+        let cbc = |m, iv: &[u8], data: &[u8]| {
+            let aes256 = symm::Cipher::aes_256_cbc();
+            let mut c = symm::Crypter::new(aes256, m, &aes, Some(iv)).unwrap();
+            c.pad(false);
+            let mut out = vec![0; data.len() + 16];
+            let n = c.update(data, &mut out).unwrap();
+            out.truncate(n);
+            out
+        };
+        let ct = cbc(symm::Mode::Encrypt, &[7; 16], &[5; 32]);
+        let ct = [&[7; 16][..], &ct].concat();
+        assert_eq!(shared.decrypt(&ct).unwrap(), [5; 32]);
+        let back = shared.encrypt(&[9; 32]).unwrap();
+        assert_eq!(cbc(symm::Mode::Decrypt, &back[..16], &back[16..]), [9; 32]);
+    }
+
     /// The salt a key is asked with is WebAuthn's PRF form, as the phone
     /// (Yubico's kit) asks it: a key added there opens the store here.
     #[test]

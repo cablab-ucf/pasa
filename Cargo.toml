@@ -21,7 +21,7 @@ sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:q
 # A QR code by the camera, or in a picture (desktop; Android scans with ZXing).
 scan = ["sync", "dep:rqrr", "dep:rxing", "dep:nokhwa", "dep:image"]
 # Security keys by CTAP2 over USB, in-process (desktop; Android: Yubico's kit).
-fido = ["dep:authenticator", "dep:pcsc"]
+fido = ["dep:authenticator", "dep:openssl", "dep:pcsc"]
 tui = ["dep:crossterm"]
 gui = ["dep:eframe", "dep:winit", "scan", "fido"]
 
@@ -53,9 +53,13 @@ rxing = { version = "0.9", default-features = false, features = ["decoders", "qr
 # MJPEG decoder (C) left out: `image` (Rust) reads JPEG and PNG.
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"], optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"], optional = true }
-# CTAP2 to security keys over USB HID: Firefox's own, with RustCrypto. No
-# tool to install, no keyboard access (macOS asks no Input Monitoring).
-authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"], optional = true }
+# CTAP2 to security keys over USB HID: Firefox's own. No tool to install, no
+# keyboard access (macOS asks no Input Monitoring). Its key agreement and
+# ciphers by AWS-LC (built with CMake), the library under the network side's
+# TLS too, whose P-256 is constant time and formally verified; its RustCrypto
+# backend's (p256 0.13 < crypto-bigint 0.5) is not (RUSTSEC-2026-0387).
+authenticator = { version = "0.5", default-features = false, features = ["crypto_openssl"], optional = true }
+openssl = { version = "0.10", default-features = false, features = ["aws-lc"], optional = true }
 # Smart cards: a YubiKey held to an NFC reader (or its CCID side, plugged
 # in), through the system's PC/SC (pcsc-lite; macOS's own).
 pcsc = { version = "2.9", optional = true }
