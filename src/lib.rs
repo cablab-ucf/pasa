@@ -175,9 +175,9 @@ const RETIRED: &str = ".pasa/retired/";
 const HISTORY: &str = ".pasa/history";
 
 /// What a device on a retired key is told, and why it writes nothing.
-pub const RETIRED_SAY: &str = "this device's store key was retired on \
-    another device (a revocation): pair again from it; nothing more is \
-    written under the old key";
+pub const RETIRED_SAY: &str = "this device's store key was retired: if you \
+    revoked a device, pair this one again from where you did; if not, \
+    revoke here the device you suspect and pair the others from here";
 
 /// A store key's name in such word: 128 bits of its SHA-256.
 fn key_id(k: &[u8]) -> String {
@@ -1611,6 +1611,38 @@ mod tests {
         let mut sa = Store::open(&a, b"pw", None).unwrap();
         sa.rotate().unwrap();
         check(&sa, 3);
+    }
+
+    /// A bad device that revokes first only forks the store: the good one
+    /// keeps all it had, revokes it in turn, and writes again.
+    #[test]
+    fn a_bad_revocation_is_a_fork_the_good_devices_leave() {
+        let d = dir("fork");
+        let (a, b) = (d.join("a"), d.join("bad"));
+        let s = Store::create(&a, b"pw", None).unwrap();
+        s.put("x", b"1").unwrap();
+        drop(s);
+        let copy = |from: &Path, to: &Path| {
+            fs::create_dir_all(crate::versions(to)).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                let _ =
+                    fs::copy(e.path(), crate::versions(to).join(e.file_name()));
+            }
+        };
+        copy(&a, &b);
+        fs::copy(a.join("key"), b.join("key")).unwrap();
+        let mut sb = Store::open(&b, b"pw", None).unwrap();
+        sb.rotate().unwrap();
+        sb.put("x", b"bad").unwrap();
+        copy(&b, &a);
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        assert!(sa.retired() && sa.put("x", b"2").is_err());
+        assert_eq!(&sa.get("x").unwrap()[..], b"1");
+        sa.rotate().unwrap();
+        sa.put("x", b"2").unwrap();
+        assert!(!sa.retired());
+        assert_eq!(&sa.get("x").unwrap()[..], b"2");
+        assert_eq!(sa.history("x").unwrap().len(), 3, "1, sealed again, 2");
     }
 
     /// Two devices changed one entry apart: the newer wins, and is flagged
