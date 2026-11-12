@@ -1,21 +1,15 @@
-//! The network side runs as a process of its own that sees `store/v/` and `net/`
-//! alone: never a key file, never the rest of the computer. On Linux it
-//! confines itself by Landlock before it opens a socket; on macOS its
-//! parent starts it inside the system's sandbox (`sandbox-exec`). Its
-//! parent, which may hold the store open, opens no socket.
+//! The sync process sees only `store/v/` and `net/`. Its parent has no socket.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The certificates this environment names for TLS, wherever they are:
-/// public, and what the relay's TLS checks against.
+/// TLS roots named by the environment: public, so readable.
 fn certs() -> Vec<PathBuf> {
     let vars = ["SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE"];
     let set = vars.iter().filter_map(std::env::var_os);
     set.flat_map(|v| std::env::split_paths(&v).collect::<Vec<_>>()).collect()
 }
 
-/// The network side's command: `exe args`, to see `dir`'s `v/` and `net/`.
 pub fn command(dir: &Path, exe: &Path, args: &[&str]) -> Command {
     #[cfg(target_os = "macos")]
     if let Some(profile) = profile(dir, exe) {
@@ -30,9 +24,7 @@ pub fn command(dir: &Path, exe: &Path, args: &[&str]) -> Command {
     c
 }
 
-/// Confine this process, first thing, to `dir`'s `v/` and `net/` and the
-/// system files a connection reads (certificates, name resolution,
-/// libraries). Whether it is confined: false on a kernel without Landlock.
+/// Call before any socket. False on a kernel without Landlock.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn confine(dir: &Path) -> anyhow::Result<bool> {
     use landlock::{
@@ -63,14 +55,12 @@ pub fn confine(dir: &Path) -> anyhow::Result<bool> {
     Ok(s.ruleset != RulesetStatus::NotEnforced)
 }
 
-/// On macOS the parent's sandbox did it ([`command`]).
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn confine(_: &Path) -> anyhow::Result<bool> {
     Ok(std::env::var_os("PASA_SANDBOX").is_some())
 }
 
-/// No reading or writing where people keep files, but `v/`, `net/`, the
-/// program itself and the certificates named for TLS; the system as it is.
+/// Denies user file areas but `v/`, `net/`, the exe and certs; allows the rest.
 #[cfg(target_os = "macos")]
 fn profile(dir: &Path, exe: &Path) -> Option<String> {
     let at = |p: &Path| {
@@ -102,7 +92,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// Run in a child: what it may read and write.
+    /// Runs in the confined child: confinement cannot be undone.
     fn probe(dir: &Path) {
         assert!(confine(dir).unwrap(), "not confined");
         assert!(fs::read(crate::versions(dir).join("x")).is_ok(), "v/");
@@ -118,8 +108,6 @@ mod tests {
         }
     }
 
-    /// The network side's process reads `v/` and writes `net/`, and
-    /// reaches nothing else of the store's or the person's.
     #[test]
     fn the_network_side_sees_v_and_net_alone() {
         if let Some(d) = std::env::var_os("PASA_PROBE") {
