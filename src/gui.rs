@@ -1291,6 +1291,12 @@ impl App {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         for i in range {
                             let at = rows[i];
+                            // Deleted this frame (in the entry pane, drawn
+                            // first), or by a sync since: the list is
+                            // shorter; the next frame draws it anew.
+                            if at >= v.names.len() {
+                                continue;
+                            }
                             let m = self.meta(&v, at).clone();
                             let (rect, r) = ui.allocate_exact_size(
                                 vec2(width, 30.0),
@@ -1495,6 +1501,7 @@ impl App {
                             s.remove(name)?;
                             Ok(format!("{name}: deleted; its history stays"))
                         });
+                        ui.ctx().request_repaint();
                     }
                     self.armed ^= true;
                 }
