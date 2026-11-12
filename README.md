@@ -8,6 +8,7 @@ cargo install --locked --path .   # --no-default-features: no network at all
 pasa init -y                      # password + YubiKey (-y optional)
 pasa gen mail/work -c             # new password, to the clipboard
 pasa cp mail/work                 # clipboard, cleared after 45 s if unchanged
+pasa pick                         # choose with fzf, then as cp (pick user: that field)
 pasa mail/work otp                # a field: pass, user, otp, ...
 ```
 
@@ -220,15 +221,27 @@ had: change the passwords it held. `forget NAME` ends a pairing alone.
 
 ```sh
 kdbx2pasa A.kdbx [B.kdbx ...] [-k KEYFILE] | pasa load   # KeePass
+pasa dump | pasa2kdbx OUT.kdbx          # to KeePass, KeePassXC
 contrib/migrate.sh                      # pasa 0.1 (age 1.3+)
 ```
 
 `kdbx2pasa` brings every entry with its history, each version dated as
-KeePass dated it, its attachments and tags, and `.kdbx.json` (the first
-database, whole); what is in the recycle bin stays out. Several databases
+KeePass dated it, its attachments, tags and expiry, and `.kdbx.json` (the
+first database, whole); what is in the recycle bin stays out. Several databases
 are copies of one that went apart (sync conflicts): an entry is the same
 by its id in each, and its versions from all of them make one history by
 time, each once, the newest being the entry. `pasa load` keeps a tar
 member's date as its version's.
+
+`pasa2kdbx` writes each entry as it is now (not its history) to a new
+KDBX4 file, never over one that is there: groups by name; title, user,
+address, password, one-time code (`otp`, as KeePassXC keeps it), tags,
+expiry, every other field, notes, date, and its files as attachments.
+It is sealed under a password asked for there, by Argon2id (256 MiB, 4
+passes; KeePass's default is 1 MiB) and AES-256. Both ways the entries
+cross the pipe as text: run them on the machine itself.
+
+`pasa pick` gives fzf the names alone (no secret, no preview); it copies
+the chosen entry's field as `cp` does.
 
 License: GPL-3.0-or-later.

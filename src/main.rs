@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use anyhow::{Context, Result, bail, ensure};
 use data_encoding::HEXLOWER;
 use pasa::{Secret, Store, challenge, field, home, rand};
@@ -17,6 +19,7 @@ pasa [ls]                    names
 pasa tui | gui               browse, copy, edit: one unlock
 pasa [show] NAME [FIELD]     entry, or a field: pass, user, otp, ...
 pasa cp NAME [FIELD]         to the clipboard for 45 s
+pasa pick [FIELD]            choose the entry with fzf, then as cp
 pasa set NAME                from stdin (a terminal: the password)
 pasa edit NAME               in $EDITOR
 pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: copy)
@@ -281,6 +284,25 @@ fn quick_on(s: &Store, pin: &[u8]) -> Result<()> {
     s.quick_on(pin, &c, &yubikey(&c)?)
 }
 
+/// An entry chosen with fzf, which is given the names alone: no secret,
+/// no preview. It draws on the terminal and says which.
+fn pick(s: &Store) -> Result<String> {
+    let names = s.entries()?.into_keys();
+    let names = names.filter(|n| !n.split('/').any(|c| c.starts_with('.')));
+    let names: String = names.map(|n| n + "\n").collect();
+    let mut c = Command::new("fzf")
+        .args(["--no-multi", "--prompt", "pasa> "])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("fzf is needed for pick (or pasa tui)")?;
+    c.stdin.take().context("fzf")?.write_all(names.as_bytes())?;
+    let o = c.wait_with_output()?;
+    let n = String::from_utf8(o.stdout)?.trim_end_matches('\n').to_string();
+    ensure!(o.status.success() && !n.is_empty(), "nothing chosen");
+    Ok(n)
+}
+
 fn text(b: &[u8]) -> Result<&str> {
     std::str::from_utf8(b).context("not text")
 }
@@ -488,6 +510,13 @@ fn main() -> Result<()> {
                 &field(text(&open()?.get(n)?)?, f).context("no such field")?,
             );
         }
+        ["pick", ..] => {
+            let (s, f) = (open()?, a.get(1).unwrap_or(&"pass"));
+            let n = pick(&s)?;
+            return clip(
+                &field(text(&s.get(&n)?)?, f).context("no such field")?,
+            );
+        }
         ["set", n] => {
             let mut b = Zeroizing::new(vec![]);
             match std::io::stdin().is_terminal() {
@@ -619,6 +648,8 @@ fn main() -> Result<()> {
                 let mut h = tar::Header::new_gnu();
                 h.set_size(b.len() as u64);
                 h.set_mode(0o600);
+                // When it was written, as `load` reads it back.
+                h.set_mtime(v.ms / 1000);
                 t.append_data(&mut h, n, &b[..])?;
             }
             return Ok(t.finish()?);

@@ -933,7 +933,9 @@ impl App {
     fn store(&mut self, ui: &mut Ui, mut v: View) {
         let l = look(ui);
         let ctx = ui.ctx().clone();
-        if let Some(s) = self.synced.lock().unwrap().take() {
+        if let Some(s) =
+            self.synced.lock().unwrap_or_else(|p| p.into_inner()).take()
+        {
             v.note = s;
         }
         // The search looks through names, users, addresses and tags; View's
@@ -1570,7 +1572,9 @@ impl App {
             for name in &expired {
                 ui.label(name);
             }
-            if let Some(found) = &*self.breached.lock().unwrap() {
+            if let Some(found) =
+                &*self.breached.lock().unwrap_or_else(|p| p.into_inner())
+            {
                 part(ui, format!("IN KNOWN BREACHES: {}", found.len()));
                 for (name, times) in found {
                     ui.horizontal(|ui| {
@@ -1618,7 +1622,7 @@ impl App {
                     Ok(0) | Err(_) => None,
                     Ok(times) => Some((n.clone(), times)),
                 };
-                *out.lock().unwrap() =
+                *out.lock().unwrap_or_else(|p| p.into_inner()) =
                     Some(pws.iter().filter_map(hit).collect());
                 ctx.request_repaint();
             });
@@ -2022,7 +2026,7 @@ impl App {
                     .replace('\n', "   "),
                 Err(e) => e.to_string(),
             };
-            *out.lock().unwrap() = Some(said);
+            *out.lock().unwrap_or_else(|p| p.into_inner()) = Some(said);
             ctx.request_repaint();
         });
     }
@@ -2041,7 +2045,8 @@ impl App {
             let Ok(mut c) = crate::net(&["serve"]) else { return };
             for (who, r) in crate::results(&mut c) {
                 if let Ok(n @ 1..) = r {
-                    *out.lock().unwrap() = Some(format!("{who}: {n} new"));
+                    *out.lock().unwrap_or_else(|p| p.into_inner()) =
+                        Some(format!("{who}: {n} new"));
                 }
                 crate::report(&who, r);
                 ctx.request_repaint();
@@ -2078,7 +2083,7 @@ impl App {
         std::thread::spawn(move || {
             let said = l.next().unwrap_or_default();
             drop((i, c));
-            *end.lock().unwrap() = Some(said);
+            *end.lock().unwrap_or_else(|p| p.into_inner()) = Some(said);
             repaint.request_repaint();
         });
         p.state = "Waiting for it".into();
@@ -2116,7 +2121,7 @@ impl App {
                 Some(img) => drop(ui.image((img.id(), vec2(240.0, 240.0)))),
                 None => drop(ui.label(RichText::new(&p.code).monospace().size(17.0))),
             }
-            if let Some(end) = p.end.as_ref().and_then(|e| e.lock().unwrap().take()) {
+            if let Some(end) = p.end.as_ref().and_then(|e| e.lock().unwrap_or_else(|p| p.into_inner()).take()) {
                 p.state = match end.as_str() {
                     "taken" => format!("{} took it: it syncs now", p.name),
                     "spent" => format!(

@@ -10,6 +10,7 @@
 //!   YubiKey response). A pairing hands it over as it is, never opened.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use age::secrecy::SecretString;
 use anyhow::{Context, Result, bail, ensure};
@@ -35,6 +36,8 @@ const KDF: (u32, u32) = if cfg!(test) { (8, 1) } else { (256 << 10, 4) };
 
 pub fn rand<const N: usize>() -> [u8; N] {
     let mut b = [0; N];
+    // No randomness from the system: nothing here may go on without it.
+    #[allow(clippy::expect_used)]
     getrandom::fill(&mut b).expect("os randomness");
     b
 }
@@ -395,7 +398,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
             locked => locked?,
         }
-        let mut loaded = self.loaded.lock().unwrap();
+        let mut loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
         let now = fs::read(self.dir.join("key")).unwrap_or_default();
         ensure!(
             now == *loaded,
@@ -466,7 +469,7 @@ impl Store {
     /// `v/` as it is now: new files' heads read, gone ones dropped. Files
     /// no store key opens are counted in [`Store::unreadable`].
     fn index(&self) -> Result<std::sync::MutexGuard<'_, Index>> {
-        let mut x = self.index.lock().unwrap();
+        let mut x = self.index.lock().unwrap_or_else(|p| p.into_inner());
         let v = self.dir.join("v");
         let mtime = fs::metadata(&v).and_then(|m| m.modified()).ok();
         if x.mtime.is_some() && x.mtime == mtime {

@@ -1,6 +1,8 @@
 //! libapasa.so: pasa for com.apasa.Native (errors become RuntimeExceptions),
 //! and pushir's org.pushir.Native.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 extern crate pushir;
 
 use anyhow::Context;
@@ -15,8 +17,17 @@ use std::sync::{LazyLock, Mutex};
 
 static STORES: LazyLock<Mutex<HashMap<jlong, Store>>> =
     LazyLock::new(Default::default);
+// Without a runtime nothing here can sync: the panic is the app's
+// exception (`run`).
+#[allow(clippy::expect_used)]
 static RT: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("tokio"));
+
+/// The open stores; a panic elsewhere while they were held leaves them as
+/// they were, not unusable.
+fn stores() -> std::sync::MutexGuard<'static, HashMap<jlong, Store>> {
+    STORES.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Any error, as a Java exception's message.
 #[derive(Debug)]
@@ -57,7 +68,7 @@ fn bytes(e: &Env, j: &JByteArray) -> Result<Option<Vec<u8>>> {
 }
 
 fn with<T>(h: jlong, f: impl FnOnce(&Store) -> anyhow::Result<T>) -> Result<T> {
-    Ok(f(STORES.lock().unwrap().get(&h).context("locked")?)?)
+    Ok(f(stores().get(&h).context("locked")?)?)
 }
 
 fn report(r: Vec<(String, anyhow::Result<usize>)>) -> String {
@@ -110,7 +121,7 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
 /// An opened store's handle.
 fn opened(st: Store) -> Result<jlong> {
     let h = jlong::from_be_bytes(pasa::rand());
-    STORES.lock().unwrap().insert(h, st);
+    stores().insert(h, st);
     Ok(h)
 }
 
@@ -268,7 +279,7 @@ pub extern "system" fn Java_com_apasa_Native_close<'l>(
     _: JClass<'l>,
     h: jlong,
 ) {
-    STORES.lock().unwrap().remove(&h);
+    stores().remove(&h);
 }
 
 #[unsafe(no_mangle)]
@@ -619,7 +630,7 @@ pub extern "system" fn Java_com_apasa_Native_pair<'l>(
     run(&mut env, |e| {
         let name = name.to_string();
         let pw = (!qr_pw.is_null()).then(|| qr_pw.to_string());
-        let dir = STORES.lock().unwrap().get(&h).context("locked")?.dir.clone();
+        let dir = stores().get(&h).context("locked")?.dir.clone();
         let got = sync::offer(&dir, &name)?;
         let code = match pw {
             Some(pw) => RT.block_on(sync::qr(&got, &pw))?,

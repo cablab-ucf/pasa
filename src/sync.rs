@@ -502,7 +502,9 @@ mod tests {
     async fn pair_then_sync_then_unlock() {
         let d = crate::tests::dir("pairing");
         let (phone, desk) = (d.join("phone"), d.join("desk"));
-        let sp = Store::create(&phone, b"pw", None).unwrap();
+        // Long enough that no age header's base64 holds it by chance.
+        const PW: &[u8] = b"the store's own password";
+        let sp = Store::create(&phone, PW, None).unwrap();
         sp.put("mail/work", b"hunter2\nuser: me").unwrap();
         sp.put("bank", b"Tr0ub4dor&3").unwrap();
         let store_key = sp.keys()[0].clone();
@@ -510,7 +512,7 @@ mod tests {
         let file = fs::read(phone.join("key")).unwrap();
         let got = offer(&phone, "desk").unwrap();
         assert!(got.ends_with(&file), "the key file as it is");
-        for s in [&store_key[..], b"hunter2", b"pw\n"] {
+        for s in [&store_key[..], b"hunter2", PW] {
             assert!(!got.windows(s.len()).any(|w| w == s), "in the clear");
         }
         let qr = qr(&got, "ab").await.unwrap();
@@ -541,7 +543,7 @@ mod tests {
                 }
             }
         }
-        let sd = Store::open(&desk, b"pw", None).unwrap();
+        let sd = Store::open(&desk, PW, None).unwrap();
         assert_eq!(&sd.get("mail/work").unwrap()[..], b"hunter2\nuser: me");
     }
 
