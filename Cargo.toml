@@ -10,10 +10,12 @@ description = "A tiny password store: sealed versions, synced by union"
 members = ["kdbx2pasa", "apasa-jni"]
 
 [features]
-default = ["sync", "tui"]
+default = ["sync", "tui", "scan"]
 sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode", "dep:landlock"]
+# A QR code by the camera (desktop; Android scans with ZXing).
+scan = ["sync", "dep:rqrr", "dep:rxing"]
 tui = ["dep:crossterm"]
-gui = ["dep:eframe", "dep:winit", "sync"]
+gui = ["dep:eframe", "dep:winit", "scan"]
 
 [dependencies]
 anyhow = "1"
@@ -35,6 +37,10 @@ pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "6e7faa92e6732834
 iroh = { version = "1.4", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 qrcode = { version = "0.14", default-features = false, optional = true }
+# Read a pairing QR code in camera frames (pure Rust): each reads frames
+# the other misses.
+rqrr = { version = "0.11", optional = true }
+rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"], optional = true }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
 # The frame (close, minimise, maximise) that GNOME on Wayland leaves to the app.

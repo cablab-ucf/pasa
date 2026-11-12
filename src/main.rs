@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "scan")]
+mod scan;
 #[cfg(feature = "tui")]
 mod tui;
 #[cfg(any(feature = "tui", feature = "gui"))]
@@ -48,8 +50,9 @@ pasa keys                    the store keys: age -d takes them as passphrases
 pasa pair NAME [--qr]        hand the key file, as it is, to a new device called NAME
                              here: a code to type, or a QR code (offline) after its
                              password; serve until it has synced. No store password asked
-pasa join NAME CODE          take the code device NAME shows (a QR code: its password
-                             too), then sync. The store's password opens it afterwards
+pasa join NAME CODE|--scan   take the code device NAME shows (a QR code: its password
+                             too; --scan: by the camera, with ffmpeg), then sync. The
+                             store's password opens it afterwards
 pasa sync | serve | listen | peers | forget NAME | revoke NAME";
 
 fn ask(p: &str) -> Result<Secret> {
@@ -889,6 +892,16 @@ async fn sync(a: &[&str]) -> Result<()> {
             serve_until(name)?;
         }
         ["join", name, code] => {
+            // --scan: the QR code the other device shows, by the camera.
+            let scanned = match *code {
+                #[cfg(feature = "scan")]
+                "--scan" => {
+                    eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
+                    crate::scan::scan()?
+                }
+                c => c.to_string(),
+            };
+            let code = scanned.trim();
             let got = match code.starts_with("PAIRIR1:") {
                 true => {
                     let pw = ask("QR code password: ")?;
