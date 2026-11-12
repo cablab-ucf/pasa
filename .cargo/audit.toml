@@ -1,0 +1,10 @@
+# cargo audit (CI).
+[advisories]
+ignore = [
+  # crypto-bigint 0.5 (elliptic-curve 0.13 < p256 0.13 < authenticator-rs
+  # 0.5): branches on secrets in subtraction, division, Montgomery
+  # multiplication. Here they would touch the ECDH key made for one
+  # security-key touch (CTAP2's key agreement), used once and dropped; no
+  # 0.5 is fixed. Remove when authenticator-rs moves to p256 0.14.
+  "RUSTSEC-2026-0387",
+]
