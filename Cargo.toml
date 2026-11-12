@@ -6,16 +6,24 @@ license = "GPL-3.0-or-later"
 rust-version = "1.97"
 description = "A tiny password store: sealed versions, synced by union"
 
+# The program needs its features; the library (Android's) does not.
+[[bin]]
+name = "pasa"
+path = "src/main.rs"
+required-features = ["fido"]
+
 [workspace]
 members = ["kdbx2pasa", "apasa-jni"]
 
 [features]
-default = ["sync", "tui", "scan"]
+default = ["sync", "tui", "scan", "fido"]
 sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:qrcode", "dep:landlock"]
 # A QR code by the camera (desktop; Android scans with ZXing).
 scan = ["sync", "dep:rqrr", "dep:rxing"]
+# Security keys by CTAP2 over USB, in-process (desktop; Android: Yubico's kit).
+fido = ["dep:authenticator"]
 tui = ["dep:crossterm"]
-gui = ["dep:eframe", "dep:winit", "scan"]
+gui = ["dep:eframe", "dep:winit", "scan", "fido"]
 
 [dependencies]
 anyhow = "1"
@@ -41,6 +49,9 @@ qrcode = { version = "0.14", default-features = false, optional = true }
 # the other misses.
 rqrr = { version = "0.11", optional = true }
 rxing = { version = "0.9", default-features = false, features = ["decoders", "qrcode", "encoding_rs"], optional = true }
+# CTAP2 to security keys over USB HID: Firefox's own, with RustCrypto. No
+# tool to install, no keyboard access (macOS asks no Input Monitoring).
+authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"], optional = true }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
 # The frame (close, minimise, maximise) that GNOME on Wayland leaves to the app.

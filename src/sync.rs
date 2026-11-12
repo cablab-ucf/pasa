@@ -393,28 +393,71 @@ pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
 /// is kept here; the other device dials here once it has [`take`]n it.
 pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
     let f = fs::read(dir.join("key")).context("no store here")?;
+    let quick = fs::read(dir.join("quick")).unwrap_or_default();
+    let ctap = fs::read_to_string(dir.join("ctap")).ok();
+    let ctap = ctap.and_then(|t| crate::ctap_packed(&t)).unwrap_or_default();
     let (psk, id) = (rand::<32>(), key(dir, "node")?.public());
     add(dir, Peer { name: name.into(), psk, id: None, lane: None })?;
-    Ok(Zeroizing::new([id.as_bytes(), &psk[..], &f].concat()))
+    let n = 64 + KEYS.len() + 12 + f.len() + quick.len() + ctap.len();
+    let mut out = Zeroizing::new(Vec::with_capacity(n));
+    out.extend_from_slice(id.as_bytes());
+    out.extend_from_slice(&psk);
+    // The key file alone, as before, unless hardware keys open it too.
+    match quick.is_empty() && ctap.is_empty() {
+        true => out.extend(&f),
+        false => {
+            out.extend(KEYS);
+            for b in [&f, &quick, &ctap] {
+                crate::frame(&mut out, b);
+            }
+        }
+    }
+    Ok(out)
 }
 
+/// Before the key files framed, in what [`offer`] makes; else the key file
+/// alone follows.
+const KEYS: &[u8] = b"pasakeys";
+
 /// Take what [`offer`] made, as a code brought it, calling that device
-/// `name`: it is a peer at once, to sync with, and its key file is this
-/// device's (one that differed kept as `key.old`). Nothing is unlocked:
-/// the password opens it afterwards, here alone.
+/// `name`: it is a peer at once, to sync with, and its key files are this
+/// device's: `key` (one that differed kept as `key.old`), and `quick` and
+/// `ctap` if they came (else, beside a new key file, gone: they open the
+/// old one alone). Nothing is unlocked: the password or hardware key
+/// opens it afterwards, here alone.
 pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     named(name)?;
     let bad = || anyhow!("not a pasa pairing");
     let (id, rest) = got.split_at_checked(32).ok_or_else(bad)?;
-    let (psk, f) = rest.split_at_checked(32).ok_or_else(bad)?;
+    let (psk, mut f) = rest.split_at_checked(32).ok_or_else(bad)?;
+    let (mut quick, mut ctap) = (&[][..], String::new());
+    if let Some(mut b) = f.strip_prefix(KEYS) {
+        let mut next = || crate::unframe(&mut b).ok_or_else(bad);
+        (f, quick) = (next()?, next()?);
+        let packed = next()?;
+        if !packed.is_empty() {
+            ctap = crate::ctap_unpacked(packed).ok_or_else(bad)?;
+        }
+    }
     ensure!(!f.is_empty(), "not a pasa pairing");
     let id = Some(PublicKey::from_bytes(id.try_into()?)?);
     let at = dir.join("key");
-    match fs::read(&at) {
-        Ok(old) if old != f => write(&dir.join("key.old"), &old)?,
-        _ => {}
-    }
+    let new = match fs::read(&at) {
+        Ok(old) if old != f => {
+            write(&dir.join("key.old"), &old).map(|_| true)?
+        }
+        old => old.is_err(),
+    };
     write(&at, f)?;
+    for (n, b) in [("quick", quick), ("ctap", ctap.as_bytes())] {
+        match b.is_empty() {
+            false => write(&dir.join(n), b)?,
+            true if new => {
+                let _ = fs::remove_file(dir.join(n));
+            }
+            true => {}
+        }
+    }
     add(dir, Peer { name: name.into(), psk: psk.try_into()?, id, lane: None })
 }
 
@@ -547,6 +590,57 @@ mod tests {
         }
         let sd = Store::open(&desk, PW, None).unwrap();
         assert_eq!(&sd.get("mail/work").unwrap()[..], b"hunter2\nuser: me");
+    }
+
+    /// Pairing brings the hardware keys' files too, as they are: the
+    /// YubiKey with its PIN and each security key open the store there as
+    /// here. A device's files for another store's key go; an older
+    /// pairing (the key file alone) is still taken.
+    #[tokio::test]
+    async fn pairing_brings_the_hardware_keys() {
+        let d = crate::tests::dir("pairing-keys");
+        let (phone, desk) = (d.join("phone"), d.join("desk"));
+        let s = Store::create(&phone, b"pw", None).unwrap();
+        s.put("a", b"1").unwrap();
+        let (c, yk) = ([7; 32], [9; 20]);
+        s.quick_on(b"2468", &c, &yk).unwrap();
+        let salt = s.fido_salt();
+        let (one, two) = ([1; 32], [2; 32]);
+        s.fido_add(&salt, &[3; 64], true, &one).unwrap();
+        s.fido_add(&salt, &[4; 64], false, &two).unwrap();
+        drop(s);
+        let other = Store::create(&desk, b"old", None).unwrap();
+        other.quick_on(b"", &c, &yk).unwrap();
+        let old = fs::read(desk.join("key")).unwrap();
+        drop(other);
+        let got = offer(&phone, "desk").unwrap();
+        let text = fs::read_to_string(phone.join("ctap")).unwrap();
+        let packed = crate::ctap_packed(&text).unwrap();
+        assert!(packed.len() < text.len() * 6 / 10, "ctap packed");
+        let got = unqr(&qr(&got, "ab").await.unwrap(), "ab").await.unwrap();
+        take(&desk, "phone", &got).unwrap();
+        for f in ["key", "quick", "ctap"] {
+            assert_eq!(
+                fs::read(desk.join(f)).unwrap(),
+                fs::read(phone.join(f)).unwrap()
+            );
+        }
+        assert_eq!(fs::read(desk.join("key.old")).unwrap(), old);
+        Store::open_quick(&desk, b"2468", &yk).unwrap();
+        Store::open_fido(&desk, &[3; 64], &one).unwrap();
+        Store::open_fido(&desk, &[4; 64], &two).unwrap();
+        // An older pairing, of a store without them: theirs go.
+        let lap = d.join("lap");
+        Store::create(&lap, b"pw3", None).unwrap();
+        let got = offer(&lap, "desk").unwrap();
+        assert!(got.ends_with(&fs::read(lap.join("key")).unwrap()));
+        take(&desk, "lap", &got).unwrap();
+        assert!(!desk.join("quick").exists() && !desk.join("ctap").exists());
+        Store::open(&desk, b"pw3", None).unwrap();
+        assert!(
+            take(&desk, "x", &[got[..64].to_vec(), KEYS.to_vec()].concat())
+                .is_err()
+        );
     }
 
     /// Lists past a stream's window (2 MiB: 70,000 names here) cross: each

@@ -985,15 +985,16 @@ impl App {
                     field(ui, "PIN", &mut self.pin, true);
                 }
                 ui.horizontal_wrapped(|ui| {
+                    if keys.is_some()
+                        && ui.button("Unlock with a security key").clicked()
+                    {
+                        let say = "Plug in your security key and touch it";
+                        self.begin(ui, Job::Fido, say);
+                    }
                     if quick.is_some()
                         && ui.button("Unlock with the YubiKey").clicked()
                     {
                         self.begin(ui, Job::Quick, "Touch your YubiKey");
-                    }
-                    if keys.is_some()
-                        && ui.button("Unlock with a security key").clicked()
-                    {
-                        self.begin(ui, Job::Fido, "Touch your security key");
                     }
                 });
             }
@@ -2316,11 +2317,12 @@ impl App {
             RichText::new("Security keys: CTAP2 (FIDO2 without the network)")
                 .strong(),
         );
-        let how = "A security key of any make opens the store on this machine, \
-                   beside the password. Only this machine and the key take \
-                   part, over USB: no server, no account, no network, so it \
-                   works offline. The key's secret never leaves it. Add a \
-                   spare at any time.";
+        let how = "A security key of any make (a YubiKey is one) opens the \
+                   store on this machine, beside the password, plugged in. \
+                   Only this machine and the key take part, over USB: no \
+                   server, no account, no network, nothing to install. The \
+                   key's secret never leaves it. Keys added on a phone come \
+                   along when it pairs this machine. Add a spare at any time.";
         ui.label(RichText::new(how).small().color(l.muted));
         let keys = pasa::fido(&home()).map_or(0, |f| f.keys.len());
         ui.horizontal(|ui| {
@@ -2346,7 +2348,14 @@ impl App {
         ui.separator();
         ui.label(RichText::new("Quick unlock").strong());
         let how = "A tap of your YubiKey and a PIN open the store on this \
-                   machine. The password still opens it alone: keep it long.";
+                   machine, by its slot 2 (ykman). The password still opens \
+                   it alone: keep it long.";
+        #[cfg(target_os = "macos")]
+        let how = format!(
+            "{how} On a Mac ykman reads slot 2 through the key's keyboard \
+             side, which macOS guards (Input Monitoring): add the YubiKey \
+             as a security key above instead, which asks for nothing."
+        );
         ui.label(RichText::new(how).small().color(l.muted));
         match pasa::quick(&home()) {
             Some((_, pin)) => {

@@ -118,16 +118,24 @@ ciphertext, and learns when you change things. A version deleted from
   factors needed. The password is per device (`passwd` changes this one);
   each `passwd` takes a fresh challenge. Program two YubiKeys with one
   secret (`ykman otp chalresp 2 SECRET`).
-- **Security keys: CTAP2** (`pasa ctap`, or the apps' settings; per
-  device, never synced): a security key of any make opens the store beside
-  the password, by CTAP2's `hmac-secret`. CTAP2 is the half of FIDO2
-  between a device and a key; the half between a browser and a server
-  (WebAuthn) is not used, and there is no server, account or network in
-  it: it works offline, and "pasa" on the key is a name, not an address.
+- **Security keys: CTAP2** (`pasa ctap`, or the apps' settings; brought
+  along by pairing, never synced): a security key of any make (a YubiKey
+  is one) opens the store beside the password, by CTAP2's `hmac-secret`.
+  CTAP2 is the half of FIDO2 between a device and a key; the half between
+  a browser and a server (WebAuthn) is not used, and there is no server,
+  account or network in it: it works offline, and "pasa" on the key is a
+  name, not an address.
   The key makes a secret that never leaves it and answers HMAC-SHA-256 of
-  the device's salt under it; `ctap` holds, a line a key, the credential
-  and the key the password opens sealed to that answer. A key is added
-  whenever the store is open, so a spare can come later. With a PIN on the
+  the store's salt under it, the salt in WebAuthn's PRF form
+  (SHA-256("WebAuthn PRF", 0, salt)), as Yubico's kit on the phone asks
+  it: a key added on one device opens the store on those it pairs (keys
+  added on a computer before, asked the salt as it is, still open it
+  there). On a computer pasa speaks CTAP2 itself, over USB
+  (authenticator-rs, Firefox's): nothing to install, and nothing a
+  system guards as a keyboard (macOS asks no Input Monitoring). `ctap`
+  holds, a line a key, the credential and the key the password opens
+  sealed to that answer. A key is added whenever the store is open, so a
+  spare can come later. With a PIN on the
   key, the key counts the wrong tries (8, then it locks). The exchange on
   the cable is CTAP2's (P-256, AES-256, HMAC-SHA-256), not post-quantum;
   what it carries opens nothing without the device's files. A new password
@@ -135,17 +143,17 @@ ciphertext, and learns when you change things. A version deleted from
   That no connection is made is checked, not only said: on Android, every
   build runs `android/no-network.sh`, which fails if the app's key code or
   any class of Yubico's library names one that could open a connection;
-  on the desktop, libfido2's tools (`fido2-token`, `fido2-cred`,
-  `fido2-assert`) link no TLS or HTTP library and resolve no names
-  (`nm -D` shows no `getaddrinfo`); libfido2's sockets are the kernel's
-  NFC interfaces (`AF_NETLINK`, `AF_NFC`).
-- **Quick unlock** (`pasa quick`, or the apps' settings; per device, never
-  synced): `quick` holds the key the password derives, sealed to Argon2id
+  on the desktop, authenticator-rs depends on no network crate
+  (`cargo tree -p authenticator`) and its source names no socket.
+- **Quick unlock** (`pasa quick`, or the apps' settings; brought along by
+  pairing, never synced): `quick` holds the key the password derives, sealed to Argon2id
   of a PIN with the YubiKey's answer as its secret. A tap and the PIN then
   open the store; so does the password alone, which must therefore be
   long. The key alone opens nothing; the device's storage with the key
   leaves only the PIN to guess, at Argon2id's pace: days for six digits.
-  `passwd` ends it.
+  `passwd` ends it. A computer asks slot 2 through `ykman`, which reaches
+  it by the key's keyboard side: macOS opens that only to apps given
+  Input Monitoring, so on a Mac add the YubiKey as a security key instead.
 - **Transport keys, endpoints, lanes**: what `serve` holds; none opens
   a version or the key file.
 
@@ -165,7 +173,8 @@ the store's password and hardware key are never asked for, typed or
 seen while devices pair or sync, only afterwards, on each device alone.
 
 **Pairing** sends the key file as it is, sealed to the password (and
-YubiKey), with this device's endpoint and a fresh transport key for the
+YubiKey), and the hardware keys' files if there are any (`quick`, `ctap`:
+sealed to them), with this device's endpoint and a fresh transport key for the
 two. The device that has the keys shows a QR code (offline: a phone's
 camera, a computer's by `join --scan` or the window's "Scan with the
 camera", or `join` with its text takes it; frames stay in memory), under a password of its own, typed or two
@@ -173,8 +182,9 @@ made-up words, shown before the code and never beside it; or a short
 code to type (`pair` without `--qr`, for a device with no camera), which
 meets once at the relay under [pairir](https://github.com/cablab-ucf/pairir)
 (CPace, then X-Wing, inside post-quantum TLS), one try, one minute. The
-device that takes it holds that key file from then on (one it had that
-differed is kept as `key.old`).
+device that takes it holds those files from then on (a key file it had
+that differed is kept as `key.old`; its own hardware keys' files, which
+opened that one alone, go).
 
 **Syncing** sends versions, age files to the store key, as they are; the
 new device syncs at once, before anything is unlocked. It runs in a
