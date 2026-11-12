@@ -9,7 +9,7 @@ use crossterm::{cursor::MoveTo, execute, queue};
 use std::io::{Write, stdout};
 
 const HELP: &str = "Enter pass ^U user ^O otp Tab show ^E edit ^G regen ^N new \
-                    ^D del ^S sync Esc";
+                    ^D del ^S sync ^T store Esc";
 
 fn screen(on: bool) -> Result<()> {
     match on {
@@ -33,6 +33,54 @@ pub fn run(s: pasa::Store) -> Result<()> {
     let r = browse(v);
     screen(false)?;
     r
+}
+
+/// Another store: its number, or a folder; Esc: stay.
+fn pick() -> Result<Option<std::path::PathBuf>> {
+    let (all, here) = (pasa::stores(), pasa::home());
+    let mut t = String::new();
+    loop {
+        let mut o = stdout().lock();
+        queue!(o, Clear(All))?;
+        for (i, s) in all.iter().enumerate() {
+            let open = if *s == here { "  (open)" } else { "" };
+            let s = format!("{} {}{open}", i + 1, s.display());
+            queue!(o, MoveTo(0, i as u16), Print(s))?;
+        }
+        let ask = format!("Store: its number, or a folder (Esc: stay) > {t}");
+        queue!(o, MoveTo(0, all.len() as u16 + 1), Print(ask))?;
+        o.flush()?;
+        let Event::Key(k) = read()? else { continue };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            _ if k.kind != KeyEventKind::Press => {}
+            Esc => return Ok(None),
+            Enter => break,
+            Char('j') if ctrl => break,
+            Backspace => drop(t.pop()),
+            Char(c) if !ctrl => t.push(c),
+            _ => {}
+        }
+    }
+    let to = match t.trim() {
+        "" => None,
+        t => t.parse::<usize>().map_or(Some(pasa::path(t)), |n| {
+            all.get(n.wrapping_sub(1)).cloned()
+        }),
+    };
+    Ok(to.filter(|d| *d != here))
+}
+
+/// This process becomes `pasa --dir DIR tui`, which asks for its unlock.
+fn reopen(dir: &std::path::Path) -> Result<()> {
+    let mut c = crate::reopen(dir, "tui")?;
+    #[cfg(unix)]
+    return Err(std::os::unix::process::CommandExt::exec(&mut c).into());
+    #[cfg(not(unix))]
+    {
+        c.status()?;
+        Ok(())
+    }
 }
 
 fn checkin() -> String {
@@ -86,7 +134,7 @@ fn draw(v: &View, shown: bool) -> Result<()> {
             .try_for_each(|i| line(i + 1 - top, &v.names[i], i == v.at))?,
     }
     line(
-        h as usize - 1,
+        (h as usize).saturating_sub(1),
         if v.note.is_empty() { HELP } else { &v.note },
         false,
     )?;
@@ -155,6 +203,12 @@ fn browse(mut v: View) -> Result<()> {
                     Ok(()) => "Offline: pasa opens no connection".into(),
                     Err(e) => format!("{e:#}"),
                 };
+            }
+            (Char('t'), _) if ctrl => {
+                if let Some(d) = pick()? {
+                    screen(false)?;
+                    return reopen(&d);
+                }
             }
             (Backspace, _) => drop(v.filter.pop()),
             (Char(c), _) if !ctrl => v.filter.push(c),

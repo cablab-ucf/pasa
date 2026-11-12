@@ -15,12 +15,11 @@ pub fn command(dir: &Path, exe: &Path, args: &[&str]) -> Command {
     if let Some(profile) = profile(dir, exe) {
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p").arg(profile).arg(exe).args(args);
-        c.env("PASA_SANDBOX", "1");
+        c.env("PASA_SANDBOX", "1").env("PASA_DIR", dir);
         return c;
     }
-    let _ = dir;
     let mut c = Command::new(exe);
-    c.args(args);
+    c.args(args).env("PASA_DIR", dir);
     c
 }
 

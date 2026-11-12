@@ -28,7 +28,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.pairir.ScanQr
 
-fun store(c: Context) = File(c.filesDir, "pasa")
+/** The chosen store: an app-private folder, "pasa" or "pasa-NAME". */
+fun store(c: Context) = File(c.filesDir, c.getSharedPreferences("pasa", 0).getString("store", null) ?: "pasa")
 
 private suspend fun <T> io(f: () -> T): T = withContext(Dispatchers.IO) { f() }
 private fun lines(s: String) = s.lines().filter { it.isNotEmpty() }
@@ -121,6 +122,18 @@ class MainActivity : ComponentActivity(), Host {
     }
 
     override val hasStore get() = stored
+    override val storeName get() = store(this).name
+    override val stores get() =
+        (filesDir.list().orEmpty().filter { it == "pasa" || it.startsWith("pasa-") } + "pasa" + storeName).distinct().sorted()
+
+    override fun useStore(name: String) {
+        here(false)
+        if (sync) org.pushir.Pushir.stop(this)
+        lock()
+        getSharedPreferences("pasa", 0).edit().putString("store", name).commit()
+        if (sync) push(this)
+        recreate()
+    }
     override val needsKey get() = Native.challenge(dir) != null
     override val open get() = handle != 0L
     override val version get() = packageManager.getPackageInfo(packageName, 0).versionName ?: ""

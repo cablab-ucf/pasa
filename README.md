@@ -33,7 +33,15 @@ libclang-dev libpcsclite-dev cmake`); the flake brings them.
 ~/.pasa/store/v/    versions: age files named by their hash
 ~/.pasa/store/.git  optional: git init ~/.pasa/store
 ~/.pasa/net/        pairings, this device's endpoint and lane
+~/.pasa/stores      other stores chosen here, a path a line
 ```
+
+A store is a folder: `pasa --dir DIR` (or `PASA_DIR`) uses one other than
+`~/.pasa`, say one per person or purpose. The window's store menu and
+`^T` in `pasa tui` switch to another, or to a new folder, by starting
+pasa anew on it, so it asks for its own unlock and nothing of the last
+one's stays; the phone keeps its stores side by side (Store, on the lock
+screen).
 
 Every file is an age file to a random 256-bit key (scrypt recipient,
 N = 2): symmetric, so post-quantum, and `age -d` opens any version with

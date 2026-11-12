@@ -124,9 +124,57 @@ pub fn versions(dir: &Path) -> PathBuf {
     v
 }
 
+static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The store: `--dir` ([`set_home`]), else `PASA_DIR`, else `~/.pasa`.
 pub fn home() -> PathBuf {
-    let h = || std::env::home_dir().unwrap_or_default().join(".pasa");
-    std::env::var_os("PASA_DIR").map_or_else(h, PathBuf::from)
+    let env = || std::env::var_os("PASA_DIR").map(PathBuf::from);
+    DIR.get().cloned().or_else(env).unwrap_or_else(|| user(".pasa"))
+}
+
+/// Once, before [`home`] is asked.
+pub fn set_home(dir: &str) {
+    let _ = DIR.set(path(dir));
+}
+
+fn user(p: &str) -> PathBuf {
+    std::env::home_dir().unwrap_or_default().join(p)
+}
+
+/// `~` expanded, made absolute.
+pub fn path(s: &str) -> PathBuf {
+    let p = match s.trim().strip_prefix('~') {
+        Some(r) if r.is_empty() || r.starts_with('/') => {
+            user(r.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(s.trim()),
+    };
+    std::path::absolute(&p).unwrap_or(p)
+}
+
+/// `~/.pasa` and the stores chosen on this device (`~/.pasa/stores`, a path
+/// a line), those here; and [`home`].
+pub fn stores() -> Vec<PathBuf> {
+    let t = fs::read_to_string(user(".pasa/stores")).unwrap_or_default();
+    let mut all: Vec<PathBuf> = vec![];
+    for p in [user(".pasa")].into_iter().chain(t.lines().map(PathBuf::from)) {
+        if p.join("key").exists() && !all.contains(&p) {
+            all.push(p);
+        }
+    }
+    if !all.contains(&home()) {
+        all.push(home());
+    }
+    all
+}
+
+pub fn remember(dir: &Path) -> Result<()> {
+    let at = user(".pasa/stores");
+    let t = fs::read_to_string(&at).unwrap_or_default();
+    if dir == user(".pasa") || t.lines().any(|l| Path::new(l) == dir) {
+        return Ok(());
+    }
+    write(&at, format!("{t}{}\n", dir.display()).as_bytes())
 }
 
 pub fn write(p: &Path, b: &[u8]) -> Result<()> {
@@ -1462,6 +1510,17 @@ mod tests {
         let mut sa = Store::open(&a, b"pw", None).unwrap();
         sa.rotate().unwrap();
         check(&sa, 3);
+    }
+
+    #[test]
+    fn store_paths_are_absolute_and_tilde_is_home() {
+        let (h, here) =
+            (std::env::home_dir().unwrap(), std::env::current_dir().unwrap());
+        assert_eq!(path("~"), h);
+        assert_eq!(path(" ~/a/b "), h.join("a/b"));
+        assert_eq!(path("/x/y"), PathBuf::from("/x/y"));
+        assert_eq!(path("rel"), here.join("rel"));
+        assert_eq!(path("~bob"), here.join("~bob"));
     }
 
     #[test]
