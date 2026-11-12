@@ -2813,7 +2813,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "irnet"
 version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/irnet?rev=7a19e4aeac4b56365626feea68cddd17496a18dc#7a19e4aeac4b56365626feea68cddd17496a18dc"
+source = "git+https://github.com/cablab-ucf/irnet?rev=fbd691d1b6dd34d4d2c027b6875df3f11c918f66#fbd691d1b6dd34d4d2c027b6875df3f11c918f66"
 dependencies = [
  "anyhow",
  "chacha20poly1305 0.11.0",
@@ -4528,7 +4528,7 @@ dependencies = [
 [[package]]
 name = "pairir"
 version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/pairir?rev=6e7faa92e6732834db30e8a67fc439f5cb333132#6e7faa92e6732834db30e8a67fc439f5cb333132"
+source = "git+https://github.com/cablab-ucf/pairir?rev=6d250b2c47763c55c7f988a05eb65d5182ac7d91#6d250b2c47763c55c7f988a05eb65d5182ac7d91"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4986,7 +4986,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 [[package]]
 name = "pushir"
 version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/pushir?rev=3e91f07d51eb6b08cd807640b4edc10cde16b716#3e91f07d51eb6b08cd807640b4edc10cde16b716"
+source = "git+https://github.com/cablab-ucf/pushir?rev=344430c2539df744420bd0180364a2a3cf867bd2#344430c2539df744420bd0180364a2a3cf867bd2"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
