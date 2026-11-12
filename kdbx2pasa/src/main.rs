@@ -6,6 +6,8 @@
 //! an entry is the same by its id in each, and its versions from all of
 //! them make one history by time, the newest being the entry.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use anyhow::{Context, Result};
 use keepass::{Database, DatabaseKey, db::Entry, db::GroupRef};
 use std::collections::{BTreeMap, HashSet};
@@ -34,6 +36,9 @@ fn text(e: &Entry) -> Result<String> {
     }
     if !e.tags.is_empty() {
         writeln!(b, "tags: {}", e.tags.join(", "))?;
+    }
+    if e.times.expires == Some(true) {
+        writeln!(b, "expires: {}", e.times.expiry.date())?;
     }
     // An empty line, then the notes: notes whatever they say.
     if let Some(n) = e.get("Notes").filter(|n| !n.is_empty()) {

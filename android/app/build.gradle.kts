@@ -11,8 +11,8 @@ android {
         applicationId = "com.apasa"
         minSdk = 26
         targetSdk = 35
-        versionCode = 22
-        versionName = "0.4.10"
+        versionCode = 23
+        versionName = "0.4.11"
         // pushir: apps signed by the same key share one connection.
         manifestPlaceholders["pushirGroup"] = "center.cxn"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
