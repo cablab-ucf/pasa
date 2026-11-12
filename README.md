@@ -28,8 +28,9 @@ One binary is the command line, the terminal browser and the window. A
 release has it for Linux (x86-64, glibc) and macOS (Apple silicon, with
 `pasa.app`); elsewhere, and on NixOS, build it: the flake's `pasa-gui`
 (default) or `pasa-cli` (no window libraries), or `cargo install --locked
---path . --features gui`. Built on Linux it needs libudev and libclang
-(Debian: `libudev-dev libclang-dev`); the flake brings both. `pasa.app` is
+--path . --features gui`. Built on Linux it needs libudev, libclang and
+pcsc-lite (Debian: `libudev-dev libclang-dev libpcsclite-dev`); the flake
+brings them. `pasa.app` is
 signed ad hoc, by no Apple account:
 after a download, `xattr -dr com.apple.quarantine pasa.app`.
 
@@ -134,7 +135,10 @@ ciphertext, and learns when you change things. A version deleted from
   added on a computer before, asked the salt as it is, still open it
   there). On a computer pasa speaks CTAP2 itself, over USB
   (authenticator-rs, Firefox's): nothing to install, and nothing a
-  system guards as a keyboard (macOS asks no Input Monitoring). `ctap`
+  system guards as a keyboard (macOS asks no Input Monitoring), or held
+  to an NFC reader (PC/SC: pcsc-lite's `pcscd` on Linux,
+  `services.pcscd.enable` on NixOS; macOS's own), a key's CTAP2 then
+  carried in ISO 7816 APDUs. `ctap`
   holds, a line a key, the credential and the key the password opens
   sealed to that answer. A key is added whenever the store is open, so a
   spare can come later. With a PIN on the
@@ -153,9 +157,11 @@ ciphertext, and learns when you change things. A version deleted from
   open the store; so does the password alone, which must therefore be
   long. The key alone opens nothing; the device's storage with the key
   leaves only the PIN to guess, at Argon2id's pace: days for six digits.
-  `passwd` ends it. A computer asks slot 2 through `ykman`, which reaches
-  it by the key's keyboard side: macOS opens that only to apps given
-  Input Monitoring, so on a Mac add the YubiKey as a security key instead.
+  `passwd` ends it. A computer asks slot 2 itself of a YubiKey held to an
+  NFC reader, or by its smart-card side plugged in where the key allows
+  it; else through `ykman`, which reaches it by the key's keyboard side:
+  macOS opens that only to apps given Input Monitoring, so on a Mac add
+  the YubiKey as a security key instead.
 - **Transport keys, endpoints, lanes**: what `serve` holds; none opens
   a version or the key file.
 

@@ -24,7 +24,8 @@
         nativeBuildInputs = [ pkgs.makeWrapper ]
           ++ lib.optionals linux [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ]
           ++ lib.optional (gui && linux) pkgs.copyDesktopItems;
-        buildInputs = lib.optional linux pkgs.udev; # libudev: security keys over USB
+        # libudev: security keys over USB; pcsc-lite: keys on NFC readers.
+        buildInputs = lib.optionals linux [ pkgs.udev pkgs.pcsclite ];
         desktopItems = lib.optional (gui && linux) (pkgs.makeDesktopItem {
           name = "pasa"; desktopName = "pasa"; exec = "pasa gui"; categories = [ "Utility" "Security" ];
         });

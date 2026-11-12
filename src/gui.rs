@@ -994,7 +994,9 @@ impl App {
             if quick.is_some() || keys.is_some() {
                 ui.separator();
                 let l = look(ui);
-                ui.label(RichText::new("Or a key").small().color(l.muted));
+                let or = "Or a key: plugged in, or held to a reader (NFC) \
+                          before you press";
+                ui.label(RichText::new(or).small().color(l.muted));
                 let pin = quick.as_ref().is_some_and(|q| q.1);
                 if pin
                     || keys.as_ref().is_some_and(|f| f.keys.iter().any(|k| k.1))
@@ -1005,13 +1007,16 @@ impl App {
                     if keys.is_some()
                         && ui.button("Unlock with a security key").clicked()
                     {
-                        let say = "Plug in your security key and touch it";
+                        let say =
+                            "Touch your security key, or hold it to the reader";
                         self.begin(ui, Job::Fido, say);
                     }
                     if quick.is_some()
                         && ui.button("Unlock with the YubiKey").clicked()
                     {
-                        self.begin(ui, Job::Quick, "Touch your YubiKey");
+                        let say =
+                            "Touch your YubiKey, or hold it to the reader";
+                        self.begin(ui, Job::Quick, say);
                     }
                 });
             }

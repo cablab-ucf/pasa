@@ -21,11 +21,12 @@ use authenticator::ctap2::server::{
     Transport, UserVerificationRequirement,
 };
 use authenticator::statecallback::StateCallback;
-use authenticator::{Pin, StatusPinUv, StatusUpdate};
+use authenticator::{FidoDevice, Pin, StatusPinUv, StatusUpdate};
 use sha2::Digest;
 
 #[cfg(feature = "gui")]
 mod gui;
+mod nfc;
 #[cfg(feature = "scan")]
 mod scan;
 #[cfg(feature = "tui")]
@@ -55,14 +56,15 @@ pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
-pasa ctap | ctap off         let the security key plugged in open the store here beside
-                             the password, by CTAP2 (FIDO2 without the network: only
-                             this machine and the key, over USB); again for a spare, at
-                             any time. off: none does. Pairing brings them along
+pasa ctap | ctap off         let the security key plugged in (or held to an NFC reader)
+                             open the store here beside the password, by CTAP2 (FIDO2
+                             without the network: only this machine and the key); again
+                             for a spare, at any time. off: none does. Pairing brings them
 pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
                              spare with the same secret, now or never: have both at hand
-pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
-                             password still opens it alone, so make it long
+pasa quick [-n] | quick off  open here by a YubiKey (touched, or held to an NFC reader)
+                             and a PIN (-n: no PIN); the password still opens it alone,
+                             so make it long. A key on a reader: held there first
 pasa keys                    the store keys: age -d takes them as passphrases
 pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys' too), to
                              a new device called NAME here: a code to type, or a QR code
@@ -85,8 +87,15 @@ fn new_password() -> Result<Secret> {
     Ok(p)
 }
 
-/// The YubiKey's HMAC-SHA1 (slot 2) of `c`.
+/// The YubiKey's HMAC-SHA1 (slot 2) of `c`: on a reader (held to it, or
+/// its smart-card side plugged in), in this process; else by USB, ykman.
 fn yubikey(c: &[u8]) -> Result<Secret> {
+    if let Some(mut k) = nfc::card(nfc::OTP) {
+        match nfc::slot2(&mut k, c) {
+            Ok(r) => return Ok(Zeroizing::new(r)),
+            Err(e) => eprintln!("{e:#}: now by USB"),
+        }
+    }
     eprintln!("Touch your YubiKey");
     let o = Command::new("ykman")
         .args(["otp", "calculate", "2", &HEXLOWER.encode(c)])
@@ -152,14 +161,11 @@ fn ctap<T: Send + 'static>(
     typed: Option<&[u8]>,
     wait: u64,
     go: impl FnOnce(
-        &mut AuthenticatorService,
-        u64,
+        Via,
         Sender<StatusUpdate>,
         StateCallback<authenticator::Result<T>>,
     ) -> authenticator::Result<()>,
 ) -> Result<T> {
-    let mut m = AuthenticatorService::new()?;
-    m.add_u2f_usb_hid_platform_transports();
     let (status, said) = channel();
     let text =
         |p: &[u8]| Zeroizing::new(String::from_utf8_lossy(p).into_owned());
@@ -216,7 +222,19 @@ fn ctap<T: Send + 'static>(
     let done = StateCallback::new(Box::new(move |r| {
         let _ = tx.send(r);
     }));
-    go(&mut m, wait, status, done)?;
+    // A key on a reader (NFC) is used as it is held there; else USB's.
+    let mut usb = AuthenticatorService::new()?;
+    match nfc::card(nfc::FIDO).map(nfc::Fido::new) {
+        Some(mut f) => {
+            let init = f.init();
+            init.map_err(|e| anyhow::anyhow!("the key on the reader: {e}"))?;
+            go(Via::Card(&mut f), status, done)?
+        }
+        None => {
+            usb.add_u2f_usb_hid_platform_transports();
+            go(Via::Usb(&mut usb, wait), status, done)?
+        }
+    }
     let got = rx.recv()?;
     let why = *why.lock().unwrap_or_else(|p| p.into_inner());
     got.map_err(|e| {
@@ -225,6 +243,50 @@ fn ctap<T: Send + 'static>(
             why.map_or(e.to_string(), String::from)
         )
     })
+}
+
+/// Where a security key is asked: on a reader, or on USB (`wait`: ms).
+enum Via<'a> {
+    Usb(&'a mut AuthenticatorService, u64),
+    Card(&'a mut nfc::Fido),
+}
+
+type Done<R> = StateCallback<authenticator::Result<R>>;
+
+impl Via<'_> {
+    fn sign(
+        self,
+        ask: SignArgs,
+        status: Sender<StatusUpdate>,
+        done: Done<authenticator::SignResult>,
+    ) -> authenticator::Result<()> {
+        match self {
+            Via::Usb(m, t) => m.sign(t, ask, status, done),
+            Via::Card(f) => {
+                // It answers in this thread; `done` has the outcome.
+                let _ =
+                    authenticator::ctap2::sign(f, ask, status, done, &|| true);
+                Ok(())
+            }
+        }
+    }
+
+    fn register(
+        self,
+        ask: RegisterArgs,
+        status: Sender<StatusUpdate>,
+        done: Done<authenticator::RegisterResult>,
+    ) -> authenticator::Result<()> {
+        match self {
+            Via::Usb(m, t) => m.register(t, ask, status, done),
+            Via::Card(f) => {
+                let alive = &|| true;
+                let _ =
+                    authenticator::ctap2::register(f, ask, status, done, alive);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// `salt` as WebAuthn's PRF hands it to a key: SHA-256("WebAuthn PRF", 0,
@@ -251,7 +313,7 @@ fn fido_secret(
         true => UserVerificationRequirement::Preferred,
         false => UserVerificationRequirement::Discouraged,
     };
-    let got = ctap(typed, 30_000, |m, t, status, done| {
+    let got = ctap(typed, 30_000, |via, status, done| {
         let ask = SignArgs {
             client_data_hash: rand::<32>(),
             origin: RP.into(),
@@ -269,7 +331,7 @@ fn fido_secret(
             pin: None,
             use_ctap1_fallback: false,
         };
-        m.sign(t, ask, status, done)
+        via.sign(ask, status, done)
     })?;
     let out =
         got.extensions.hmac_get_secret.context("the key gave no secret")?;
@@ -297,7 +359,7 @@ fn allow(keys: &[(Vec<u8>, bool)]) -> Vec<PublicKeyCredentialDescriptor> {
 /// Whether a security key plugged in holds one of `keys`: asked without a
 /// touch or a PIN, a moment's wait.
 fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
-    let probe = |m: &mut AuthenticatorService, t, status, done| {
+    let probe = |via: Via, status, done| {
         let ask = SignArgs {
             client_data_hash: rand::<32>(),
             origin: RP.into(),
@@ -309,7 +371,7 @@ fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
             pin: None,
             use_ctap1_fallback: false,
         };
-        m.sign(t, ask, status, done)
+        via.sign(ask, status, done)
     };
     ctap(Some(b""), 1500, probe).is_ok()
 }
@@ -319,7 +381,7 @@ fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
 /// of), with its PIN if it has one, and the key the password opens sealed
 /// to its secret. `typed`: its PIN, from a window.
 pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
-    let made = ctap(typed, 30_000, |m, t, status, done| {
+    let made = ctap(typed, 30_000, |via, status, done| {
         let ask = RegisterArgs {
             client_data_hash: rand::<32>(),
             relying_party: RelyingParty {
@@ -345,7 +407,7 @@ pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
             pin: None,
             use_ctap1_fallback: false,
         };
-        m.register(t, ask, status, done)
+        via.register(ask, status, done)
     })?;
     let a = made.att_obj.auth_data;
     let pin = a.flags.contains(AuthenticatorDataFlags::USER_VERIFIED);
