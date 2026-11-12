@@ -33,7 +33,6 @@ fun store(c: Context) = File(c.filesDir, "pasa")
 private suspend fun <T> io(f: () -> T): T = withContext(Dispatchers.IO) { f() }
 private fun lines(s: String) = s.lines().filter { it.isNotEmpty() }
 
-/** The screens are [Pasa] (Ui.kt); this is what they ask of the phone. */
 class MainActivity : ComponentActivity(), Host {
     private var handle by mutableStateOf(0L)
     private var stored by mutableStateOf(false)
@@ -42,7 +41,7 @@ class MainActivity : ComponentActivity(), Host {
     private var scanned: (String) -> Unit = {}
     private val scanner = registerForActivityResult(ScanQr()) { it?.let { t -> scanned(t) } }
 
-    /** A file is being picked: the store stays open under the picker. */
+    /** The picker stops this activity; the store stays open under it. */
     private var picking = false
     private var picked: (Uri?) -> Unit = {}
     private val opener = registerForActivityResult(ActivityResultContracts.OpenDocument()) { picking = false; picked(it) }
@@ -61,7 +60,6 @@ class MainActivity : ComponentActivity(), Host {
         }
     }
 
-    /** Read again each time the app comes back: NFC may have been switched meanwhile. */
     private var nfcIsOff by mutableStateOf(false)
     override val nfcOff get() = nfcIsOff
 
@@ -88,7 +86,7 @@ class MainActivity : ComponentActivity(), Host {
         }
     }
 
-    /** When the app left the screen, by the clock that runs while the phone sleeps: the handler's does not. */
+    /** elapsedRealtime: the Handler's clock stops while the phone sleeps, so onStart checks too. */
     private var left = 0L
 
     override fun onStart() {
@@ -99,11 +97,9 @@ class MainActivity : ComponentActivity(), Host {
         here(sync)
     }
 
-    /** What syncs bring shows at once: a version is a file moved into v/. */
     override var news by mutableStateOf(0)
     private var watch: android.os.FileObserver? = null
 
-    /** On the screen with sync on: paired devices dial here; off it, none do. */
     @Suppress("DEPRECATION") // FileObserver(File) is API 29; this app runs from 26.
     private fun here(on: Boolean) {
         Native.serve(dir, on)
@@ -116,7 +112,6 @@ class MainActivity : ComponentActivity(), Host {
     private val main = Handler(Looper.getMainLooper())
     private val locker = Runnable { lock() }
 
-    // What Settings changes, kept on this phone: seconds, and for the theme a number.
     private val settings = mutableStateMapOf<String, Int>()
     private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0)
     override fun setting(name: String) = settings.getOrPut(name) { getSharedPreferences("pasa", 0).getInt(name, usual[name] ?: 0) }
@@ -134,8 +129,7 @@ class MainActivity : ComponentActivity(), Host {
         get() = syncOn(this)
         set(on) {
             getSharedPreferences("pasa", 0).edit().putBoolean("sync", on).apply()
-            // Off: this app leaves the push connection (its broker stopped,
-            // if it holds it) before the broker is disabled; serving ends.
+            // Off: leave the push connection before its broker is disabled.
             if (on) push(this) else org.pushir.Pushir.stop(this)
             broker(this, on)
             here(on)
@@ -159,12 +153,10 @@ class MainActivity : ComponentActivity(), Host {
         val c = fresh()
         val r = yubikey(this, c, enroll = true)
         io { Native.quickOn(h, pin.toByteArray(), c, r) }
-        // Kept, so that unlocking shows the number pad for a PIN of digits alone.
         set("pinDigits", if (pin.isNotEmpty() && pin.all { it in '0'..'9' }) 1 else 0)
         readQuick()
     }
 
-    /** The secret of the key last set up, for a spare: kept until the app leaves the screen. */
     private var keySecret: ByteArray? = null
 
     override suspend fun setUpKey(spare: Boolean) {
@@ -181,7 +173,6 @@ class MainActivity : ComponentActivity(), Host {
         readQuick()
     }
 
-    /** The key's answer to the quick challenge, from a tap made before the PIN was typed: gone when the app leaves the screen. */
     private var answer: ByteArray? = null
 
     override suspend fun tapKey(pin: String): Boolean {
@@ -190,7 +181,6 @@ class MainActivity : ComponentActivity(), Host {
         return when (val t = anyKey(this, quick?.copyOf(32), keys?.first, keys?.second.orEmpty(), pin)) {
             is Tapped.Slot2 -> {
                 answer = t.answer
-                // No PIN was set: the tap is all of it.
                 (quick!![32].toInt() != 1).also { if (it) unlockQuick("") }
             }
             is Tapped.Ctap -> {
@@ -204,14 +194,13 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun unlockQuick(pin: String) {
         val r = answer ?: yubikey(this, Native.quick(dir)!!.copyOf(32))
-        // A wrong PIN leaves the answer for the next try; the right one ends it.
+        // A wrong PIN throws here, keeping the answer for the next try.
         handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
         r.fill(0)
         answer = null
         if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
-    // Security keys (FIDO2): how many open the store here, and whether a PIN goes with any.
     private var fidoNow by mutableStateOf(0 to false)
     override val fidoKeys get() = fidoNow.first
     override val fidoPin get() = fidoNow.second
@@ -240,7 +229,6 @@ class MainActivity : ComponentActivity(), Host {
         if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
-    /** Joining turns sync on: the phone then reaches its devices through the relay. */
     override suspend fun join(name: String, code: String, pw: String) {
         io { Native.join(dir, name, code, pw) }
         sync = true
@@ -261,7 +249,6 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun names() = io { lines(Native.names(handle)) }
     override suspend fun get(name: String) = io { Native.get(handle, name) }
 
-    /** A change, then the news to the other devices. */
     private suspend fun changed(f: () -> Unit) = io {
         f()
         if (sync) runCatching { Native.sync(dir, true) }
@@ -295,7 +282,6 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun stats() = io { lines(Native.stats(handle)).map { it.substringBefore('\t') to it.substringAfter('\t') } }
 
-    /** Only 5 hex digits of the password's SHA-1 leave the phone; the answer is padded. */
     override suspend fun pwned(pw: String) = io {
         val (sent, kept) = lines(Native.pwnedKey(pw))
         val c = URL("https://api.pwnedpasswords.com/range/$sent").openConnection() as HttpURLConnection

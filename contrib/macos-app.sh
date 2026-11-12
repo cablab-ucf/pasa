@@ -1,7 +1,6 @@
 #!/bin/sh
-# pasa.app around the binary $1, in directory $2, at version $3: opening it
-# is `pasa gui`. Finder gives an app a bare PATH, so where ykman and git
-# usually are is added. Signed ad hoc: no Apple account is involved.
+# pasa.app (`pasa gui`) for binary $1, in dir $2, version $3; signed ad hoc.
+# Finder gives apps a bare PATH: ykman's and git's usual dirs are added.
 set -eu
 a="$2/pasa.app/Contents"
 mkdir -p "$a/MacOS"

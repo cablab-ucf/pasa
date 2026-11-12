@@ -1,8 +1,4 @@
-//! `pasa dump | pasa2kdbx OUT.kdbx`: the store, each entry as it is now, as
-//! a KeePass database (KDBX4) that KeePassXC opens. Groups follow the
-//! names; an entry keeps its user, address, password, one-time code,
-//! tags, expiry, other fields, notes, date, and its files as attachments.
-//! Sealed under a new password: Argon2id (256 MiB, 4 passes), AES-256.
+//! `pasa dump` to KDBX4: entries as they are now (no history), files attached.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -14,17 +10,14 @@ use pasa::{FILES, Form};
 use std::collections::BTreeMap;
 use std::io::Read;
 
-/// Argon2id's memory and passes: pasa's own, and a test's cheap ones.
 const KDF: (u64, u64) = if cfg!(test) { (1 << 20, 1) } else { (256 << 20, 4) };
 
-/// A group: its groups and its entries by title.
 #[derive(Default)]
 struct Group {
     groups: BTreeMap<String, Group>,
     entries: BTreeMap<String, Item>,
 }
 
-/// An entry: its text, when it was written (s), its files.
 #[derive(Default)]
 struct Item {
     text: String,
@@ -41,8 +34,7 @@ impl Group {
     }
 }
 
-/// The tar `pasa dump` writes: entries, and their files under
-/// `NAME/.files/`; other hidden names (`.kdbx.json`) stay out.
+/// Hidden names other than `NAME/.files/` (`.kdbx.json`) stay out.
 fn read(tar: impl Read) -> Result<Group> {
     let mut root = Group::default();
     for e in tar::Archive::new(tar).entries()? {
@@ -67,7 +59,7 @@ fn read(tar: impl Read) -> Result<Group> {
     Ok(root)
 }
 
-/// `key: value` lines, a value that runs over lines going on indented.
+/// `key: value` lines; an indented line continues the value.
 fn fields(more: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![];
     for l in more.lines() {
@@ -124,8 +116,7 @@ fn fill(g: &mut GroupMut, from: &Group) {
     }
 }
 
-/// The database: the store's groups under a root called pasa, sealed by
-/// Argon2id at pasa's strength (KeePass's default is 1 MiB).
+/// Argon2id at pasa's strength, not KeePass's default 1 MiB.
 fn database(root: &Group) -> Database {
     let mut db = Database::new();
     if let KdfConfig::Argon2 { version, .. } = &db.config.kdf_config {
@@ -152,7 +143,6 @@ fn main() -> Result<()> {
     let mut o = std::fs::OpenOptions::new();
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    // Never over a file that is there.
     let mut f =
         o.write(true).create_new(true).open(out).context(out.clone())?;
     db.save(&mut f, DatabaseKey::new().with_password(&pw))?;
@@ -164,8 +154,6 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    /// What `pasa dump` gives, saved and read back as KeePassXC would:
-    /// groups, fields, tags, expiry, date and files where they belong.
     #[test]
     fn a_dump_opens_as_a_keepass_database() {
         let mut t = tar::Builder::new(vec![]);

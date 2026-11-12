@@ -1,8 +1,4 @@
-//! A key held to a reader: a YubiKey (or any FIDO2 key) through the
-//! system's PC/SC, by NFC, or by the smart-card side of a key plugged in.
-//! Two of its applications: the YubiKey's OTP slot 2 (HMAC-SHA1), and
-//! FIDO2 (CTAP2 in ISO 7816 APDUs), which authenticator-rs drives as it
-//! drives a key on USB. Nothing here reaches a network.
+//! YubiKey OTP slot 2 and FIDO2 (CTAP2 in ISO 7816 APDUs) over PC/SC.
 
 use anyhow::{Result, bail, ensure};
 use authenticator::crypto::SharedSecret;
@@ -12,12 +8,10 @@ use authenticator::{
     AuthenticatorInfo, FidoDevice, FidoDeviceIO, FidoProtocol,
 };
 
-/// The YubiKey's OTP application.
 pub const OTP: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01];
-/// FIDO's.
 pub const FIDO: &[u8] = &[0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
 
-/// A card: an APDU in, its answer (data, then the two status bytes) out.
+/// One APDU in; its response, ending in SW1 SW2, out.
 pub trait Apdu {
     fn raw(&mut self, apdu: &[u8]) -> Result<Vec<u8>>;
 }
@@ -29,8 +23,6 @@ impl Apdu for pcsc::Card {
     }
 }
 
-/// The card that answers `aid`, on a reader now: one held to it, or a
-/// key plugged in whose smart-card side does. None with no PC/SC here.
 pub fn card(aid: &[u8]) -> Option<pcsc::Card> {
     let ctx = pcsc::Context::establish(pcsc::Scope::User).ok()?;
     let (share, any) = (pcsc::ShareMode::Shared, pcsc::Protocols::ANY);
@@ -40,8 +32,7 @@ pub fn card(aid: &[u8]) -> Option<pcsc::Card> {
     cards.find_map(|mut c| select(&mut c, aid).ok().map(|_| c))
 }
 
-/// What the card says to `apdu`, all of it (61xx: more to fetch), and its
-/// status word.
+/// The response's data and SW; on 61xx, GET RESPONSE fetches the rest.
 fn tx(c: &mut impl Apdu, apdu: &[u8]) -> Result<(Vec<u8>, u16)> {
     let (mut r, mut data) = (c.raw(apdu)?, vec![]);
     loop {
@@ -56,8 +47,7 @@ fn tx(c: &mut impl Apdu, apdu: &[u8]) -> Result<(Vec<u8>, u16)> {
     }
 }
 
-/// `cla ins p1 p2` with `data`, in pieces of 255 bytes chained (ISO
-/// 7816-4); the answer to the last.
+/// ISO 7816-4 command chaining in 255-byte parts; the last part's response.
 fn send(
     c: &mut impl Apdu,
     [cla, ins, p1, p2]: [u8; 4],
@@ -92,8 +82,7 @@ fn select(c: &mut impl Apdu, aid: &[u8]) -> Result<Vec<u8>> {
     Ok(d)
 }
 
-/// The YubiKey's slot 2 HMAC-SHA1 of `challenge`, as ykman asks it: the
-/// challenge padded to 64 bytes with a byte unlike its last.
+/// As ykman asks: the challenge padded to 64 with a byte unlike its last.
 pub fn slot2(c: &mut impl Apdu, challenge: &[u8]) -> Result<Vec<u8>> {
     ensure!(challenge.len() <= 64, "a challenge is 64 bytes at most");
     let pad = (challenge.last() == Some(&0)) as u8;
@@ -107,8 +96,7 @@ pub fn slot2(c: &mut impl Apdu, challenge: &[u8]) -> Result<Vec<u8>> {
     Ok(r)
 }
 
-/// A FIDO2 key on a reader, for authenticator-rs: CTAP2's messages as
-/// NFCCTAP_MSG APDUs; the protocol (PIN, hmac-secret) is its own.
+/// A FIDO2 key on a reader for authenticator-rs: CTAP2 as NFCCTAP_MSG APDUs.
 pub struct Fido<C: Apdu = pcsc::Card> {
     card: C,
     info: Option<AuthenticatorInfo>,
@@ -121,11 +109,10 @@ impl<C: Apdu> Fido<C> {
         Fido { card, info: None, secret: None, ctap1: false }
     }
 
-    /// A CTAP2 command's answer: its status byte, then CBOR.
     fn cbor(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         let c = &mut self.card;
         let (mut d, mut sw) = send(c, [0x80, 0x10, 0x00, 0x00], msg)?;
-        // Still at it (a touch, a PIN): asked for the answer again.
+        // 9100: still working (a touch, a PIN); NFCCTAP_GETRESPONSE polls.
         while sw == 0x9100 {
             (d, sw) = send(c, [0x80, 0x11, 0x00, 0x00], &[])?;
         }
@@ -162,7 +149,6 @@ impl<C: Apdu> FidoDeviceIO for Fido<C> {
         msg.handle_response_ctap2(self, &r)
     }
 
-    /// U2F alone (CTAP1): not this way.
     fn send_ctap1_cancellable<Req: RequestCtap1>(
         &mut self,
         _: &Req,
@@ -210,7 +196,6 @@ impl<C: Apdu> FidoDevice for Fido<C> {
 mod tests {
     use super::*;
 
-    /// A card that answers from a script, and keeps what it was sent.
     #[derive(Default)]
     struct Script {
         sent: Vec<Vec<u8>>,
@@ -229,8 +214,6 @@ mod tests {
         Script { sent: vec![], replies }
     }
 
-    /// Slot 2 is asked as Yubico's own library asks it: INS 01, P1 38,
-    /// the challenge padded to 64 with a byte unlike its last; 20 back.
     #[test]
     fn slot_two_is_asked_as_ykman_asks() {
         let answer = [[7u8; 20].as_slice(), &[0x90, 0x00]].concat();
@@ -246,9 +229,7 @@ mod tests {
         assert!(slot2(&mut c, &[1; 32]).is_err());
     }
 
-    /// Long messages go in chained pieces; "still at it" (9100, its data
-    /// a keep-alive's, not the answer's) is asked again; a long answer
-    /// comes by GET RESPONSE.
+    /// 9100's data is a keep-alive, not part of the answer.
     #[test]
     fn apdus_chain_wait_and_fetch() {
         let c = script(&[
@@ -268,8 +249,6 @@ mod tests {
         assert_eq!(c.sent[3], [0x00, 0xC0, 0x00, 0x00, 0x01]);
     }
 
-    /// authenticator-rs takes a key on a reader as one on USB: it selects
-    /// FIDO and reads what the key can do (authenticatorGetInfo).
     #[test]
     fn authenticator_rs_drives_a_key_on_a_reader() {
         // {1: ["FIDO_2_0"], 3: aaguid}

@@ -16,18 +16,12 @@ import com.yubico.yubikit.yubiotp.YubiOtpSession
 import java.security.SecureRandom
 import java.util.Base64
 
-/*
- * Security keys by CTAP2 (FIDO2 without the network), its hmac-secret: the key holds a secret made on it that never leaves it,
- * and gives HMAC-SHA-256 of a salt under it. All of it is between this phone and the key, over NFC or
- * USB: no server, no account, no network; "pasa" below is a name on the key, not an address. Nothing
- * here or in Yubico's library opens a connection: android/no-network.sh checks both at every build.
- */
+// No network here or in Yubico's library: android/no-network.sh fails the build otherwise.
 private const val RP = "pasa"
 
 private fun rand(n: Int) = ByteArray(n).also { SecureRandom().nextBytes(it) }
 private fun b64(b: ByteArray) = Base64.getUrlEncoder().withoutPadding().encodeToString(b)
 
-/** What [use] makes of a security key at hand, said through [done]. */
 private fun <T> onFido(d: YubiKeyDevice, use: (Ctap2Client) -> T, done: (Result<T>) -> Unit) {
     val run = { session: () -> Ctap2Session ->
         done(runCatching { use(Ctap2Client(session(), listOf(HmacSecretExtension(true)))) }.recoverCatching { throw told(it) })
@@ -36,10 +30,9 @@ private fun <T> onFido(d: YubiKeyDevice, use: (Ctap2Client) -> T, done: (Result<
     else d.requestConnection(SmartCardConnection::class.java) { c -> run { Ctap2Session(c.value) } }
 }
 
-/** What [use] makes of the next security key tapped (NFC) or plugged in (USB). */
 private suspend fun <T> withFido(a: Activity, use: (Ctap2Client) -> T): T = withDevice(a) { d, done -> onFido(d, use, done) }
 
-/** What went wrong with a security key, for someone holding it; a key that did not answer is left to be said as that. */
+/** CTAP errors in the user's words; an IOException passes on, for [said]. */
 private fun told(e: Throwable): Throwable {
     val code = generateSequence(e) { it.cause }.filterIsInstance<CtapException>().firstOrNull()?.ctapError
     return when {
@@ -52,20 +45,18 @@ private fun told(e: Throwable): Throwable {
     }
 }
 
-/** What a key is asked to make: a credential for pasa that gives secrets (hmac-secret), with its PIN ([uv]) or not. */
 internal fun creation(uv: Boolean) = PublicKeyCredentialCreationOptions.fromMap(
     mapOf(
         "rp" to mapOf("id" to RP, "name" to RP),
         "user" to mapOf("id" to b64(rand(16)), "name" to RP, "displayName" to RP),
         "challenge" to b64(rand(32)),
         "pubKeyCredParams" to listOf(mapOf("type" to "public-key", "alg" to -7)),
-        // Not one of those a key has room for only a few of: the store keeps its id.
+        // Non-resident: keys hold few resident credentials, and the store keeps the id.
         "authenticatorSelection" to mapOf("residentKey" to "discouraged", "userVerification" to if (uv) "required" else "discouraged"),
         "extensions" to mapOf("hmacCreateSecret" to true),
     ),
 )
 
-/** What a key is asked for: its secret for [salt], if it holds one of [creds]. */
 internal fun request(creds: List<ByteArray>, salt: ByteArray, uv: Boolean) = PublicKeyCredentialRequestOptions.fromMap(
     mapOf(
         "challenge" to b64(rand(32)), "rpId" to RP,
@@ -75,7 +66,7 @@ internal fun request(creds: List<ByteArray>, salt: ByteArray, uv: Boolean) = Pub
     ),
 )
 
-/** The key's secret for [salt], and which of [creds] it is under: with its PIN ([uv]) or without, since the secret differs. */
+/** (credential, secret for [salt]); hmac-secret gives another secret with [uv] than without. */
 private fun secret(c: Ctap2Client, creds: List<ByteArray>, salt: ByteArray, uv: Boolean, pin: CharArray?): Pair<ByteArray, ByteArray> {
     val got = c.getAssertion(ClientDataProvider.fromHash(rand(32)), request(creds, salt, uv), RP, if (uv) pin else null, null)
     val out = (got.clientExtensionResults?.toMap(SerializationType.JSON)?.get("hmacGetSecret") as? Map<*, *>)?.get("output1") as? String
@@ -89,33 +80,27 @@ private fun pinOf(c: Ctap2Client, pin: String): CharArray? {
     return pin.toCharArray()
 }
 
-/** A new credential on the key tapped, and its secret for [salt]: the credential, whether its PIN went with it, the secret. */
+/** (credential, PIN used, secret for [salt]) of a new credential. */
 suspend fun fidoNew(a: Activity, salt: ByteArray, pin: String): Triple<ByteArray, Boolean, ByteArray> = withFido(a) { c ->
     val typed = pinOf(c, pin)
     val made = c.makeCredential(ClientDataProvider.fromHash(rand(32)), creation(typed != null), RP, typed, null, null)
     Triple(made.rawId, typed != null, secret(c, listOf(made.rawId), salt, typed != null, typed).second)
 }
 
-/** The secret of the key at hand, if it is one of [keys] (credential, whether its PIN goes with it): which, and the secret. */
 private fun ctapSecret(c: Ctap2Client, keys: List<Pair<ByteArray, Boolean>>, salt: ByteArray, pin: String): Pair<ByteArray, ByteArray> {
     val typed = if (keys.any { it.second }) pinOf(c, pin) else null
     val got = secret(c, keys.map { it.first }, salt, typed != null, typed)
-    // Added without its PIN and given one since (or the other way): its secret is another now.
     if (keys.first { it.first.contentEquals(got.first) }.second != (typed != null))
         throw Said("This key's PIN was set or removed since it was added: use the password, then add the key again.")
     return got
 }
 
-/** What a tapped key opens the store with: its slot 2 answer (the quick-unlock PIN comes next), or its CTAP2 secret. */
 sealed interface Tapped {
     class Slot2(val answer: ByteArray) : Tapped
     class Ctap(val cred: ByteArray, val secret: ByteArray) : Tapped
 }
 
-/**
- * Whatever the key tapped opens the store with, whichever kind it is: its slot 2 answer to [challenge]
- * (quick unlock, if that is on), else its CTAP2 secret if it is one of [keys]. One tap, tried in that order.
- */
+/** One tap: slot 2 first (quick unlock, if on), else CTAP2 if it is one of [keys]. */
 suspend fun anyKey(a: Activity, challenge: ByteArray?, salt: ByteArray?, keys: List<Pair<ByteArray, Boolean>>, pin: String): Tapped =
     withDevice(a) { d, done ->
         val ctap = { before: Throwable? ->

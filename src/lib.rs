@@ -1,13 +1,8 @@
-//! A store: `key` and `v/`. Every file sealed here is a standard
-//! age file to a random 256-bit key used as its passphrase (age's own
-//! scrypt recipient, at N = 2: the key needs no stretching). Symmetric,
-//! so post-quantum; `age -d` opens any of them; pasa implements no crypto.
-//!
-//! - `v/NAME`: one version of one entry, named by its hash: `ms parent
-//!   size name\n`, the body, padding. Files never change, so copies merge
-//!   by union. Size 0 deletes.
-//! - `key`: the store keys, newest first, sealed to Argon2id(password,
-//!   YubiKey response). A pairing hands it over as it is, never opened.
+//! `store/v/`: versions, named by hash, never changed, merged by union; each
+//! an age file to a random 256-bit store key as scrypt passphrase (N = 2),
+//! holding `ms parent size name\n`, body, padding (size 0 deletes). `key`:
+//! store keys, newest first, sealed to Argon2id(password, YubiKey). Only the
+//! newest key's versions are current; older keys' are history if frozen.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -36,7 +31,7 @@ const KDF: (u32, u32) = if cfg!(test) { (8, 1) } else { (256 << 10, 4) };
 
 pub fn rand<const N: usize>() -> [u8; N] {
     let mut b = [0; N];
-    // No randomness from the system: nothing here may go on without it.
+    // No safe fallback without OS randomness.
     #[allow(clippy::expect_used)]
     getrandom::fill(&mut b).expect("os randomness");
     b
@@ -52,8 +47,7 @@ fn pass(k: &[u8]) -> SecretString {
     SecretString::from(HEXLOWER.encode(k))
 }
 
-/// The age identity of a random key: files at N = 2 only, so no file can
-/// make us run a costly scrypt.
+/// Opens N = 2 files only, so no file can make us run a costly scrypt.
 fn identity(k: &[u8]) -> age::scrypt::Identity {
     let mut i = age::scrypt::Identity::new(pass(k));
     i.set_max_work_factor(1);
@@ -66,7 +60,7 @@ fn recipient(k: &[u8]) -> age::scrypt::Recipient {
     r
 }
 
-/// Any one of several keys (age stops at the first passphrase that fails).
+/// Tries each key: age stops at the first scrypt passphrase that fails.
 struct AnyOf<'a>(&'a [age::scrypt::Identity]);
 
 impl age::Identity for AnyOf<'_> {
@@ -97,19 +91,16 @@ fn reader<'a, R: Read + 'a>(
     Ok(d.decrypt(std::iter::once(&AnyOf(ids) as &dyn age::Identity))?)
 }
 
-/// `pt` sealed to key `k`.
 pub(crate) fn seal(k: &[u8], pt: &[u8]) -> Result<Vec<u8>> {
     encrypt(&recipient(k), pt)
 }
 
-/// What `seal` sealed to `k`.
 pub(crate) fn open(k: &[u8], ct: &[u8]) -> Option<Secret> {
     let mut out = Zeroizing::new(vec![]);
     reader(&[identity(k)], ct).ok()?.read_to_end(&mut out).ok()?;
     Some(out)
 }
 
-/// A version's file name: 128 bits of its SHA-256.
 pub fn name_of(b: &[u8]) -> String {
     HEXLOWER.encode(&Sha256::digest(b)[..16])
 }
@@ -118,10 +109,7 @@ pub fn is_name(n: &str) -> bool {
     n.len() == 32 && n.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The versions: `store/v/`, beside the store's git repository, if one is
-/// made (`store/.git`), and apart from the keys: git's whole world is
-/// ciphertext. Moved from `v/`, where they lay before, the first time asked
-/// (one by one, if something made `store/v/` first).
+/// In `store/`, where git holds only ciphertext; moves a legacy `v/` there.
 pub fn versions(dir: &Path) -> PathBuf {
     let (v, old) = (dir.join("store").join("v"), dir.join("v"));
     if old.is_dir() {
@@ -141,7 +129,6 @@ pub fn home() -> PathBuf {
     std::env::var_os("PASA_DIR").map_or_else(h, PathBuf::from)
 }
 
-/// Whole or not at all, owner-only, durable.
 pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     let dir = p.parent().context("no directory")?;
     fs::create_dir_all(dir)?;
@@ -157,30 +144,31 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Where a rotation leaves word, sealed to the key it retires, for the
-/// devices still on it (hidden: a name part begins with a dot).
+const OWN: &str = ".pasa/";
+
+/// Notice of a retired key, sealed to that key: `RETIRED` + [`key_id`].
 const RETIRED: &str = ".pasa/retired/";
 
-/// What a device on a retired key is told, and why it writes nothing.
-pub const RETIRED_SAY: &str = "this device's store key was retired on \
-    another device (a revocation): pair again from it; nothing more is \
-    written under the old key";
+/// Written by a rotation under its new key: SHA-256 of each file then trusted.
+/// Older keys' versions count only if listed.
+const HISTORY: &str = ".pasa/history";
 
-/// A store key's name in such word: 128 bits of its SHA-256.
+pub const RETIRED_SAY: &str = "this device's store key was retired: if you \
+    revoked a device, pair this one again from where you did; if not, \
+    revoke here the device you suspect and pair the others from here";
+
 fn key_id(k: &[u8]) -> String {
     HEXLOWER.encode(&Sha256::digest(k)[..16])
 }
 
-/// What is said where there is no store yet: both ways to have one.
 pub const NO_STORE: &str = "no store here: pasa init makes one; or pasa join \
     NAME CODE takes one from a device that has it (pasa pair NAME there)";
 
-/// The YubiKey challenge in a key file, if it has one.
+/// `key`: salt (the YubiKey challenge if byte 32 is 1), that byte, sealed keys.
 pub fn challenge(key: &[u8]) -> Option<&[u8]> {
     (key.get(32) == Some(&1)).then(|| &key[..32])
 }
 
-/// Argon2id(password, salt), with the YubiKey's response as its secret.
 fn kek(pw: &[u8], salt: &[u8], yk: Option<&[u8]>) -> Result<Secret> {
     let e = anyhow::Error::msg;
     let p = Params::new(KDF.0, KDF.1, 1, Some(32)).map_err(e)?;
@@ -190,8 +178,7 @@ fn kek(pw: &[u8], salt: &[u8], yk: Option<&[u8]>) -> Result<Secret> {
     Ok(k)
 }
 
-/// A plaintext's padded length: a power of two to 64 KiB, then 64 KiB
-/// steps; what a file's size tells is bounded.
+/// Bounds what a file's size reveals.
 fn padded(n: usize) -> usize {
     match n.max(256).next_power_of_two() {
         p if p <= 64 << 10 => p,
@@ -199,15 +186,13 @@ fn padded(n: usize) -> usize {
     }
 }
 
-/// One version's head.
 #[derive(Clone)]
 pub struct Version {
     pub ms: u64,
     pub size: usize,
     pub name: String,
-    /// The version of this entry it followed ("-": none).
+    /// File of the version this followed, or "-".
     pub parent: String,
-    /// Its file in `v/`.
     pub file: String,
 }
 
@@ -231,18 +216,30 @@ impl Version {
     }
 }
 
-/// `v/` as read: heads by file, `v/`'s mtime then, and what a lookup or a
-/// new version needs without a pass over every head: each entry's newest
-/// version (its time and file) and the latest time of all.
+/// Cache of `v/`'s heads by file, refreshed when its mtime changes.
 #[derive(Default)]
 struct Index {
+    /// Under the newest key: the store as it is.
     heads: HashMap<String, Version>,
+    /// Under older keys, with their files' SHA-256: history if frozen.
+    old: HashMap<String, (Version, [u8; 32])>,
+    frozen: HashSet<[u8; 32]>,
     mtime: Option<SystemTime>,
     tips: HashMap<String, (u64, String)>,
     last: u64,
 }
 
+fn sorted<'a>(vs: impl Iterator<Item = &'a Version>) -> Vec<Version> {
+    let mut out: Vec<Version> = vs.cloned().collect();
+    out.sort_by(|a, b| (a.ms, &a.name, &a.file).cmp(&(b.ms, &b.name, &b.file)));
+    out
+}
+
 impl Index {
+    fn past(&self) -> impl Iterator<Item = &(Version, [u8; 32])> {
+        self.old.values().filter(|(_, d)| self.frozen.contains(d))
+    }
+
     fn tip(&mut self, v: &Version) {
         let t = (v.ms, v.file.clone());
         match self.tips.get_mut(&v.name) {
@@ -256,9 +253,8 @@ impl Index {
 
 pub struct Store {
     pub dir: PathBuf,
-    /// [`versions`].
     v: PathBuf,
-    /// Store keys, newest first: older ones open history.
+    /// Newest first; older ones open history.
     keys: Vec<Secret>,
     ids: Vec<age::scrypt::Identity>,
     newest: age::scrypt::Recipient,
@@ -267,7 +263,6 @@ pub struct Store {
     /// The key file as read or last written: never overwrite a newer one.
     loaded: Mutex<Vec<u8>>,
     index: Mutex<Index>,
-    /// Files the last listing found that no store key opens.
     pub unreadable: AtomicUsize,
 }
 
@@ -292,7 +287,6 @@ impl Store {
         })
     }
 
-    /// A new store key, hedged with the password.
     pub fn create(
         dir: &Path,
         pw: &[u8],
@@ -305,7 +299,6 @@ impl Store {
         Ok(s)
     }
 
-    /// Open with the password and, if `key` asks, the YubiKey's response.
     pub fn open(dir: &Path, pw: &[u8], yk: Option<&[u8]>) -> Result<Store> {
         let f = fs::read(dir.join("key")).context(NO_STORE)?;
         let salt = f.get(..32).context("not a pasa key file")?;
@@ -313,10 +306,6 @@ impl Store {
             .context("wrong password or key")
     }
 
-    /// Open by a YubiKey's answer and the PIN, if [`quick_on`] set them:
-    /// they open the key the password opens.
-    ///
-    /// [`quick_on`]: Store::quick_on
     pub fn open_quick(dir: &Path, pin: &[u8], yk: &[u8]) -> Result<Store> {
         let f = fs::read(dir.join("quick")).context("quick unlock is off")?;
         let (head, sealed) =
@@ -327,11 +316,7 @@ impl Store {
             .context("quick unlock is out of date: use the password")
     }
 
-    /// Let this device open the store by a YubiKey's answer to `challenge`
-    /// and a PIN (empty: none), beside the password: `quick` holds the key
-    /// the password opens, sealed to them. With the device's storage and
-    /// the YubiKey a PIN is guessed in days, so the password, which opens
-    /// the store alone, must be long.
+    /// `quick`: `challenge`, PIN flag, the KEK sealed to Argon2id(`pin`, `yk`).
     pub fn quick_on(
         &self,
         pin: &[u8],
@@ -345,17 +330,11 @@ impl Store {
         write(&self.dir.join("quick"), &quick)
     }
 
-    /// The salt security keys are asked with on this device: made at the
-    /// first key, the same for every one after.
     pub fn fido_salt(&self) -> Vec<u8> {
         fido(&self.dir).map_or_else(|| rand::<32>().to_vec(), |f| f.salt)
     }
 
-    /// Let the security key with credential `cred` open the store on this
-    /// device, with its PIN or not: the key the password opens is sealed
-    /// to `secret`, the key's answer (32 bytes, never leaving the key but
-    /// so) to `salt` ([`Store::fido_salt`]). A key is added at any time
-    /// the store is open; the others stay.
+    /// Seals the KEK to `secret`: the key's hmac-secret answer to `salt`.
     pub fn fido_add(
         &self,
         salt: &[u8],
@@ -377,7 +356,6 @@ impl Store {
         write(&at, (lines.join("\n") + "\n").as_bytes())
     }
 
-    /// Open by the answer of the security key with credential `cred`.
     pub fn open_fido(dir: &Path, cred: &[u8], secret: &[u8]) -> Result<Store> {
         let f =
             fs::read_to_string(dir.join("ctap")).context("no security key")?;
@@ -390,7 +368,6 @@ impl Store {
             .context("the security key is out of date: use the password")
     }
 
-    /// With the key the password gives.
     fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
         let f = fs::read(dir.join("key")).context(NO_STORE)?;
         let (salt, sealed) =
@@ -405,7 +382,7 @@ impl Store {
         Store::new(dir, keys, kek, salt.to_vec())
     }
 
-    /// Seal the keys to `pw` and a YubiKey's (challenge, response).
+    /// `yk`: a YubiKey's (challenge, response); the challenge is the salt.
     pub fn lock(
         &mut self,
         pw: &[u8],
@@ -415,14 +392,13 @@ impl Store {
         self.salt = [&salt[..], &[yk.is_some() as u8]].concat();
         self.kek = kek(pw, &salt, yk.map(|c| c.1))?;
         self.save()?;
-        // What quick unlock held opens the old lock only.
+        // quick and ctap hold the old KEK.
         let _ = fs::remove_file(self.dir.join("quick"));
         let _ = fs::remove_file(self.dir.join("ctap"));
         Ok(())
     }
 
-    /// Write `key` under a lock, unless it changed since we read it
-    /// (another process rotated, relocked or paired: unlock again).
+    /// Refuses if another process rewrote `key` since it was read.
     pub(crate) fn save(&self) -> Result<()> {
         fs::create_dir_all(&self.dir)?;
         let mut lock = fs::OpenOptions::new();
@@ -431,8 +407,7 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(self.dir.join("key.lock"))?;
-        // One writer at a time, across processes. Android's std has no file
-        // lock; an app there is one process, and `loaded` orders its threads.
+        // Android's std has no file lock; one process there, `loaded` suffices.
         match lock.lock() {
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
             locked => locked?,
@@ -457,14 +432,13 @@ impl Store {
         &self.keys
     }
 
-    /// The store keys, as `age -d` asks for them (passphrases).
     pub fn passphrases(&self) -> Zeroizing<String> {
         Zeroizing::new(
             self.keys.iter().map(|k| HEXLOWER.encode(k) + "\n").collect(),
         )
     }
 
-    /// Add keys a rotation made elsewhere (newest first): whether any was new.
+    /// Keys a rotation made elsewhere, newest first; true if any was new.
     pub(crate) fn add_keys(&mut self, ks: &[u8]) -> Result<bool> {
         let new: Vec<_> = ks
             .chunks(32)
@@ -476,29 +450,33 @@ impl Store {
         }
         if !new.is_empty() {
             self.newest = recipient(&self.keys[0]);
+            // Which versions are current depends on the newest key.
+            *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+                Index::default();
             self.save()?;
         }
         Ok(!new.is_empty())
     }
 
-    /// A new store key, first; every entry sealed again to it. History
-    /// stays under the keys it was written to. Devices still on the old key
-    /// find word of it, sealed to that key, at their next sync, and write
-    /// nothing more under it ([`Store::retired`]): they pair again.
+    /// Notice under the old key; [`HISTORY`] and entries under a new one.
     pub fn rotate(&mut self) -> Result<()> {
-        let e = self
-            .entries()?
-            .into_values()
-            .map(|v| Ok((v.name.clone(), self.body(&v)?)));
+        let e = self.entries()?.into_values().map(|v| Ok((self.body(&v)?, v)));
         let e = e.collect::<Result<Vec<_>>>()?;
         let old = key_id(self.keys.first().context("no store key")?);
         self.put(&format!("{RETIRED}{old}"), b"retired")?;
+        let x = self.index()?;
+        let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
+        let now: Vec<String> = x.heads.keys().cloned().collect();
+        drop(x);
+        for f in now {
+            frozen.extend(Sha256::digest(fs::read(self.v.join(f))?));
+        }
         self.add_keys(&rand::<32>())?;
-        e.iter().try_for_each(|(n, b)| self.put(n, b))
+        self.put_on(HISTORY, &frozen, None)?;
+        let mut e = e.iter();
+        e.try_for_each(|(b, v)| self.put_on(&v.name, b, Some(v.file.clone())))
     }
 
-    /// Whether this device's store key was retired by a rotation on
-    /// another device (a revocation): nothing more is written under it.
     pub fn retired(&self) -> bool {
         let Some(k) = self.keys.first() else { return false };
         let at = format!("{RETIRED}{}", key_id(k));
@@ -509,22 +487,28 @@ impl Store {
         reader(&self.ids, fs::File::open(self.v.join(file))?)
     }
 
-    fn head(&self, file: &str) -> Option<Version> {
-        let mut l = String::new();
-        std::io::BufReader::new(self.version(file).ok()?)
-            .read_line(&mut l)
-            .ok()?;
-        Version::parse(l.strip_suffix('\n')?, file)
+    /// A version's head, and its file's SHA-256 if an older key opened it.
+    fn head(&self, file: &str) -> Option<(Version, Option<[u8; 32]>)> {
+        let line = |r| {
+            let mut l = String::new();
+            std::io::BufReader::new(r).read_line(&mut l).ok()?;
+            Version::parse(l.strip_suffix('\n')?, file)
+        };
+        let (newest, older) = self.ids.split_first()?;
+        let f = fs::File::open(self.v.join(file)).ok()?;
+        if let Ok(r) = reader(std::slice::from_ref(newest), f) {
+            return Some((line(Box::new(r) as Box<dyn Read>)?, None));
+        }
+        let b = fs::read(self.v.join(file)).ok()?;
+        let r = reader(older, &b[..]).ok()?;
+        Some((line(Box::new(r))?, Some(Sha256::digest(&b).into())))
     }
 
-    /// `v/` as it is now: new files' heads read, gone ones dropped. Files
-    /// no store key opens are counted in [`Store::unreadable`].
     fn index(&self) -> Result<std::sync::MutexGuard<'_, Index>> {
         let mut x = self.index.lock().unwrap_or_else(|p| p.into_inner());
         let v = self.v.clone();
         let mtime = fs::metadata(&v).and_then(|m| m.modified()).ok();
-        // A listing made within the directory's own two seconds may be
-        // behind it (a sync writes beside us, in the same tick).
+        // mtime granularity: a write in the same tick may not change it.
         let settled = |m: &SystemTime| {
             m.elapsed().is_ok_and(|e| e > std::time::Duration::from_secs(2))
         };
@@ -541,12 +525,15 @@ impl Store {
             .filter_map(|e| e.file_name().into_string().ok());
         let names: HashSet<String> = names.filter(|n| is_name(n)).collect();
         x.heads.retain(|f, _| names.contains(f));
+        x.old.retain(|f, _| names.contains(f));
         let mut bad = 0;
-        let new: Vec<&String> =
-            names.iter().filter(|n| !x.heads.contains_key(*n)).collect();
+        let known =
+            |n: &&String| x.heads.contains_key(*n) || x.old.contains_key(*n);
+        let new: Vec<&String> = names.iter().filter(|n| !known(n)).collect();
         for n in new {
             match self.head(n) {
-                Some(h) => drop(x.heads.insert(n.clone(), h)),
+                Some((h, None)) => drop(x.heads.insert(n.clone(), h)),
+                Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
                 None => bad += 1,
             }
         }
@@ -556,17 +543,17 @@ impl Store {
         let heads = std::mem::take(&mut x.heads);
         heads.values().for_each(|v| x.tip(v));
         x.heads = heads;
+        let h = x.tips.get(HISTORY).and_then(|t| x.heads.get(&t.1));
+        let h = h.and_then(|v| self.body(v).ok()).unwrap_or_default();
+        x.frozen =
+            h.chunks_exact(32).filter_map(|d| d.try_into().ok()).collect();
         Ok(x)
     }
 
-    /// Every version's head, oldest first.
+    /// Oldest first, frozen history included.
     pub fn versions(&self) -> Result<Vec<Version>> {
-        let mut out: Vec<Version> =
-            self.index()?.heads.values().cloned().collect();
-        out.sort_by(|a, b| {
-            (a.ms, &a.name, &a.file).cmp(&(b.ms, &b.name, &b.file))
-        });
-        Ok(out)
+        let x = self.index()?;
+        Ok(sorted(x.heads.values().chain(x.past().map(|(v, _)| v))))
     }
 
     pub fn body(&self, v: &Version) -> Result<Secret> {
@@ -576,28 +563,24 @@ impl Store {
             .context("damaged version")?;
         let at =
             b.iter().position(|&c| c == b'\n').context("damaged version")? + 1;
-        // A size from another device: no sum that can overflow.
+        // `size` comes from another device: no sum that can overflow.
         let body = b.get(at..).and_then(|b| b.get(..v.size));
         Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
     }
 
-    /// Each entry's newest version, deleted ones left out.
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
-        let mut m: BTreeMap<_, _> =
-            self.versions()?.into_iter().map(|v| (v.name.clone(), v)).collect();
-        // Word of retired keys is the store's own, not an entry.
-        m.retain(|n, v| v.size > 0 && !n.starts_with(RETIRED));
-        Ok(m)
+        let x = self.index()?;
+        let tips = x.tips.values().filter_map(|t| x.heads.get(&t.1));
+        let live = tips.filter(|v| v.size > 0 && !v.name.starts_with(OWN));
+        Ok(live.map(|v| (v.name.clone(), v.clone())).collect())
     }
 
-    /// The names of the files attached to entry `name`.
     pub fn files(&self, name: &str) -> Result<Vec<String>> {
         let at = format!("{name}{FILES}");
         let all = self.entries()?.into_keys();
         Ok(all.filter_map(|n| n.strip_prefix(&at).map(String::from)).collect())
     }
 
-    /// Delete entry `name` and what is attached to it.
     pub fn remove(&self, name: &str) -> Result<()> {
         for f in self.files(name)? {
             self.put(&format!("{name}{FILES}{f}"), b"")?;
@@ -605,7 +588,6 @@ impl Store {
         self.put(name, b"")
     }
 
-    /// Entry `from` and what is attached to it, as `to`.
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         ensure!(self.get(to).is_err(), "{to} exists");
         for f in self.files(from)? {
@@ -616,14 +598,13 @@ impl Store {
         self.remove(from)
     }
 
-    /// When entry `name` was made and last changed, in milliseconds.
+    /// (created, changed), in ms.
     pub fn times(&self, name: &str) -> Result<Option<(u64, u64)>> {
         let ms = self.versions()?.into_iter().filter(|v| v.name == name);
         let ms: Vec<u64> = ms.map(|v| v.ms).collect();
         Ok(ms.first().copied().zip(ms.last().copied()))
     }
 
-    /// Weak (under 65 bits by [`strength`]), shared and expired passwords.
     pub fn health(&self) -> Result<Health> {
         let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let (mut h, today) = (Health::default(), today());
@@ -644,7 +625,6 @@ impl Store {
         Ok(h)
     }
 
-    /// Every listed entry as its form.
     fn forms(&self) -> Result<Vec<(String, Form)>> {
         let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
         let names = self.entries()?.into_keys().filter(shown);
@@ -655,7 +635,6 @@ impl Store {
         names.map(form).collect()
     }
 
-    /// The store in numbers: what each counts, and the count.
     pub fn stats(&self) -> Result<Vec<(&'static str, String)>> {
         let (forms, h) = (self.forms()?, self.health()?);
         let versions = self.versions()?;
@@ -707,25 +686,22 @@ impl Store {
         ])
     }
 
-    /// Entry `name`'s versions and their bodies, newest first.
     pub fn history(&self, name: &str) -> Result<Vec<(u64, Secret)>> {
         let mut vs = self.versions()?;
         vs.retain(|v| v.name == name);
         vs.iter().rev().map(|v| Ok((v.ms, self.body(v)?))).collect()
     }
 
-    /// Entries whose newest version did not follow the one before it: two
-    /// devices changed them apart. The other change is in `pasa log`.
+    /// Entries whose newest version's parent is not the one before it.
     pub fn conflicts(&self) -> Result<Vec<String>> {
         let mut last: BTreeMap<String, (String, bool)> = BTreeMap::new();
-        for v in self.versions()? {
+        for v in sorted(self.index()?.heads.values()) {
             let split = last.get(&v.name).is_some_and(|p| p.0 != v.parent);
             last.insert(v.name.clone(), (v.file, split));
         }
         Ok(last.into_iter().filter(|(_, (_, c))| *c).map(|(n, _)| n).collect())
     }
 
-    /// An entry's body: its newest version, found without sorting the rest.
     pub fn get(&self, name: &str) -> Result<Secret> {
         let x = self.index()?;
         let v = x.tips.get(name).and_then(|t| x.heads.get(&t.1));
@@ -735,20 +711,28 @@ impl Store {
         self.body(&v)
     }
 
-    /// A new version of `name` (empty: deleted): after every version seen,
-    /// following the newest of `name`.
+    /// Empty `body` deletes; dated after every version seen.
     pub fn put(&self, name: &str, body: &[u8]) -> Result<()> {
+        self.put_on(name, body, None)
+    }
+
+    /// `parent`: for a rotation, the version under the retired key.
+    fn put_on(
+        &self,
+        name: &str,
+        body: &[u8],
+        parent: Option<String>,
+    ) -> Result<()> {
         let mut x = self.index()?;
-        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let tip = || x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let parent = parent.unwrap_or_else(tip);
         let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
         let ms = now.max(x.last.saturating_add(1));
         self.keep(&mut x, name, body, ms, parent)
     }
 
-    /// A version of `name` as it was at `at` (milliseconds): an import's.
-    /// It takes its place among the others by time and follows the one
-    /// before it; dated in the newest one's second, it follows that one.
-    /// The same text in the same second is not kept twice.
+    /// An import, dated `at` ms. The same body in the same second is kept once;
+    /// one in the newest version's second goes just after it.
     pub fn put_at(&self, name: &str, body: &[u8], at: u64) -> Result<()> {
         let mut x = self.index()?;
         let named = |v: &&Version| v.name == name;
@@ -782,9 +766,7 @@ impl Store {
     ) -> Result<()> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
-        // Nothing more under a key that may be retired: one a rotation or
-        // relock here replaced since this unlock, or one another device
-        // retired (word of it came by sync).
+        // Never write under a key that may be retired, here or by sync.
         let loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
         let now = fs::read(self.dir.join("key")).unwrap_or_default();
         ensure!(
@@ -823,27 +805,18 @@ impl Store {
     }
 }
 
-/// Quick unlock on this device, if it is on: the YubiKey's challenge, and
-/// whether a PIN goes with its answer.
+/// (YubiKey challenge, PIN?) if quick unlock is on.
 pub fn quick(dir: &Path) -> Option<(Vec<u8>, bool)> {
     let f = fs::read(dir.join("quick")).ok()?;
     Some((f.get(..32)?.to_vec(), *f.get(32)? == 1))
 }
 
-/// The security keys that open the store on this device, beside the
-/// password, by CTAP2 (`hmac-secret`): the half of FIDO2 that is between a
-/// device and a key, with nothing of the half that is between a browser
-/// and a server. No connection is made for it, here or in what it calls.
-/// What they are asked with: the salt each is asked with, and
-/// for each its credential and whether its PIN goes with it. The file
-/// `ctap`: the salt, then a line a key (credential, PIN, the key the
-/// password opens sealed to that key's secret), all hex.
+/// `ctap`: the salt, then per key: credential, PIN flag, sealed KEK; all hex.
 pub struct Fido {
     pub salt: Vec<u8>,
     pub keys: Vec<(Vec<u8>, bool)>,
 }
 
-/// One line of `ctap`: credential, PIN, sealed.
 fn fido_line(l: &str) -> Option<(Vec<u8>, bool, Vec<u8>)> {
     let mut p = l.split(' ');
     let hex = |p: Option<&str>| HEXLOWER.decode(p?.as_bytes()).ok();
@@ -858,13 +831,11 @@ pub fn fido(dir: &Path) -> Option<Fido> {
     (salt.len() == 32 && !keys.is_empty()).then_some(Fido { salt, keys })
 }
 
-/// `b` after its length (4 bytes, big-endian), onto `out`.
 pub fn frame(out: &mut Vec<u8>, b: &[u8]) {
     out.extend((b.len() as u32).to_be_bytes());
     out.extend(b);
 }
 
-/// The next of what [`frame`] framed, `b` moved past it.
 pub fn unframe<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
     let (n, rest) = b.split_first_chunk::<4>()?;
     let (f, rest) = rest.split_at_checked(u32::from_be_bytes(*n) as usize)?;
@@ -872,8 +843,7 @@ pub fn unframe<'a>(b: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(f)
 }
 
-/// The file `ctap` in half the room, for a pairing: frames of its salt,
-/// then of each key's credential, PIN (a byte) and sealed key.
+/// `ctap` as frames, half the size, for pairing.
 pub fn ctap_packed(text: &str) -> Option<Vec<u8>> {
     let mut l = text.lines();
     let mut out = vec![];
@@ -886,7 +856,6 @@ pub fn ctap_packed(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The file `ctap` again, from what [`ctap_packed`] made.
 pub fn ctap_unpacked(mut b: &[u8]) -> Option<String> {
     let mut out = HEXLOWER.encode(unframe(&mut b)?) + "\n";
     while !b.is_empty() {
@@ -897,8 +866,7 @@ pub fn ctap_unpacked(mut b: &[u8]) -> Option<String> {
     Some(out)
 }
 
-/// The security key with credential `cred` opens nothing here any more;
-/// `None`: none does.
+/// `None` removes every key.
 pub fn fido_off(dir: &Path, cred: Option<&[u8]>) -> Result<()> {
     let at = dir.join("ctap");
     let f = fs::read_to_string(&at).unwrap_or_default();
@@ -915,7 +883,7 @@ pub fn fido_off(dir: &Path, cred: Option<&[u8]>) -> Result<()> {
     }
 }
 
-/// One of `abc`, each as likely as the next.
+/// Uniform, by rejection sampling.
 fn pick(abc: &[u8]) -> char {
     let fair = 256 - 256 % abc.len();
     loop {
@@ -935,8 +903,6 @@ pub fn generate(len: usize, symbols: bool) -> String {
     (0..len).map(|_| pick(&abc)).collect()
 }
 
-/// `pass`: line 1; `otp`: the code of an otpauth://totp/ URI; else
-/// `key: value`.
 pub fn field(body: &str, f: &str) -> Option<String> {
     let mut l = body.lines();
     match f {
@@ -952,10 +918,6 @@ pub fn field(body: &str, f: &str) -> Option<String> {
     }
 }
 
-// A syllable is an onset, a vowel and a coda: 5 + 3 + 3 bits. The
-// consonants between two vowels split into a coda and an onset one way
-// only (tested), so a password reads back as one sequence: the bits
-// counted are the bits there.
 const ONSETS: [&str; 32] = [
     "b", "c", "d", "f", "g", "h", "j", "k", "p", "s", "t", "v", "bl", "br",
     "ch", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "pl", "pr", "sh", "sk",
@@ -964,15 +926,11 @@ const ONSETS: [&str; 32] = [
 const VOWELS: [&str; 8] = ["a", "e", "i", "o", "u", "ai", "ee", "ou"];
 const CODAS: [&str; 8] = ["", "n", "m", "l", "r", "ng", "rn", "ll"];
 
-/// The symbols that may stand between speakable words: sixteen, none a
-/// letter's 1337 form.
+/// Sixteen (4 bits), none a 1337 letter, so leet reads back.
 pub const SEPS: &str = "-_.!#%&*+=?^~,:;";
 
-/// A password to say aloud: `words` made-up words of two syllables, 22
-/// bits each (four: 88). Between two words stands one of `seps`, drawn
-/// anew each time (snur-deslat_genres); none: SnurDeslatGenres. `leet`:
-/// a e l o s t are, one time in two, @ 3 1 0 $ 7, which stand nowhere
-/// else, so nothing is lost; a capital stays a letter.
+/// `words` two-syllable words, 22 bits each, joined by fresh picks of `seps`
+/// (none: capitalised). `leet`: a e l o s t become @ 3 1 0 $ 7 at p = 1/2.
 pub fn speakable(words: usize, seps: &str, leet: bool) -> String {
     let word = |i| {
         let mut w = String::new();
@@ -1001,19 +959,13 @@ pub fn speakable(words: usize, seps: &str, leet: bool) -> String {
     (0..words).map(word).collect()
 }
 
-/// The bits of chance in [`speakable`]: its words', and its separators'.
 pub fn speakable_bits(words: usize, seps: &str) -> u32 {
     let gaps = words.saturating_sub(1) as f64;
     22 * words as u32 + (gaps * (seps.len().max(1) as f64).log2()) as u32
 }
 
-/// Where an entry's attachments are: entries of their own, hidden from
-/// listings, so they sync, keep their history and are deleted as any other.
 pub const FILES: &str = "/.files/";
 
-/// What a health check finds: entries whose password is weak, with its
-/// bits; those sharing a password, group by group; those past their
-/// `expires` date.
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Health {
     pub weak: Vec<(String, u32)>,
@@ -1021,9 +973,7 @@ pub struct Health {
     pub expired: Vec<String>,
 }
 
-/// What a guesser tries before letters: the 10,000 commonest passwords, by
-/// rank (SecLists, MIT), and the 7,776 words of EFF's long list (CC BY 3.0),
-/// each with the bits it is worth.
+/// Top 10,000 passwords by rank (SecLists, MIT); EFF long list (CC BY 3.0).
 static WORDS: LazyLock<HashMap<&'static str, f64>> = LazyLock::new(|| {
     let eff = include_str!("words/eff.txt").lines().map(|w| (w, 12.925));
     let rank = |(i, w)| (w, ((i + 2) as f64).log2());
@@ -1036,7 +986,6 @@ static WORDS: LazyLock<HashMap<&'static str, f64>> = LazyLock::new(|| {
     m
 });
 
-/// The syllables [`speakable`] builds its words of: 2,048, 11 bits each.
 static SYLLABLES: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let mut all = HashSet::new();
     for (o, v) in ONSETS.iter().flat_map(|o| VOWELS.map(|v| (o, v))) {
@@ -1045,14 +994,7 @@ static SYLLABLES: LazyLock<HashSet<String>> = LazyLock::new(|| {
     all
 });
 
-/// A guess at the bits in a typed password: the cheapest way to spell it
-/// from common passwords (by rank), dictionary words (13 bits; a capital
-/// or 1337 costs a little more), the syllables of [`speakable`] (11 bits:
-/// a made-up word is worth what went into it, not its letters) and single
-/// characters (by the alphabets used; one next to its neighbour, as in abc
-/// or 111, costs one bit; a separator at most four). An estimate, made
-/// from the password as it stands: only a generator knows the bits it
-/// used. Under 40 is poor, under 65 weak, under 100 good.
+/// Estimated bits: the cheapest parse of `pw`.
 pub fn strength(pw: &str) -> u32 {
     let cs: Vec<char> = pw.chars().collect();
     let has = |f: fn(&char) -> bool| cs.iter().any(f);
@@ -1077,15 +1019,13 @@ pub fn strength(pw: &str) -> u32 {
     let mut best = vec![0.0f64; cs.len() + 1];
     for i in 1..=cs.len() {
         let near = i >= 2 && (cs[i - 1] as i64 - cs[i - 2] as i64).abs() <= 1;
-        // Between two letters: what words are held apart with.
+        // A separator between letters costs at most a SEPS pick (4 bits).
         let letter =
             |j: usize| cs.get(j).is_some_and(char::is_ascii_alphabetic);
         let sep =
             SEPS.contains(cs[i - 1]) && i >= 2 && letter(i - 2) && letter(i);
         let one = if sep { each.min(4.0) } else { each };
         best[i] = best[i - 1] + if near { 1.0 } else { one };
-        // A syllable, spelt as `speakable` spells it: a capital or a
-        // 1337 letter is one bit more.
         for len in 2..=i.min(6) {
             let part = &cs[i - len..i];
             let (mut plain, mut odd) = (String::new(), 0.0);
@@ -1116,15 +1056,13 @@ pub fn strength(pw: &str) -> u32 {
     best[cs.len()] as u32
 }
 
-/// Today as YYYY-MM-DD: what an `expires` date is held against.
+/// UTC, as YYYY-MM-DD.
 pub fn today() -> String {
     let now = humantime::format_rfc3339_seconds(SystemTime::now());
     now.to_string()[..10].into()
 }
 
-/// How often a local copy of haveibeenpwned's passwords holds `pw`:
-/// `file` is its `HASH:COUNT` lines ordered by hash, as its downloader
-/// writes them. Nothing leaves the machine.
+/// Binary search of a local HIBP file: `SHA1:COUNT` lines sorted by hash.
 pub fn pwned_file(file: &Path, pw: &str) -> Result<u64> {
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let (sent, kept) = pwned_key(pw);
@@ -1132,7 +1070,7 @@ pub fn pwned_file(file: &Path, pw: &str) -> Result<u64> {
     let mut f = BufReader::new(fs::File::open(file)?);
     let (mut lo, mut hi) = (0, f.get_ref().metadata()?.len());
     let mut line = String::new();
-    // The line that starts at or after the middle: before or after `want`?
+    // Bisect bytes: compare the first whole line at or after `mid`.
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         f.seek(SeekFrom::Start(mid))?;
@@ -1155,34 +1093,29 @@ pub fn pwned_file(file: &Path, pw: &str) -> Result<u64> {
     Ok(0)
 }
 
-/// For haveibeenpwned's range search: the 5 hex digits of the password's
-/// SHA-1 that are sent, and the 35 that are not.
+/// HIBP range query: the 5 hex digits of SHA-1 sent, the 35 kept.
 pub fn pwned_key(pw: &str) -> (String, String) {
     use sha1::Digest;
     let h = data_encoding::HEXUPPER.encode(&sha1::Sha1::digest(pw.as_bytes()));
     (h[..5].into(), h[5..].into())
 }
 
-/// How many breaches' worth of `rest` the range's answer `text` lists.
 pub fn pwned_count(rest: &str, text: &str) -> u64 {
     let hit =
         |l: &str| l.trim().strip_prefix(rest)?.strip_prefix(':')?.parse().ok();
     text.lines().find_map(hit).unwrap_or(0)
 }
 
-/// An entry's text as the fields a form shows: the password (line 1),
-/// `user:`, `url:`, the otpauth URI's line, and every other line.
+/// Password on line 1, then `key: value` lines; after an empty line, notes.
 #[derive(Default, Clone, PartialEq, Debug)]
 pub struct Form {
     pub pass: String,
     pub user: String,
     pub url: String,
     pub otp: String,
-    /// The `tags:` line: names, commas between.
+    /// Comma-separated.
     pub tags: String,
-    /// The `expires:` line: a date, YYYY-MM-DD.
     pub expires: String,
-    /// Every other `key: value` line, as written.
     pub more: String,
     pub notes: String,
 }
@@ -1194,9 +1127,8 @@ impl Form {
             pass: l.next().unwrap_or_default().into(),
             ..Form::default()
         };
-        // `key: value`, the key short, however it is spelt: what is in
-        // the store already is read with a free hand ([`Form::problem`]
-        // is strict with what is saved). `https://x` has no space there.
+        // Lenient on read, strict on save ([`Form::problem`]). `https://x` has
+        // no space after the colon.
         let named = |l: &str| {
             l.split_once(':').is_some_and(|(k, v)| {
                 k.starts_with(char::is_alphanumeric)
@@ -1205,8 +1137,7 @@ impl Form {
             })
         };
         let (mut notes, mut more, mut within) = (vec![], vec![], false);
-        // After an empty line all is notes, as written: no line of
-        // theirs is ever taken for a field.
+        // After an empty line all is notes: none is ever taken for a field.
         let mut head = true;
         for l in l {
             let key = |k: &str| {
@@ -1223,7 +1154,6 @@ impl Form {
                 _ if l.contains("otpauth://") && f.otp.is_empty() => {
                     f.otp = l[l.find("otpauth://").unwrap_or(0)..].trim().into()
                 }
-                // A field, or the rest of one that runs over lines.
                 _ if named(l) || was && l.starts_with("  ") => {
                     more.push(l);
                     within = true;
@@ -1236,8 +1166,7 @@ impl Form {
         f
     }
 
-    /// Why this may not be saved as it is, if so: every part must read
-    /// back as the part it was written as, and no other.
+    /// Why it can't be saved: each part must read back as itself.
     pub fn problem(&self) -> Option<String> {
         let date = |d: &str| {
             let digits =
@@ -1285,7 +1214,6 @@ impl Form {
         None
     }
 
-    /// Its fields under their names, in the order they are shown.
     pub fn fields(&self) -> [(&'static str, &str); 8] {
         [
             ("Password", &self.pass),
@@ -1299,7 +1227,7 @@ impl Form {
         ]
     }
 
-    /// The entry's text again: what [`Form::parse`] reads back the same.
+    /// Inverse of [`Form::parse`].
     pub fn text(&self) -> String {
         let one = |s: &str| s.replace(['\n', '\r'], " ");
         let mut t = one(&self.pass) + "\n";
@@ -1317,8 +1245,6 @@ impl Form {
         for l in self.more.lines().filter(|l| !l.is_empty()) {
             t += &format!("{l}\n");
         }
-        // An empty line, then the notes: read back as notes, whatever
-        // they say.
         let notes = self.notes.trim_matches('\n').trim_end();
         if !notes.is_empty() {
             t += &format!("\n{notes}\n");
@@ -1386,8 +1312,8 @@ mod tests {
         let body = String::from_utf8(s.get("mail").unwrap().to_vec()).unwrap();
         assert_eq!(field(&body, "user").as_deref(), Some("me"));
         assert_eq!(field(&body, "pass").as_deref(), Some("b"));
-        // Four, mail sealed again, and word that the first key is retired.
-        assert_eq!(s.versions().unwrap().len(), 6);
+        // 4 puts, the retired notice, the history list, mail resealed.
+        assert_eq!(s.versions().unwrap().len(), 7);
         assert!(s.conflicts().unwrap().is_empty());
         fs::write(
             crate::versions(&d).join("0123456789abcdef0123456789abcdef"),
@@ -1396,7 +1322,7 @@ mod tests {
         .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
-        assert_eq!(s.versions().unwrap().len(), 6);
+        assert_eq!(s.versions().unwrap().len(), 7);
         assert_eq!(s.unreadable.load(Relaxed), 1);
         s.lock(b"new", Some((&[9; 32], b"hmac"))).unwrap();
         let k = fs::read(d.join("key")).unwrap();
@@ -1405,7 +1331,6 @@ mod tests {
         assert!(Store::open(&d, b"new", Some(b"hmac")).is_ok());
     }
 
-    /// A stale process does not overwrite a newer key file.
     #[test]
     fn stale_key_files_are_refused() {
         let d = dir("stale");
@@ -1418,8 +1343,6 @@ mod tests {
         assert_eq!(Store::open(&d, b"pw", None).unwrap().keys().len(), 2);
     }
 
-    /// Versions move from `v/` into `store/v/`, all of them, also when
-    /// something made `store/v/` first; the store opens there as before.
     #[test]
     fn versions_move_into_store() {
         let d = dir("move");
@@ -1435,8 +1358,6 @@ mod tests {
         assert_eq!(&s.get("x").unwrap()[..], b"1");
     }
 
-    /// A session opened before a rotation writes nothing more: its key
-    /// may be the one retired. Opened again, it writes.
     #[test]
     fn a_stale_session_writes_nothing() {
         let d = dir("stale-write");
@@ -1451,8 +1372,7 @@ mod tests {
         Store::open(&d, b"pw", None).unwrap().put("x", b"4").unwrap();
     }
 
-    /// A device still on a key that another retired (a revocation) learns
-    /// it by sync, and writes nothing more under it; paired again, it does.
+    /// It then writes nothing until paired again.
     #[test]
     fn a_retired_key_is_learnt_by_sync() {
         let d = dir("retired");
@@ -1478,15 +1398,103 @@ mod tests {
         assert!(sb.retired());
         assert!(sb.put("y", b"3").is_err());
         assert_eq!(&sb.get("x").unwrap()[..], b"1", "it still reads");
-        // Paired again: the key file that holds the new key.
         fs::copy(a.join("key"), b.join("key")).unwrap();
         let sb = Store::open(&b, b"pw", None).unwrap();
         assert!(!sb.retired());
         sb.put("y", b"3").unwrap();
     }
 
-    /// Two devices changed one entry apart: the newer wins, and is flagged
-    /// until an edit follows it.
+    /// Whatever its date: not in history or the clock, nor on later devices.
+    #[test]
+    fn a_retired_key_replaces_and_adds_nothing() {
+        let d = dir("revoked");
+        let (a, r, c) = (d.join("a"), d.join("r"), d.join("c"));
+        let copy = |from: &Path, to: &Path| {
+            fs::create_dir_all(crate::versions(to)).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                fs::copy(e.path(), crate::versions(to).join(e.file_name()))
+                    .unwrap();
+            }
+            fs::copy(from.join("key"), to.join("key")).unwrap();
+        };
+        let s = Store::create(&a, b"pw", None).unwrap();
+        s.put("bank", b"1").unwrap();
+        s.put("mail", b"m").unwrap();
+        drop(s);
+        copy(&a, &r);
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        sa.rotate().unwrap();
+        let sr = Store::open(&r, b"pw", None).unwrap();
+        sr.put("bank", b"forged").unwrap();
+        sr.put("new", b"planted").unwrap();
+        sr.put_at("mail", b"backdated", 1).unwrap();
+        sr.put_at("bank", b"ahead", u64::MAX / 4).unwrap();
+        for e in fs::read_dir(crate::versions(&r)).unwrap().flatten() {
+            let to = crate::versions(&a).join(e.file_name());
+            let _ = fs::copy(e.path(), to);
+        }
+        let check = |s: &Store, n: usize| {
+            assert_eq!(&s.get("bank").unwrap()[..], b"1");
+            assert_eq!(&s.get("mail").unwrap()[..], b"m");
+            assert!(s.get("new").is_err());
+            let names = s.entries().unwrap().into_keys();
+            let names: Vec<String> = names.filter(|n| n != "x").collect();
+            assert_eq!(names, ["bank", "mail"]);
+            for v in s.versions().unwrap() {
+                let b = s.body(&v).unwrap();
+                assert!(
+                    ![&b"forged"[..], b"planted", b"backdated", b"ahead"]
+                        .contains(&&b[..])
+                );
+            }
+            let h = s.history("bank").unwrap();
+            assert_eq!(h.len(), n, "1, and sealed again at each rotation");
+            assert!(s.conflicts().unwrap().is_empty());
+            s.put("x", b"y").unwrap();
+            let x = s.versions().unwrap().into_iter().find(|v| v.name == "x");
+            assert!(x.unwrap().ms < u64::MAX / 8, "the clock stays");
+        };
+        let sa = Store::open(&a, b"pw", None).unwrap();
+        check(&sa, 2);
+        copy(&a, &c);
+        check(&Store::open(&c, b"pw", None).unwrap(), 2);
+        // Rotated again: frozen history stays, the rest stays out.
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        sa.rotate().unwrap();
+        check(&sa, 3);
+    }
+
+    #[test]
+    fn a_bad_revocation_is_a_fork_the_good_devices_leave() {
+        let d = dir("fork");
+        let (a, b) = (d.join("a"), d.join("bad"));
+        let s = Store::create(&a, b"pw", None).unwrap();
+        s.put("x", b"1").unwrap();
+        drop(s);
+        let copy = |from: &Path, to: &Path| {
+            fs::create_dir_all(crate::versions(to)).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                let _ =
+                    fs::copy(e.path(), crate::versions(to).join(e.file_name()));
+            }
+        };
+        copy(&a, &b);
+        fs::copy(a.join("key"), b.join("key")).unwrap();
+        let mut sb = Store::open(&b, b"pw", None).unwrap();
+        sb.rotate().unwrap();
+        sb.put("x", b"bad").unwrap();
+        copy(&b, &a);
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        assert!(sa.retired() && sa.put("x", b"2").is_err());
+        assert_eq!(&sa.get("x").unwrap()[..], b"1");
+        sa.rotate().unwrap();
+        sa.put("x", b"2").unwrap();
+        assert!(!sa.retired());
+        assert_eq!(&sa.get("x").unwrap()[..], b"2");
+        assert_eq!(sa.history("x").unwrap().len(), 3, "1, sealed again, 2");
+    }
+
+    /// The newer wins, flagged until an edit follows it.
     #[test]
     fn concurrent_edits_are_flagged() {
         let d = dir("conflict");
@@ -1513,7 +1521,6 @@ mod tests {
         assert!(s.conflicts().unwrap().is_empty());
     }
 
-    /// Stock age opens a version with its store key as the passphrase.
     #[test]
     fn versions_are_age_files() {
         let d = dir("age");
@@ -1527,8 +1534,7 @@ mod tests {
         assert_eq!(pt.len(), 256, "padded");
     }
 
-    /// A version another device sealed with a size or a time at the end
-    /// of the range is damaged, not a crash; what follows it is written.
+    /// Extreme size or time: damaged, not a panic; later writes still work.
     #[test]
     fn sizes_and_times_from_elsewhere_overflow_nothing() {
         let d = dir("overflow");
@@ -1543,8 +1549,7 @@ mod tests {
 
     #[test]
     fn speakable_passwords_keep_their_bits() {
-        // Between two vowels stand a coda and an onset: no two such pairs
-        // spell the same, so the syllables read back one way.
+        // Coda+onset pairs are unique, so syllables parse one way.
         let runs =
             CODAS.iter().flat_map(|c| ONSETS.iter().map(move |o| (c, o)));
         let runs: std::collections::HashSet<String> =
@@ -1564,14 +1569,12 @@ mod tests {
         let p = speakable(4, "-", false);
         assert_eq!(p.split('-').count(), 4);
         assert!(p.chars().all(|c| c == '-' || c.is_ascii_lowercase()));
-        // Some letters as 1337, not all; what they become is no letter of
-        // a syllable and no separator, so it reads back.
+        // Leet digits are neither syllable letters nor separators.
         let p = speakable(64, "", true);
         assert_eq!(p.chars().filter(|c| c.is_ascii_uppercase()).count(), 64);
         assert!(p.contains(['@', '3', '1', '0', '$', '7']));
         assert!(p.contains(['a', 'e', 'l', 'o', 's', 't']));
         assert!(!SEPS.contains(['@', '3', '1', '0', '$', '7']));
-        // Any of the separators, and their bits.
         let p = speakable(64, SEPS, false);
         let seps: std::collections::HashSet<char> =
             p.chars().filter(|c| !c.is_ascii_lowercase()).collect();
@@ -1612,12 +1615,10 @@ mod tests {
         assert_eq!(*q.get("mail").unwrap(), *b"pw\n");
         assert!(Store::open_quick(&d, b"0000", &r).is_err());
         assert!(Store::open_quick(&d, b"2468", &[1; 20]).is_err());
-        // The password still opens it alone; no PIN is a setting too.
         Store::open(&d, b"a long master phrase", None).unwrap();
         s.quick_on(b"", &c, &r).unwrap();
         assert_eq!(quick(&d), Some((c.to_vec(), false)));
         Store::open_quick(&d, b"", &r).unwrap();
-        // A new password ends it.
         s.lock(b"another phrase", None).unwrap();
         assert!(quick(&d).is_none());
     }
@@ -1626,7 +1627,6 @@ mod tests {
     fn imports_keep_their_dates_and_order() {
         let s = Store::create(&dir("dated"), b"pw", None).unwrap();
         let day = 86_400_000;
-        // Out of order, twice, and two in one second.
         for (at, body) in [
             (3 * day, "c"),
             (day, "a"),
@@ -1641,7 +1641,6 @@ mod tests {
         assert_eq!(bodies, [&b"d"[..], b"c", b"b", b"a"]);
         assert_eq!(h[3].0, day);
         assert_eq!(*s.get("mail").unwrap(), *b"d");
-        // In order from the start: one line of versions, nothing flagged.
         let t = Store::create(&dir("dated2"), b"pw", None).unwrap();
         for (at, body) in [(day, "a"), (2 * day, "b"), (2 * day, "c")] {
             t.put_at("mail", body.as_bytes(), at).unwrap();
@@ -1665,12 +1664,10 @@ mod tests {
         assert_eq!(strength(""), 0);
         assert!(strength("k3Vq9xLp2mZt") >= 65);
         assert!(strength(&generate(24, true)) >= 100);
-        // A made password is worth about what went into it, as it stands.
         for _ in 0..100 {
             let near = |pw: String, bits: u32| {
                 let got = strength(&pw);
-                // Chance repeats and runs cost a random one some: never
-                // most.
+                // Chance repeats and runs cost some bits, never most.
                 assert!(got * 5 >= bits * 3, "{pw}: {got} for {bits}");
                 assert!(got <= bits + 28, "{pw}: {got} for {bits}");
             };
@@ -1681,7 +1678,6 @@ mod tests {
             near(generate(24, true), 151);
             near(generate(16, false), 95);
         }
-        // SHA-1("password") = 5BAA6 1E4C9B93F3F0682250B6CF8331B7EE68FD8.
         let (sent, kept) = pwned_key("password");
         assert_eq!(
             (&*sent, &*kept),
@@ -1709,10 +1705,8 @@ mod tests {
             (of("Entries"), of("Different passwords"), of("Expired")),
             ("4".into(), "3".into(), "1".into())
         );
-        // A phrase of dictionary words is worth its words, not its letters.
         let phrase = strength("correct horse battery staple");
         assert!((40..80).contains(&phrase), "{phrase}");
-        // A local copy of the breach list, ordered by hash.
         let (sent, kept) = pwned_key("hunter2");
         let row = |i: u128| {
             format!(
@@ -1744,8 +1738,6 @@ mod tests {
         let s = Store::create(&d, b"pw", None).unwrap();
         s.put("a", b"1").unwrap();
         assert!(fido(&d).is_none());
-        // Two keys, the second added later: each opens it, with the salt
-        // of the first; a wrong answer and a stranger do not.
         let salt = s.fido_salt();
         let (one, two) = ([1; 32], [2; 32]);
         s.fido_add(&salt, b"cred-one", true, &one).unwrap();
@@ -1762,13 +1754,11 @@ mod tests {
         assert!(Store::open_fido(&d, b"cred-one", &two).is_err());
         assert!(Store::open_fido(&d, b"cred-none", &one).is_err());
         assert!(s.fido_add(&[9; 32], b"cred-x", false, &one).is_err());
-        // Added again, a key is there once; taken off, the other stays.
         s.fido_add(&salt, b"cred-one", false, &one).unwrap();
         assert_eq!(fido(&d).unwrap().keys.len(), 2);
         fido_off(&d, Some(b"cred-one")).unwrap();
         assert!(Store::open_fido(&d, b"cred-one", &one).is_err());
         assert!(Store::open_fido(&d, b"cred-two", &two).is_ok());
-        // A new password leaves a key behind: it says so, and is taken off.
         fido_off(&d, None).unwrap();
         assert!(fido(&d).is_none() && !d.join("ctap").exists());
         fido_off(&d, None).unwrap();
@@ -1794,13 +1784,10 @@ mod tests {
         assert_eq!(Form::parse(&f.text()), f);
         assert_eq!(field(&f.text(), "user").as_deref(), Some("ada"));
         assert!(field(&f.text(), "otp").is_some());
-        // A password is one line, whatever is typed; nothing else: only it.
         let bare = Form { pass: "a\nb".into(), ..Form::default() };
         assert_eq!(bare.text(), "a b\n");
         assert_eq!(Form::parse(""), Form::default());
-        // What is saved reads back the same, part by part: notes are
-        // notes whatever they say, and a field no parser would know as
-        // one is refused, not moved.
+        // Notes stay notes; a field no parser would know is refused, not moved.
         let notes =
             "user: eve\notpauth://totp/z?secret=AA\nkey: v\n\n  x\npin: 1";
         let more = "card_no: 1234\nq2: a: b\n  more of it";

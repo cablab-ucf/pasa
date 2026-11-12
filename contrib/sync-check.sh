@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
-# Stores on this machine pair and sync through the relay, as devices
-# would. "phone" holds the store; "desk" takes its keys by QR code (under a
-# two-letter password), "lap" by short code, and each syncs the store before
-# the store's password is typed anywhere. Then changes go each way, and
-# what is on disk is checked.
-#   contrib/sync-check.sh [DIR]     (Linux: needs script(1))
+# Three stores here pair (QR code, short code) and sync through the relay;
+# then what the network side holds is checked. Needs script(1).
+#   contrib/sync-check.sh [DIR]
 set -u
 P=${PASA:-pasa}
 cd "${1:-$(mktemp -d)}" || exit 1

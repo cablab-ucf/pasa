@@ -1,15 +1,4 @@
-//! Pairing and syncing are apart, and neither opens a key. A pairing hands
-//! another device the key file as it is (sealed to the password), with this
-//! device's endpoint and a fresh transport key, by a QR code (offline,
-//! under a password of its own) or a short code (pairir). A sync swaps the
-//! versions each device lacks (age files to the store key), seeing `v/` and
-//! `net/` alone ([`net`], `confine`). The password and the hardware key
-//! open the key file afterwards, on each device alone.
-//!
-//! Dialers use throwaway endpoints; `serve` admits whoever proves a
-//! pairing's key (irnet::psk: HPKE over X-Wing inside TLS 1.3), while pasa
-//! is open there; each swap tells the other where, so either dials. A wake
-//! is an empty message to a peer's pushir lane: it says sync, nothing more.
+//! Pairing and sync; neither ever opens the key file or a version.
 
 use crate::{MAX, Store, is_name, name_of, rand, write};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -24,11 +13,10 @@ use zeroize::Zeroizing;
 
 const ALPN: &[u8] = b"pasa/6";
 
-/// What the network side sees beside `v/`: the pairings, this device's
-/// endpoint key and lane. Never a key file.
+/// The network side's files beside `v/`: never a key file.
 pub fn net(dir: &Path) -> PathBuf {
     let n = dir.join("net");
-    // Before 0.4.9 these lay beside the key files.
+    // Migration: before 0.4.9 these lay beside the key files.
     if !n.exists() && dir.join("peers").exists() {
         let _ = fs::create_dir_all(&n);
         for f in ["peers", "node", "id", "mailbox", "lane", "give", "take"] {
@@ -38,9 +26,7 @@ pub fn net(dir: &Path) -> PathBuf {
     n
 }
 
-/// A pairing: its transport key, the peer's endpoint if it serves, its
-/// pushir lane if it listens, when it last synced with this device (Unix
-/// seconds; paired, if never).
+/// `id`: its endpoint, once known; `seen`: last sync or pairing, Unix seconds.
 pub struct Peer {
     pub name: String,
     pub psk: [u8; 32],
@@ -49,8 +35,7 @@ pub struct Peer {
     pub seen: Option<u64>,
 }
 
-/// `psk endpoint lane seen name`, a line each; the name last, as before
-/// `seen` came (and before 0.4.10, when a device id stood there).
+/// `psk id lane seen name` a line; name last, where older versions read it.
 pub fn peers(dir: &Path) -> Vec<Peer> {
     let f = fs::read_to_string(net(dir).join("peers")).unwrap_or_default();
     let peer = |l: &str| {
@@ -85,9 +70,6 @@ fn now() -> u64 {
     t.map_or(0, |d| d.as_secs())
 }
 
-/// Whether sync is on here. Off unless turned on (pairing turns it on), as
-/// on the phone; off, pasa opens no connection: no serving, no listening, no
-/// sync after a change.
 pub fn on(dir: &Path) -> bool {
     net(dir).join("on").exists()
 }
@@ -103,13 +85,9 @@ pub fn set_on(dir: &Path, on: bool) -> Result<()> {
     }
 }
 
-/// How long devices may stay apart before each says so: a month. Offline
-/// the rest of the time is the point.
 pub const APART: u64 = 30 * 86_400;
 
-/// Each peer: its name, the days since it last synced here (paired, if
-/// never), and whether that is [`APART`] or longer. One paired before that
-/// was kept counts from when the pairings last changed.
+/// (name, days since last sync, >= APART); no `seen`: since the file's mtime.
 pub fn apart(dir: &Path) -> Vec<(String, u64, bool)> {
     let now = now();
     let m = fs::metadata(net(dir).join("peers")).and_then(|m| m.modified());
@@ -122,7 +100,6 @@ pub fn apart(dir: &Path) -> Vec<(String, u64, bool)> {
     peers(dir).into_iter().map(one).collect()
 }
 
-/// The peers a month apart or more: each, with the days.
 pub fn unseen(dir: &Path) -> Vec<(String, u64)> {
     apart(dir).into_iter().filter(|a| a.2).map(|a| (a.0, a.1)).collect()
 }
@@ -146,9 +123,7 @@ pub fn forget(dir: &Path, name: &str) -> Result<()> {
     ps.retain(|p| p.name != name);
     ensure!(ps.len() < n, "no peer {name}");
     save(dir, &ps)?;
-    // It held our lane's secret: a new one, which the peers that stay get
-    // at their next sync. `listen` moves to it by itself; the Android app
-    // when it next starts.
+    // It knew our lane's secret: a new one, which the rest get at next sync.
     let at = fs::read_to_string(net(dir).join("mailbox")).ok();
     if let Some(at) = at.and_then(|l| l.parse::<Lane>().ok()) {
         let _ = fs::remove_file(net(dir).join("lane"));
@@ -157,35 +132,26 @@ pub fn forget(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// End pairing `name` and rotate the store key, here: every entry sealed
-/// again to a new key, which the other devices get by pairing again (keys
-/// never travel in a sync). Forget it on every device it paired with.
 pub fn revoke(s: &mut Store, name: &str) -> Result<()> {
     forget(&s.dir, name)?;
     s.rotate()
 }
 
-/// A secret key in `net/file`, made once.
 fn key(dir: &Path, file: &str) -> Result<SecretKey> {
     fs::create_dir_all(net(dir))?;
     Ok(SecretKey::from_bytes(&pushir::kept(&net(dir).join(file))?))
 }
 
-/// This device's pushir lane secret for pasa, made once: peers alone get
-/// it, and what is sealed under it says only "sync".
 pub fn lane(dir: &Path) -> Result<pushir::Key> {
     fs::create_dir_all(net(dir))?;
     pushir::kept(&net(dir).join("lane"))
 }
 
-/// Where peers wake us: our lane on the mailbox pushir gave this device.
 pub fn set_mailbox(dir: &Path, id: PublicKey) -> Result<()> {
     let l = Lane { relay: pushir::relay()?, id, secret: lane(dir)? };
     write(&net(dir).join("mailbox"), l.to_string().as_bytes())
 }
 
-/// `$PASA_RELAY`, or the lab's. One that does not parse is an error, not
-/// the lab's after all.
 fn relay() -> Result<RelayUrl> {
     match std::env::var("PASA_RELAY") {
         Ok(r) => r
@@ -200,12 +166,10 @@ fn ep() -> Result<iroh::endpoint::Builder> {
     Ok(irnet::on(&[relay()?]))
 }
 
-/// What a swap learnt of the peer (lane, endpoint), and how many versions
-/// it took.
+/// (peer's lane, peer's endpoint, versions taken)
 type Swapped = (Option<Lane>, Option<PublicKey>, usize);
 
-/// Swap lanes and endpoints, then the versions each lacks: age files, and
-/// nothing of the keys.
+/// Wire: lane, endpoint key, names (32 bytes each), files the other lacks, "".
 async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     let mailbox = fs::read(net(dir).join("mailbox")).unwrap_or_default();
     tx.send(&mailbox).await?;
@@ -220,8 +184,7 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| is_name(n))
         .collect();
-    // Both lists at once: past a stream's window (2 MiB, some 65,000
-    // versions) each side would wait for the other to read.
+    // Both at once: past the 2 MiB stream window, sequential sends deadlock.
     let names = mine.iter().map(String::as_str).collect::<String>();
     let (sent, list) = tokio::join!(tx.send(names.as_bytes()), rx.recv(MAX));
     let list = (sent?, list?).1;
@@ -259,7 +222,7 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     Ok((theirs, id, t?))
 }
 
-/// Keep what a swap learnt of `name`, and that it synced now.
+/// Records a sync with `name`; `lane: None` keeps the known lane.
 fn learnt(
     dir: &Path,
     name: &str,
@@ -274,9 +237,6 @@ fn learnt(
     let _ = save(dir, &ps);
 }
 
-/// Wake every listening peer but `except`: an empty message to its lane,
-/// over one connection per relay, the relays at once. A wake lost or
-/// repeated costs a sync at most.
 async fn wake(dir: &Path, except: &str) {
     let mut by: std::collections::BTreeMap<String, Vec<Lane>> =
         Default::default();
@@ -298,9 +258,7 @@ async fn wake(dir: &Path, except: &str) {
     while all.join_next().await.is_some() {}
 }
 
-/// Sync with every peer whose endpoint is known, all at once (one that is
-/// away costs its 15 s once, not once each); with `news` (a change here),
-/// then wake those that listen. A peer not met yet is said, not skipped.
+/// All peers at once: an unreachable one costs its 15 s once, not per peer.
 pub async fn sync(
     dir: &Path,
     news: bool,
@@ -330,7 +288,6 @@ pub async fn sync(
                     timeout(Duration::from_secs(15), meet).await.map_err(
                         |_| anyhow!("not reached: is pasa open there?"),
                     )??;
-                // A whole store may take a while; a stalled peer, not forever.
                 let r = timeout(SWAP, swap(&dir, tx, rx)).await;
                 c.close(0u32.into(), b"");
                 r.unwrap_or_else(|_| Err(anyhow!("timed out")))
@@ -339,7 +296,7 @@ pub async fn sync(
             (p.name, r)
         });
     }
-    // What each swap learnt is kept one at a time: `peers` is one file.
+    // Serially: `peers` is one file.
     while let Some(r) = all.join_next().await {
         let (name, r) = r?;
         out.push((
@@ -359,18 +316,15 @@ pub async fn sync(
     Ok(out)
 }
 
-/// How long one swap may take, a whole store included.
 const SWAP: Duration = Duration::from_secs(300);
 
-/// Accept syncs from paired devices; wake the others after news. One
-/// process at a time serves a store: two endpoints with one key would take
-/// its place at the relay from each other.
 pub async fn serve(
     dir: &Path,
     log: impl Fn(&str, Result<usize>) + Clone + Send + 'static,
 ) -> Result<()> {
     let node = key(dir, "node")?;
     let lock = fs::File::open(net(dir).join("node"))?;
+    // One server per endpoint key: two would evict each other at the relay.
     // Android's std has no file lock: an app there is one process.
     match lock.try_lock() {
         Err(fs::TryLockError::WouldBlock) => bail!("pasa serves here already"),
@@ -408,21 +362,17 @@ pub async fn serve(
     Ok(())
 }
 
-/// Desktop: attach to the pushir daemon; sync now, and on each message
-/// (a peer's wake, or the mailbox back from a gap). Wakes that came during
-/// a sync are answered by one more.
+/// Syncs now and on each message; wakes during a sync coalesce into one more.
 #[cfg(unix)]
 pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
     loop {
-        // On the lane as it is now: a forgotten peer ends the old one,
-        // which is seen at the next wake or within a quarter of an hour.
+        // Reattach once `forget` rotates the lane: seen on a wake or in 15 min.
         let secret = lane(dir)?;
         let (id, mut rx) =
             pushir::local::attach(&pushir::local::sock(), &secret).await?;
         set_mailbox(dir, id)?;
         while lane(dir)? == secret {
             sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
-            // The next wake; or, each quarter hour, whether the lane moved.
             loop {
                 match timeout(Duration::from_secs(900), rx.recv()).await {
                     Ok(None) => return Ok(()),
@@ -436,11 +386,8 @@ pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
     }
 }
 
-/// What a pairing hands the device called `name` here: this device's
-/// endpoint, a fresh transport key for the two, and the key file as it is,
-/// sealed to the password (and YubiKey). Nothing is unlocked to make it,
-/// and nothing in it opens a version without that password. The pairing
-/// is kept here; the other device dials here once it has [`take`]n it.
+/// Wire: endpoint key (32), psk (32), then the key file bare, or with hardware
+/// keys KEYS and the key, quick and ctap files framed.
 pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
     let f = fs::read(dir.join("key")).context("no store here")?;
     let quick = fs::read(dir.join("quick")).unwrap_or_default();
@@ -457,13 +404,11 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
             seen: Some(now()),
         },
     )?;
-    // Pairing is for syncing: on, as on the phone.
     set_on(dir, true)?;
     let n = 64 + KEYS.len() + 12 + f.len() + quick.len() + ctap.len();
     let mut out = Zeroizing::new(Vec::with_capacity(n));
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&psk);
-    // The key file alone, as before, unless hardware keys open it too.
     match quick.is_empty() && ctap.is_empty() {
         true => out.extend(&f),
         false => {
@@ -476,16 +421,8 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
     Ok(out)
 }
 
-/// Before the key files framed, in what [`offer`] makes; else the key file
-/// alone follows.
 const KEYS: &[u8] = b"pasakeys";
 
-/// Take what [`offer`] made, as a code brought it, calling that device
-/// `name`: it is a peer at once, to sync with, and its key files are this
-/// device's: `key` (one that differed kept as `key.old`), and `quick` and
-/// `ctap` if they came (else, beside a new key file, gone: they open the
-/// old one alone). Nothing is unlocked: the password or hardware key
-/// opens it afterwards, here alone.
 pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     named(name)?;
     let bad = || anyhow!("not a pasa pairing");
@@ -510,6 +447,7 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
         old => old.is_err(),
     };
     write(&at, f)?;
+    // Hardware keys' files open the key file they came with alone.
     for (n, b) in [("quick", quick), ("ctap", ctap.as_bytes())] {
         match b.is_empty() {
             false => write(&dir.join(n), b)?,
@@ -532,26 +470,20 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     set_on(dir, true)
 }
 
-/// A QR code's text: what [`offer`] made, under `pw` (pairir: Argon2id,
-/// XChaCha20-Poly1305). Offline.
 pub async fn qr(got: &[u8], pw: &str) -> Result<String> {
     pairir::seal_qr("pasa", got, pw).await
 }
 
-/// What a QR code holds, under its password.
 pub async fn unqr(text: &str, pw: &str) -> Result<Zeroizing<Vec<u8>>> {
     pairir::open_qr("pasa", text.trim(), pw).await
 }
 
-/// A short code's network half: what [`offer`] made, to whoever proves the
-/// code (pairir: CPace, then X-Wing, inside post-quantum TLS); how it ends.
 pub async fn give(
     got: &[u8],
 ) -> Result<(String, tokio::task::JoinHandle<pairir::End>)> {
     pairir::give(&[relay()?], "pasa", got, None).await
 }
 
-/// The other half: what the device showing `code` gives.
 pub async fn fetch(code: &str) -> Result<Zeroizing<Vec<u8>>> {
     pairir::take(&[relay()?], "pasa", code.trim(), None).await
 }
@@ -561,12 +493,11 @@ mod tests {
     use super::*;
     use iroh::RelayMode;
 
-    /// `b` takes what `a` offers; neither store is opened.
     fn pair(a: &Path, an: &str, b: &Path, bn: &str) {
         take(b, an, &offer(a, bn).unwrap()).unwrap();
     }
 
-    /// `a` dials `b`: how many versions each took.
+    /// `a` dials `b`: versions taken by (a, b).
     async fn swap_once(
         a: &Path,
         b: &Path,
@@ -600,7 +531,6 @@ mod tests {
         (n, srv.await.unwrap())
     }
 
-    /// Every file under `d`, and whether any holds `secret`.
     fn holds(d: &Path, secret: &[u8]) -> bool {
         fs::read_dir(d).unwrap().flatten().any(|e| match e.path() {
             p if p.is_dir() => holds(&p, secret),
@@ -610,10 +540,7 @@ mod tests {
         })
     }
 
-    /// A phone with the store pairs a desktop with none, by a QR code under
-    /// a two-letter password; they sync. Neither opens the store or sees
-    /// its password: the key file and the versions travel as they are.
-    /// Then, on the desktop alone, the password opens what came.
+    /// Pairing and sync open nothing; afterwards the password opens what came.
     #[tokio::test(flavor = "multi_thread")]
     async fn pair_then_sync_then_unlock() {
         let d = crate::tests::dir("pairing");
@@ -635,15 +562,12 @@ mod tests {
         assert!(unqr(&qr, "ac").await.is_err());
         take(&desk, "phone", &unqr(&qr, "ab").await.unwrap()).unwrap();
         assert_eq!(fs::read(desk.join("key")).unwrap(), file);
-        // No unlock anywhere: the desktop dials the phone; then each knows
-        // where the other serves.
         assert_eq!(swap_once(&desk, &phone, "phone", "desk").await, (2, 0));
         let at = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
         let node = |d: &Path| key(d, "node").unwrap().public();
         assert_eq!(at(&desk, "phone").unwrap().id, Some(node(&phone)));
         assert_eq!(at(&phone, "desk").unwrap().id, Some(node(&desk)));
-        // The sync side's view, store/v/ and net/: age files and transport keys;
-        // no store key, no entry, no key file.
+        // The sync side's view (v/, net/) holds no secret.
         for d in [&phone, &desk] {
             for e in fs::read_dir(crate::versions(d)).unwrap().flatten() {
                 let b = fs::read(e.path()).unwrap();
@@ -659,10 +583,7 @@ mod tests {
         assert_eq!(&sd.get("mail/work").unwrap()[..], b"hunter2\nuser: me");
     }
 
-    /// Pairing brings the hardware keys' files too, as they are: the
-    /// YubiKey with its PIN and each security key open the store there as
-    /// here. A device's files for another store's key go; an older
-    /// pairing (the key file alone) is still taken.
+    /// A replaced key file's hardware files go; a bare key file is still taken.
     #[tokio::test]
     async fn pairing_brings_the_hardware_keys() {
         let d = crate::tests::dir("pairing-keys");
@@ -696,7 +617,6 @@ mod tests {
         Store::open_quick(&desk, b"2468", &yk).unwrap();
         Store::open_fido(&desk, &[3; 64], &one).unwrap();
         Store::open_fido(&desk, &[4; 64], &two).unwrap();
-        // An older pairing, of a store without them: theirs go.
         let lap = d.join("lap");
         Store::create(&lap, b"pw3", None).unwrap();
         let got = offer(&lap, "desk").unwrap();
@@ -710,11 +630,7 @@ mod tests {
         );
     }
 
-    /// Sync is off until turned on, and pairing turns it on (as on the
-    /// phone). Each device keeps when each other last synced with it, and
-    /// says which are a month apart; a pairing from before that was kept
-    /// counts from when the pairings last changed. The name stays last on
-    /// its line, where 0.4.12 reads it.
+    /// The name stays last on its line, where 0.4.12 reads it.
     #[test]
     fn off_until_on_and_a_month_apart_is_said() {
         let d = crate::tests::dir("apart");
@@ -747,8 +663,7 @@ mod tests {
         assert_eq!(unseen(&b), [("a".to_string(), 40)]);
     }
 
-    /// Lists past a stream's window (2 MiB: 70,000 names here) cross: each
-    /// side sends its own while it reads the other's.
+    /// 70,000 names: past a stream's 2 MiB window.
     #[tokio::test(flavor = "multi_thread")]
     async fn long_lists_cross() {
         let d = crate::tests::dir("lists");
@@ -767,9 +682,6 @@ mod tests {
         assert_eq!(took.expect("the lists never crossed"), (0, 0));
     }
 
-    /// Versions merge by union; a stray file stays. After a revoke the store
-    /// key is new: another device reads what follows once paired again, and
-    /// the revoked one's transport key is no longer taken.
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_and_revoke() {
         let d = crate::tests::dir("sync");

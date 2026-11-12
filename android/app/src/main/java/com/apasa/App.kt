@@ -7,12 +7,9 @@ import android.content.pm.PackageManager
 import kotlin.concurrent.thread
 import org.pushir.Pushir
 
-/** Whether the user turned sync on: no network before that. */
+/** No network until the user turns this on. */
 fun syncOn(c: Context) = c.getSharedPreferences("pasa", 0).getBoolean("sync", false)
 
-/** Woken through the phone's one pushir connection: a message on pasa's
- *  lane (a paired device's wake, or the connection back from a gap) syncs.
- *  Whoever holds the connection hands it over unopened. */
 fun push(c: Context) {
     val dir = store(c).path
     Pushir.start(c, "apasa", Native.lane(dir), onId = { Native.mailbox(dir, it) }) {
@@ -20,8 +17,7 @@ fun push(c: Context) {
     }
 }
 
-/** pushir's service runs in this app only while sync is on: off, no boot
- *  starts it and no other app finds it, so the app reaches no network. */
+/** Disabled while sync is off: no boot or other app starts pushir here, so no network. */
 fun broker(c: Context, on: Boolean) = c.packageManager.setComponentEnabledSetting(
     ComponentName(c, "org.pushir.Broker"),
     if (on) PackageManager.COMPONENT_ENABLED_STATE_ENABLED else PackageManager.COMPONENT_ENABLED_STATE_DISABLED,

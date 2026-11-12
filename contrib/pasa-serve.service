@@ -1,9 +1,5 @@
-# pasa serve, seeing only store/v/ (age files) and net/ (its endpoint key, the
-# pairings' transport keys): nothing that opens a version. Its
-# network side confines itself to those two as well (Landlock). It serves
-# only while sync is on (pasa sync on|off), following the switch. First:
-#   mkdir -p ~/.pasa/store/v ~/.pasa/net   (a store from before: run any
-#   pasa command once, which moves ~/.pasa/v into ~/.pasa/store/v)
+# pasa serve, seeing only store/v/ and net/: nothing that opens a version.
+#   mkdir -p ~/.pasa/store/v ~/.pasa/net
 #   cp contrib/pasa-serve.service ~/.config/systemd/user/
 #   systemctl --user enable --now pasa-serve
 [Unit]

@@ -17,56 +17,42 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
 
-/** No key can be reached: NFC is off ([nfcOff]) or the phone has none, and no key is plugged in. */
 class NoKey(val nfcOff: Boolean) : Exception(
     if (nfcOff) "NFC is off. Turn it on to tap the YubiKey, or plug the key in."
     else "This phone has no NFC: plug the YubiKey in.",
 )
 
-/** Whether the phone has NFC and it is switched off. */
 fun nfcOff(c: Context) = NfcAdapter.getDefaultAdapter(c)?.isEnabled == false
 
 private fun nfcOn(c: Context) = NfcAdapter.getDefaultAdapter(c)?.isEnabled == true
 
-/** A YubiKey in the USB port (Yubico's vendor id). */
+/** 0x1050: Yubico's USB vendor id. */
 private fun plugged(c: Context) =
     c.getSystemService(UsbManager::class.java)?.deviceList?.values?.any { it.vendorId == 0x1050 } == true
 
-/** Counts the waits for a key: an earlier one's late clean-up must not end a later one's listening. */
+/** An earlier wait's late clean-up must not stop a later wait's NFC listening. */
 private val waits = AtomicInteger()
 
-/**
- * The YubiKey's HMAC-SHA1 (slot 2) of [challenge]: from a key held to the phone (NFC) or plugged in (USB),
- * whichever comes. With neither way open it says so at once ([NoKey]), not after a wait.
- *
- * The app listens for the key until the answer is in, and for a key on NFC until it is lifted away: while
- * the app listens, Android does not open the web address a YubiKey carries. (Ending the listening as soon
- * as the key was seen lost the key mid-answer, "Tag was lost", and let that page open.)
- */
 suspend fun yubikey(a: Activity, challenge: ByteArray, enroll: Boolean = false): ByteArray = withKey(a) { slot2(it, challenge, enroll) }
 
-/** The slot 2 answer of a key at hand. */
 internal fun slot2(s: YubiOtpSession, challenge: ByteArray, enroll: Boolean): ByteArray {
-    // Asked first where the key can say: an empty slot answers with nothing, which reads as nonsense.
+    // An empty slot answers nonsense rather than failing: ask first, where the key can say.
     if (runCatching { !s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(false)) throw Empty(enroll)
     return s.calculateHmacSha1(Slot.TWO, challenge, null)
 }
 
-/**
- * Writes [secret] (20 bytes) to the key's slot 2 as its HMAC-SHA1 challenge-response secret: only to a slot
- * the key says is empty, never over what one holds, and not where the key cannot say.
- */
+/** Only into a slot the key reports empty: never over one in use, nor where it cannot say. */
 suspend fun writeKey(a: Activity, secret: ByteArray): Unit = withKey(a) { s ->
     if (runCatching { s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(true))
         throw InUse()
     s.putConfiguration(Slot.TWO, HmacSha1SlotConfiguration(secret), null, null)
 }
 
-/** What [use] makes of the next YubiKey tapped or plugged in. */
 private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T =
     withDevice(a) { d, done -> YubiOtpSession.create(d) { session -> done(runCatching { use(session.value) }) } }
 
-/** The next key tapped or plugged in, handed to [open], which says through its second argument what came of it. */
+/** NFC listening lasts until the key is lifted: while it does, Android opens no URL the key carries,
+ *  and stopping sooner loses the key mid-answer ("Tag was lost"). */
 suspend fun <T> withDevice(a: Activity, open: (YubiKeyDevice, (Result<T>) -> Unit) -> Unit): T {
     val nfc = nfcOn(a)
     if (!nfc && !plugged(a)) throw NoKey(nfcOff(a))
@@ -75,7 +61,6 @@ suspend fun <T> withDevice(a: Activity, open: (YubiKeyDevice, (Result<T>) -> Uni
         val m = YubiKitManager(a)
         val stop = {
             runCatching { m.stopUsbDiscovery() }
-            // Not if a later wait is listening by now.
             if (waits.get() == mine) runCatching { m.stopNfcDiscovery(a) }
             Unit
         }
@@ -86,9 +71,7 @@ suspend fun <T> withDevice(a: Activity, open: (YubiKeyDevice, (Result<T>) -> Uni
             }
         }
         m.startUsbDiscovery(UsbConfiguration()) { answer(it) }
-        // The key's web address is not read: only its answer is wanted.
         if (nfc) {
-            // Switched off since it was looked at: said as before the wait.
             runCatching { m.startNfcDiscovery(NfcConfiguration().skipNdefCheck(true), a) { answer(it) } }
                 .onFailure { if (!plugged(a) && k.isActive) k.resumeWithException(NoKey(true)) }
         }
@@ -96,14 +79,12 @@ suspend fun <T> withDevice(a: Activity, open: (YubiKeyDevice, (Result<T>) -> Uni
     }
 }
 
-/** Slot 2 holds nothing; said while a key is being taken on ([enroll]), it can be set up here. */
 internal class Empty(val enroll: Boolean) : Exception()
 private class InUse : Exception()
 
-/** Already in the words for someone holding the key. */
+/** A message already fit for the user. */
 class Said(text: String) : Exception(text)
 
-/** What went wrong with the key, for someone holding it. */
 private fun said(e: Throwable): String = when {
     e is Said -> e.message!!
     e is android.nfc.TagLostException || e.message?.contains("Tag was lost") == true ->

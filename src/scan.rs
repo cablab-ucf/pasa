@@ -1,8 +1,5 @@
-//! A QR code from the camera, offline and in this process: nokhwa reads the
-//! camera (AVFoundation on macOS, V4L2 on Linux), and rqrr, then rxing
-//! (ZXing's way), read the code in its grey frames. Frames stay in memory:
-//! nothing is written, nothing sent. Or a picture of the code, read the
-//! same way. `PASA_CAMERA`: another camera (its number), or a picture.
+//! QR codes from a camera (nokhwa) or a picture, read by rqrr, then rxing.
+//! `PASA_CAMERA`: another camera's number, or a picture to read instead.
 
 use anyhow::{Context, Result, bail, ensure};
 use nokhwa::pixel_format::LumaFormat;
@@ -12,7 +9,7 @@ use nokhwa::utils::{
 };
 use std::path::Path;
 
-/// A grey frame, a byte a pixel, row after row.
+/// 8-bit luma, row-major.
 #[derive(Clone)]
 pub struct Frame {
     pub w: usize,
@@ -20,8 +17,6 @@ pub struct Frame {
     pub px: Vec<u8>,
 }
 
-/// The camera while it is on (it goes off when this is dropped), or a
-/// picture shown to it again and again.
 pub enum Camera {
     On(Box<nokhwa::Camera>),
     Still(Frame),
@@ -47,7 +42,6 @@ impl Camera {
         Ok(Camera::On(Box::new(c)))
     }
 
-    /// The next frame, grey.
     pub fn frame(&mut self) -> Result<Frame> {
         match self {
             Camera::Still(f) => {
@@ -90,7 +84,6 @@ fn allowed() -> Result<()> {
     Ok(())
 }
 
-/// A picture (JPEG or PNG), grey.
 pub fn picture(p: &Path) -> Result<Frame> {
     let i = image::ImageReader::open(p)?.with_guessed_format()?.decode()?;
     let i = i.to_luma8();
@@ -98,11 +91,9 @@ pub fn picture(p: &Path) -> Result<Frame> {
     Ok(Frame { w, h, px: i.into_raw() })
 }
 
-/// A camera's frame, grey: the luma it sends (its rows may be padded: the
-/// stride is what the buffer holds a row), or what a JPEG holds.
+/// Rows may be padded (macOS pads them): a row's stride is the length / h.
 fn grey(w: usize, h: usize, f: FrameFormat, b: &[u8]) -> Result<Frame> {
     ensure!(w > 0 && h > 0, "an empty frame");
-    // Every `step`th byte of each row from `off`, rows `stride` apart.
     let luma = |stride: usize, step: usize, off: usize| {
         let mut px = Vec::with_capacity(w * h);
         for y in 0..h {
@@ -131,7 +122,6 @@ fn grey(w: usize, h: usize, f: FrameFormat, b: &[u8]) -> Result<Frame> {
     Ok(Frame { w, h, px })
 }
 
-/// The text of a QR code in a frame, if one is there.
 pub fn read(f: &Frame) -> Option<String> {
     let (w, h) = (f.w, f.h);
     let px = |x, y| f.px.get(y * w + x).copied().unwrap_or(255);
@@ -151,7 +141,6 @@ pub fn read(f: &Frame) -> Option<String> {
     })
 }
 
-/// Frames until one holds a code: its text.
 pub fn scan() -> Result<String> {
     let mut c = Camera::open()?;
     loop {
@@ -168,8 +157,6 @@ mod tests {
     const W: usize = 1280;
     const H: usize = 720;
 
-    /// A pairing's QR code, as a camera sees it held at an angle, small
-    /// in a corner of the frame, on a grey ground: read whole.
     fn tilted(text: &str) -> Frame {
         let code = qrcode::QrCode::new(text).unwrap();
         let (n, dark) = (code.width(), code.to_colors());
@@ -203,9 +190,6 @@ mod tests {
         assert_eq!(read(&Frame { w: W, h: H, px: vec![140; W * H] }), None);
     }
 
-    /// What cameras send becomes the same grey frame: YUYV with padded
-    /// rows (as macOS pads them), NV12, RGB, and a JPEG; and a PNG picture
-    /// of the code reads.
     #[test]
     fn camera_formats_become_grey() {
         let text = format!("PAIRIR1:{}", "A2VO6QK5PMTRK623".repeat(20));

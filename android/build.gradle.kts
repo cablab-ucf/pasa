@@ -1,4 +1,4 @@
-// AGP's built-in Kotlin, at the latest compiler; Compose's compiler with it.
+// The compiler for AGP's built-in Kotlin; keep it in step with the Compose plugin.
 buildscript { dependencies { classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.21") } }
 
 plugins {

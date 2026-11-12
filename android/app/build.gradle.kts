@@ -13,7 +13,6 @@ android {
         targetSdk = 35
         versionCode = 26
         versionName = "0.4.14"
-        // pushir: apps signed by the same key share one connection.
         manifestPlaceholders["pushirGroup"] = "center.cxn"
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
     }
@@ -31,12 +30,7 @@ android {
     buildFeatures { compose = true }
 }
 
-// libapasa.so from apasa-jni, cross-compiled by cargo-ndk (ANDROID_NDK_HOME,
-// rustup's Android targets) into jniLibs, which the app packs.
-//
-// -Ppasa.fast=true, to try a change and never for a release: phones' ABI
-// alone and no link-time optimisation, so a change to the Rust costs seconds
-// where the release's whole-program pass costs minutes.
+// -Ppasa.fast=true: one ABI, no LTO; never for a release.
 val fast = providers.gradleProperty("pasa.fast").isPresent
 val cargoBuild by tasks.registering(Exec::class) {
     workingDir = rootDir.parentFile
@@ -51,8 +45,7 @@ val cargoBuild by tasks.registering(Exec::class) {
         environment("CARGO_PROFILE_RELEASE_LTO", "false")
         environment("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")
     }
-    // CI says so when a cache gave the library back for these very Rust
-    // sources: then there is nothing to build.
+    // Set by CI when its cache restored the .so for these exact Rust sources.
     val cached = System.getenv("PASA_SO") == "cached"
     onlyIf { !cached }
 }
