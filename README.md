@@ -291,12 +291,19 @@ to it within a quarter of an hour, the Android app when it next starts).
 `revoke NAME` (Revoke in Devices) ends the pairing and rotates the store key: every entry is
 sealed again to a new key. Keys travel by pairing alone, so pair the
 other devices again from here; what follows the rotation opens there
-only then. Forget it on every device it paired with. It keeps what it
-had: change the passwords it held, at their services. A session open
-here during the rotation writes nothing more until unlocked again; a
-device still on the old key finds word of it at its next sync, sealed to
-that key, and writes nothing more under it until paired again. `forget
-NAME` ends a pairing alone.
+only then. Forget it on every device it paired with. From the rotation
+the new key alone writes the store as it is, and the history is frozen:
+the SHA-256 of each file then held, sealed to the new key. The revoked
+device keeps the old key, but what it seals under it changes no entry,
+adds none and is no history, whatever date it claims. It keeps what it
+had, as any copy does: change the passwords it held, at their services.
+A session open here during the rotation writes nothing more until
+unlocked again; a device still on the old key finds word of it at its
+next sync, sealed to that key, and writes nothing more under it until
+paired again (what it wrote under it in between is not read: enter it
+again). A store rotated before 0.4.14 shows no history from before its
+rotation (`age -d` with `pasa keys` still opens it). `forget NAME` ends a
+pairing alone.
 
 ## Migrating
 

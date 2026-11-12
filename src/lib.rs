@@ -8,6 +8,11 @@
 //!   by union. Size 0 deletes.
 //! - `key`: the store keys, newest first, sealed to Argon2id(password,
 //!   YubiKey response). A pairing hands it over as it is, never opened.
+//!
+//! The newest key alone writes the store as it is: a version sealed to an
+//! older one is history, and only if a rotation froze it (its SHA-256 in
+//! `.pasa/history`, under the key that rotation made). A retired key, which
+//! a revoked device keeps, adds nothing and replaces nothing.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -157,9 +162,17 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The store's own entries, not the user's (hidden: a name part begins
+/// with a dot).
+const OWN: &str = ".pasa/";
+
 /// Where a rotation leaves word, sealed to the key it retires, for the
-/// devices still on it (hidden: a name part begins with a dot).
+/// devices still on it.
 const RETIRED: &str = ".pasa/retired/";
+
+/// Where a rotation freezes the history, under the key it makes: the
+/// SHA-256 of every file then trusted. Under older keys, nothing else is.
+const HISTORY: &str = ".pasa/history";
 
 /// What a device on a retired key is told, and why it writes nothing.
 pub const RETIRED_SAY: &str = "this device's store key was retired on \
@@ -236,13 +249,30 @@ impl Version {
 /// version (its time and file) and the latest time of all.
 #[derive(Default)]
 struct Index {
+    /// Under the newest key: the store as it is.
     heads: HashMap<String, Version>,
+    /// Under older keys, with their files' SHA-256: history if frozen.
+    old: HashMap<String, (Version, [u8; 32])>,
+    /// What the newest [`HISTORY`] froze.
+    frozen: HashSet<[u8; 32]>,
     mtime: Option<SystemTime>,
     tips: HashMap<String, (u64, String)>,
     last: u64,
 }
 
+/// Versions oldest first.
+fn sorted<'a>(vs: impl Iterator<Item = &'a Version>) -> Vec<Version> {
+    let mut out: Vec<Version> = vs.cloned().collect();
+    out.sort_by(|a, b| (a.ms, &a.name, &a.file).cmp(&(b.ms, &b.name, &b.file)));
+    out
+}
+
 impl Index {
+    /// History under older keys that a rotation froze.
+    fn past(&self) -> impl Iterator<Item = &(Version, [u8; 32])> {
+        self.old.values().filter(|(_, d)| self.frozen.contains(d))
+    }
+
     fn tip(&mut self, v: &Version) {
         let t = (v.ms, v.file.clone());
         match self.tips.get_mut(&v.name) {
@@ -476,25 +506,35 @@ impl Store {
         }
         if !new.is_empty() {
             self.newest = recipient(&self.keys[0]);
+            // What the newest key opens is read again.
+            *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+                Index::default();
             self.save()?;
         }
         Ok(!new.is_empty())
     }
 
     /// A new store key, first; every entry sealed again to it. History
-    /// stays under the keys it was written to. Devices still on the old key
+    /// stays under the keys it was written to, frozen ([`HISTORY`]): what a
+    /// retired key seals after is not read. Devices still on the old key
     /// find word of it, sealed to that key, at their next sync, and write
     /// nothing more under it ([`Store::retired`]): they pair again.
     pub fn rotate(&mut self) -> Result<()> {
-        let e = self
-            .entries()?
-            .into_values()
-            .map(|v| Ok((v.name.clone(), self.body(&v)?)));
+        let e = self.entries()?.into_values().map(|v| Ok((self.body(&v)?, v)));
         let e = e.collect::<Result<Vec<_>>>()?;
         let old = key_id(self.keys.first().context("no store key")?);
         self.put(&format!("{RETIRED}{old}"), b"retired")?;
+        let x = self.index()?;
+        let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
+        let now: Vec<String> = x.heads.keys().cloned().collect();
+        drop(x);
+        for f in now {
+            frozen.extend(Sha256::digest(fs::read(self.v.join(f))?));
+        }
         self.add_keys(&rand::<32>())?;
-        e.iter().try_for_each(|(n, b)| self.put(n, b))
+        self.put_on(HISTORY, &frozen, None)?;
+        let mut e = e.iter();
+        e.try_for_each(|(b, v)| self.put_on(&v.name, b, Some(v.file.clone())))
     }
 
     /// Whether this device's store key was retired by a rotation on
@@ -509,12 +549,21 @@ impl Store {
         reader(&self.ids, fs::File::open(self.v.join(file))?)
     }
 
-    fn head(&self, file: &str) -> Option<Version> {
-        let mut l = String::new();
-        std::io::BufReader::new(self.version(file).ok()?)
-            .read_line(&mut l)
-            .ok()?;
-        Version::parse(l.strip_suffix('\n')?, file)
+    /// A version's head, and its file's SHA-256 if an older key opened it.
+    fn head(&self, file: &str) -> Option<(Version, Option<[u8; 32]>)> {
+        let line = |r| {
+            let mut l = String::new();
+            std::io::BufReader::new(r).read_line(&mut l).ok()?;
+            Version::parse(l.strip_suffix('\n')?, file)
+        };
+        let (newest, older) = self.ids.split_first()?;
+        let f = fs::File::open(self.v.join(file)).ok()?;
+        if let Ok(r) = reader(std::slice::from_ref(newest), f) {
+            return Some((line(Box::new(r) as Box<dyn Read>)?, None));
+        }
+        let b = fs::read(self.v.join(file)).ok()?;
+        let r = reader(older, &b[..]).ok()?;
+        Some((line(Box::new(r))?, Some(Sha256::digest(&b).into())))
     }
 
     /// `v/` as it is now: new files' heads read, gone ones dropped. Files
@@ -541,12 +590,15 @@ impl Store {
             .filter_map(|e| e.file_name().into_string().ok());
         let names: HashSet<String> = names.filter(|n| is_name(n)).collect();
         x.heads.retain(|f, _| names.contains(f));
+        x.old.retain(|f, _| names.contains(f));
         let mut bad = 0;
-        let new: Vec<&String> =
-            names.iter().filter(|n| !x.heads.contains_key(*n)).collect();
+        let known =
+            |n: &&String| x.heads.contains_key(*n) || x.old.contains_key(*n);
+        let new: Vec<&String> = names.iter().filter(|n| !known(n)).collect();
         for n in new {
             match self.head(n) {
-                Some(h) => drop(x.heads.insert(n.clone(), h)),
+                Some((h, None)) => drop(x.heads.insert(n.clone(), h)),
+                Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
                 None => bad += 1,
             }
         }
@@ -556,17 +608,18 @@ impl Store {
         let heads = std::mem::take(&mut x.heads);
         heads.values().for_each(|v| x.tip(v));
         x.heads = heads;
+        let h = x.tips.get(HISTORY).and_then(|t| x.heads.get(&t.1));
+        let h = h.and_then(|v| self.body(v).ok()).unwrap_or_default();
+        x.frozen =
+            h.chunks_exact(32).filter_map(|d| d.try_into().ok()).collect();
         Ok(x)
     }
 
-    /// Every version's head, oldest first.
+    /// Every version's head, history frozen under older keys too, oldest
+    /// first.
     pub fn versions(&self) -> Result<Vec<Version>> {
-        let mut out: Vec<Version> =
-            self.index()?.heads.values().cloned().collect();
-        out.sort_by(|a, b| {
-            (a.ms, &a.name, &a.file).cmp(&(b.ms, &b.name, &b.file))
-        });
-        Ok(out)
+        let x = self.index()?;
+        Ok(sorted(x.heads.values().chain(x.past().map(|(v, _)| v))))
     }
 
     pub fn body(&self, v: &Version) -> Result<Secret> {
@@ -583,11 +636,10 @@ impl Store {
 
     /// Each entry's newest version, deleted ones left out.
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
-        let mut m: BTreeMap<_, _> =
-            self.versions()?.into_iter().map(|v| (v.name.clone(), v)).collect();
-        // Word of retired keys is the store's own, not an entry.
-        m.retain(|n, v| v.size > 0 && !n.starts_with(RETIRED));
-        Ok(m)
+        let x = self.index()?;
+        let tips = x.tips.values().filter_map(|t| x.heads.get(&t.1));
+        let live = tips.filter(|v| v.size > 0 && !v.name.starts_with(OWN));
+        Ok(live.map(|v| (v.name.clone(), v.clone())).collect())
     }
 
     /// The names of the files attached to entry `name`.
@@ -718,7 +770,7 @@ impl Store {
     /// devices changed them apart. The other change is in `pasa log`.
     pub fn conflicts(&self) -> Result<Vec<String>> {
         let mut last: BTreeMap<String, (String, bool)> = BTreeMap::new();
-        for v in self.versions()? {
+        for v in sorted(self.index()?.heads.values()) {
             let split = last.get(&v.name).is_some_and(|p| p.0 != v.parent);
             last.insert(v.name.clone(), (v.file, split));
         }
@@ -738,8 +790,20 @@ impl Store {
     /// A new version of `name` (empty: deleted): after every version seen,
     /// following the newest of `name`.
     pub fn put(&self, name: &str, body: &[u8]) -> Result<()> {
+        self.put_on(name, body, None)
+    }
+
+    /// [`Store::put`], following `parent` if given (a rotation's: the
+    /// version under the key it retires).
+    fn put_on(
+        &self,
+        name: &str,
+        body: &[u8],
+        parent: Option<String>,
+    ) -> Result<()> {
         let mut x = self.index()?;
-        let parent = x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let tip = || x.tips.get(name).map_or("-".into(), |t| t.1.clone());
+        let parent = parent.unwrap_or_else(tip);
         let now = std::time::UNIX_EPOCH.elapsed()?.as_millis() as u64;
         let ms = now.max(x.last.saturating_add(1));
         self.keep(&mut x, name, body, ms, parent)
@@ -1386,8 +1450,9 @@ mod tests {
         let body = String::from_utf8(s.get("mail").unwrap().to_vec()).unwrap();
         assert_eq!(field(&body, "user").as_deref(), Some("me"));
         assert_eq!(field(&body, "pass").as_deref(), Some("b"));
-        // Four, mail sealed again, and word that the first key is retired.
-        assert_eq!(s.versions().unwrap().len(), 6);
+        // Four, word that the first key is retired (both frozen), the
+        // frozen list, and mail sealed again.
+        assert_eq!(s.versions().unwrap().len(), 7);
         assert!(s.conflicts().unwrap().is_empty());
         fs::write(
             crate::versions(&d).join("0123456789abcdef0123456789abcdef"),
@@ -1396,7 +1461,7 @@ mod tests {
         .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
-        assert_eq!(s.versions().unwrap().len(), 6);
+        assert_eq!(s.versions().unwrap().len(), 7);
         assert_eq!(s.unreadable.load(Relaxed), 1);
         s.lock(b"new", Some((&[9; 32], b"hmac"))).unwrap();
         let k = fs::read(d.join("key")).unwrap();
@@ -1483,6 +1548,69 @@ mod tests {
         let sb = Store::open(&b, b"pw", None).unwrap();
         assert!(!sb.retired());
         sb.put("y", b"3").unwrap();
+    }
+
+    /// A revoked device keeps the retired key: what it seals after the
+    /// rotation, dated now, before or far ahead, neither replaces an entry,
+    /// nor adds one, nor shows in history, nor moves the clock; here and on
+    /// a device paired after.
+    #[test]
+    fn a_retired_key_replaces_and_adds_nothing() {
+        let d = dir("revoked");
+        let (a, r, c) = (d.join("a"), d.join("r"), d.join("c"));
+        let copy = |from: &Path, to: &Path| {
+            fs::create_dir_all(crate::versions(to)).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                fs::copy(e.path(), crate::versions(to).join(e.file_name()))
+                    .unwrap();
+            }
+            fs::copy(from.join("key"), to.join("key")).unwrap();
+        };
+        let s = Store::create(&a, b"pw", None).unwrap();
+        s.put("bank", b"1").unwrap();
+        s.put("mail", b"m").unwrap();
+        drop(s);
+        copy(&a, &r);
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        sa.rotate().unwrap();
+        let sr = Store::open(&r, b"pw", None).unwrap();
+        sr.put("bank", b"forged").unwrap();
+        sr.put("new", b"planted").unwrap();
+        sr.put_at("mail", b"backdated", 1).unwrap();
+        sr.put_at("bank", b"ahead", u64::MAX / 4).unwrap();
+        for e in fs::read_dir(crate::versions(&r)).unwrap().flatten() {
+            let to = crate::versions(&a).join(e.file_name());
+            let _ = fs::copy(e.path(), to);
+        }
+        let check = |s: &Store, n: usize| {
+            assert_eq!(&s.get("bank").unwrap()[..], b"1");
+            assert_eq!(&s.get("mail").unwrap()[..], b"m");
+            assert!(s.get("new").is_err());
+            let names = s.entries().unwrap().into_keys();
+            let names: Vec<String> = names.filter(|n| n != "x").collect();
+            assert_eq!(names, ["bank", "mail"]);
+            for v in s.versions().unwrap() {
+                let b = s.body(&v).unwrap();
+                assert!(
+                    ![&b"forged"[..], b"planted", b"backdated", b"ahead"]
+                        .contains(&&b[..])
+                );
+            }
+            let h = s.history("bank").unwrap();
+            assert_eq!(h.len(), n, "1, and sealed again at each rotation");
+            assert!(s.conflicts().unwrap().is_empty());
+            s.put("x", b"y").unwrap();
+            let x = s.versions().unwrap().into_iter().find(|v| v.name == "x");
+            assert!(x.unwrap().ms < u64::MAX / 8, "the clock stays");
+        };
+        let sa = Store::open(&a, b"pw", None).unwrap();
+        check(&sa, 2);
+        copy(&a, &c);
+        check(&Store::open(&c, b"pw", None).unwrap(), 2);
+        // Rotated again: what was frozen stays history, the rest stays out.
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        sa.rotate().unwrap();
+        check(&sa, 3);
     }
 
     /// Two devices changed one entry apart: the newer wins, and is flagged
