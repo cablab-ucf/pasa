@@ -108,7 +108,7 @@ class MainActivity : ComponentActivity(), Host {
     private fun here(on: Boolean) {
         Native.serve(dir, on)
         watch?.stopWatching()
-        watch = if (!on) null else object : android.os.FileObserver(File(dir, "v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
+        watch = if (!on) null else object : android.os.FileObserver(File(dir, "store/v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
             override fun onEvent(event: Int, path: String?) { main.post { news++ } }
         }.apply { startWatching() }
     }
@@ -134,8 +134,10 @@ class MainActivity : ComponentActivity(), Host {
         get() = syncOn(this)
         set(on) {
             getSharedPreferences("pasa", 0).edit().putBoolean("sync", on).apply()
+            // Off: this app leaves the push connection (its broker stopped,
+            // if it holds it) before the broker is disabled; serving ends.
+            if (on) push(this) else org.pushir.Pushir.stop(this)
             broker(this, on)
-            if (on) push(this)
             here(on)
         }
 

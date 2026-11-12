@@ -994,7 +994,9 @@ impl App {
             if quick.is_some() || keys.is_some() {
                 ui.separator();
                 let l = look(ui);
-                ui.label(RichText::new("Or a key").small().color(l.muted));
+                let or = "Or a key: plugged in, or held to a reader (NFC) \
+                          before you press";
+                ui.label(RichText::new(or).small().color(l.muted));
                 let pin = quick.as_ref().is_some_and(|q| q.1);
                 if pin
                     || keys.as_ref().is_some_and(|f| f.keys.iter().any(|k| k.1))
@@ -1005,13 +1007,16 @@ impl App {
                     if keys.is_some()
                         && ui.button("Unlock with a security key").clicked()
                     {
-                        let say = "Plug in your security key and touch it";
+                        let say =
+                            "Touch your security key, or hold it to the reader";
                         self.begin(ui, Job::Fido, say);
                     }
                     if quick.is_some()
                         && ui.button("Unlock with the YubiKey").clicked()
                     {
-                        self.begin(ui, Job::Quick, "Touch your YubiKey");
+                        let say =
+                            "Touch your YubiKey, or hold it to the reader";
+                        self.begin(ui, Job::Quick, say);
                     }
                 });
             }
@@ -2120,7 +2125,7 @@ impl App {
                 Ok(()) if on => {
                     "Sync on: paired devices sync with this one".into()
                 }
-                Ok(()) => "Offline: nothing goes online".into(),
+                Ok(()) => "Offline: pasa opens no connection".into(),
                 Err(e) => format!("{e:#}"),
             };
             if on {
@@ -2129,7 +2134,7 @@ impl App {
         }
         let about = "Devices that hold this store sync with each other directly, \
                      sealed end to end. No account, no server keeps a copy. Off: \
-                     this computer never uses the network for it. Offline is \
+                     pasa opens no connection for it. Offline is \
                      fine; check in about once a month, and each device says \
                      which others it has not met for longer.";
         ui.label(RichText::new(about).small().color(l.muted));
@@ -2164,7 +2169,9 @@ impl App {
                         v.note = match sync::revoke(&mut v.s, &p.name) {
                             Ok(()) => format!(
                                 "{}: revoked. A new store key: pair the other \
-                                 devices again, and forget {} on each",
+                                 devices again, and forget {} on each. What it \
+                                 knew it still knows: change those passwords at \
+                                 their services",
                                 p.name, p.name
                             ),
                             Err(e) => format!("{e:#}"),

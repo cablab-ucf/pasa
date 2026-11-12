@@ -36,6 +36,9 @@ impl View {
             note,
         };
         v.load();
+        if v.s.retired() {
+            v.note = pasa::RETIRED_SAY.into();
+        }
         v
     }
 

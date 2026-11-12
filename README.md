@@ -15,7 +15,7 @@ pasa mail/work otp                # a field: pass, user, otp, ...
 ```sh
 pasa tui                          # one unlock: type to filter, Enter copies
 pasa gui                          # the same in a window (--features gui)
-nix run github:cablab-ucf/pasa -- gui   # NixOS, macOS: all three, nothing to install
+nix run github:cablab-ucf/pasa          # NixOS, macOS: the window (-- ARGS: pasa ARGS), nothing to install
 ```
 
 `pasa help` lists every command. An entry is text as in `pass`: the
@@ -28,7 +28,10 @@ One binary is the command line, the terminal browser and the window. A
 release has it for Linux (x86-64, glibc) and macOS (Apple silicon, with
 `pasa.app`); elsewhere, and on NixOS, build it: the flake's `pasa-gui`
 (default) or `pasa-cli` (no window libraries), or `cargo install --locked
---path . --features gui`. `pasa.app` is signed ad hoc, by no Apple account:
+--path . --features gui`. Built on Linux it needs libudev, libclang and
+pcsc-lite (Debian: `libudev-dev libclang-dev libpcsclite-dev`); the flake
+brings them. `pasa.app` is
+signed ad hoc, by no Apple account:
 after a download, `xattr -dr com.apple.quarantine pasa.app`.
 
 The window is laid out as the Android app is: a first run asks for the
@@ -83,10 +86,11 @@ libxkbcommon, libGL and Wayland or X11, as any does (the flake brings them).
 ## Files
 
 ```
-~/.pasa/key      store keys, sealed to the password (+ YubiKey); paired, as it is
-~/.pasa/v/       versions: age files, named by their hash; synced, as they are
-~/.pasa/net/     what the network side sees beside v/: pairings (transport key, endpoint,
-                 lane), this device's endpoint key and lane
+~/.pasa/key        store keys, sealed to the password (+ YubiKey); paired, as it is
+~/.pasa/store/v/   versions: age files, named by their hash; synced, as they are
+~/.pasa/store/.git if you make one: git's work tree is store/, ciphertext alone
+~/.pasa/net/       what the network side sees beside store/v/: pairings (transport key,
+                   endpoint, lane), this device's endpoint key and lane
 ```
 
 Nothing else is written: no index, no cache. A listing opens every
@@ -104,13 +108,36 @@ two devices changing an entry apart show up in `pasa ls` until an edit
 follows the winner. A file alone tells nothing: not its entry, not its
 history. Back up `~/.pasa` with anything.
 
-`git init ~/.pasa/v` and pasa commits each new version there, and pushes
-if a remote is set (`git push -u` once): a remote holds what `serve` does,
-ciphertext, and learns when you change things. A version deleted from
-`v/` is then named by `pasa ls` and restored by `git checkout .`.
+`git init ~/.pasa/store` and pasa commits each new version there, and
+pushes if a remote is set (`git -C ~/.pasa/store remote add origin URL`,
+then `git -C ~/.pasa/store push -u origin HEAD` once): a remote holds what
+`serve` does, ciphertext, and learns when you change things. git's whole
+world is `store/`: the versions, and no key, so no git command, however
+mistaken, reaches one. The network side writes in `store/v/`, never in
+`store/.git`, so no hook or config of its can run; hooks never run
+anyway, and only versions are committed (a name of 32 hex digits, an age
+file), not whatever else lies in `v/`. Versions in `~/.pasa/v/` (before)
+move into `store/v/` by themselves, and a repository made there
+(`v/.git`) up to `store/.git`, its hooks dropped and its config cut to
+its remotes and branches. A version deleted is then named by `pasa ls`
+and restored by `git -C ~/.pasa/store checkout v`.
+
+`pasa edit` (and `^E` in the terminal browser) hands `$EDITOR` a file in a directory of its own (the owner
+alone), on a file system in memory where there is one (Linux:
+`$XDG_RUNTIME_DIR`, `/dev/shm`), removed whole after, with whatever the
+editor left beside it (swap, backup). Vim and Neovim are told to keep no
+swap, backup, undo file or history. Another editor's own history, and on
+macOS (no file system in memory) the per-user temp dir, are beyond that:
+there `pasa set` (from stdin) and the window edit in memory.
 
 ## Keys
 
+- **Each way in opens the store alone.** The password (with the YubiKey
+  as well, if the store was made with `-y`: then both are needed); or a
+  security key and its PIN (`ctap`); or a YubiKey and pasa's PIN
+  (`quick`). The last two are other ways in beside the password, not
+  further factors after it: a store is as hard to open as the weakest way
+  set up on the device that holds it.
 - **Store keys**: 256 random bits each (hedged with the password, RFC
   8937), newest first; never derived.
 - **Their lock**: Argon2id (256 MiB, 4 passes) of the password, with the
@@ -132,7 +159,10 @@ ciphertext, and learns when you change things. A version deleted from
   added on a computer before, asked the salt as it is, still open it
   there). On a computer pasa speaks CTAP2 itself, over USB
   (authenticator-rs, Firefox's): nothing to install, and nothing a
-  system guards as a keyboard (macOS asks no Input Monitoring). `ctap`
+  system guards as a keyboard (macOS asks no Input Monitoring), or held
+  to an NFC reader (PC/SC: pcsc-lite's `pcscd` on Linux,
+  `services.pcscd.enable` on NixOS; macOS's own), a key's CTAP2 then
+  carried in ISO 7816 APDUs. `ctap`
   holds, a line a key, the credential and the key the password opens
   sealed to that answer. A key is added whenever the store is open, so a
   spare can come later. With a PIN on the
@@ -151,9 +181,11 @@ ciphertext, and learns when you change things. A version deleted from
   open the store; so does the password alone, which must therefore be
   long. The key alone opens nothing; the device's storage with the key
   leaves only the PIN to guess, at Argon2id's pace: days for six digits.
-  `passwd` ends it. A computer asks slot 2 through `ykman`, which reaches
-  it by the key's keyboard side: macOS opens that only to apps given
-  Input Monitoring, so on a Mac add the YubiKey as a security key instead.
+  `passwd` ends it. A computer asks slot 2 itself of a YubiKey held to an
+  NFC reader, or by its smart-card side plugged in where the key allows
+  it; else through `ykman`, which reaches it by the key's keyboard side:
+  macOS opens that only to apps given Input Monitoring, so on a Mac add
+  the YubiKey as a security key instead.
 - **Transport keys, endpoints, lanes**: what `serve` holds; none opens
   a version or the key file.
 
@@ -171,10 +203,13 @@ pasa sync              # with every peer, all at once (also after each change)
 
 **Offline by default.** Each device has a switch, off until turned on
 (pairing turns it on): `pasa sync on|off`, the window's Devices or its
-status bar, `^S` in `pasa tui`, the phone's Devices. Off, nothing of the
-store goes online: no serving (`pasa serve` and its service wait, and
+status bar, `^S` in `pasa tui`, the phone's Devices. Off, pasa opens no
+connection of its own: no serving (`pasa serve` and its service wait, and
 start or stop within seconds of the switch), no listening, no sync after
-a change. Offline is the norm; check in about once a month. Each device
+a change; the phone leaves the push connection (its own broker stopped;
+another app of its group may keep one of its own). A breach check
+(`health --pwned`, Password health) asks its site only when asked to.
+Offline is the norm; check in about once a month. Each device
 keeps when each other last synced with it, and says which it has not met
 for a month: in the window's status bar and Devices, `pasa peers`, on a
 terminal's commands, and above the phone's list.
@@ -200,14 +235,18 @@ that differed is kept as `key.old`; its own hardware keys' files, which
 opened that one alone, go).
 
 **Syncing** sends versions, age files to the store key, as they are; the
-new device syncs at once, before anything is unlocked. It runs in a
-process of its own that sees `v/` and `net/` alone: never `key`, the
-rest of `~/.pasa` or of the computer. On Linux it confines itself by
-Landlock before it opens a socket (a kernel without Landlock: it says so
-and runs unconfined); on macOS its parent starts it inside the system
-sandbox (`sandbox-exec`), which keeps it out of `/Users`, `/Volumes` and
-the temporary directories but for `v/` and `net/`. The process that
-holds the store open (the window, a command) opens no socket. The window
+new device syncs at once, before anything is unlocked. On every platform
+what crosses the network is ciphertext: versions, and at pairing the
+sealed key files. Beyond that, and as far as the system allows (best
+effort), a computer runs it in a process of its own that sees `store/v/` and
+`net/` alone: never `key`, the rest of `~/.pasa` or of the computer. On
+Linux it confines itself by Landlock before it opens a socket (a kernel
+without Landlock: it says so and runs unconfined); on macOS its parent
+starts it inside the system sandbox (`sandbox-exec`), which keeps it out
+of `/Users`, `/Volumes` and the temporary directories but for `store/v/` and
+`net/`. The process that holds the store open (the window, a command)
+opens no socket. On Android the app is one process: its network code
+shares it with an unlocked store. The window
 serves while it is open, the Android app while it is on the screen; each
 sync tells the other device where this one serves, so after the first,
 either dials. A device not met yet, or not reached in 15 s, is said, not
@@ -224,14 +263,17 @@ files, its endpoint key and the pairings: taking it over yields
 ciphertext. One process serves a store at a time (a lock on the endpoint
 key): the window and a daemon would take each other's place at the
 relay. Dialers use throwaway endpoints. Received files must match
-their names, be asked for, and be under 16 MiB; strays in `v/` are
+their names, be asked for, and be under 16 MiB; strays in `store/v/` are
 ignored.
 
 A wake (after a change here, or Sync now; never otherwise) is an empty
 message to a peer's lane, through [pushir](https://github.com/cablab-ucf/pushir), which
 seals it: the relay sees a mailbox and 1024 random-looking bytes. It says
 "sync" and nothing else, so one lost, repeated or forged by a peer costs a
-sync at most; a device also syncs when its connection comes back. Every
+sync at most; a device also syncs when its connection comes back.
+What a relay sees is not hidden: the addresses of the devices that use
+it, their endpoint ids (each device keeps one), and when and how much
+they exchange; a pushir relay, a mailbox and when frames come. Every
 peer of a device holds its lane's secret, so `forget` and `revoke` make a
 new one, which the peers that stay get at their next sync (`listen` moves
 to it within a quarter of an hour, the Android app when it next starts).
@@ -240,7 +282,11 @@ to it within a quarter of an hour, the Android app when it next starts).
 sealed again to a new key. Keys travel by pairing alone, so pair the
 other devices again from here; what follows the rotation opens there
 only then. Forget it on every device it paired with. It keeps what it
-had: change the passwords it held. `forget NAME` ends a pairing alone.
+had: change the passwords it held, at their services. A session open
+here during the rotation writes nothing more until unlocked again; a
+device still on the old key finds word of it at its next sync, sealed to
+that key, and writes nothing more under it until paired again. `forget
+NAME` ends a pairing alone.
 
 ## Migrating
 

@@ -118,6 +118,24 @@ pub fn is_name(n: &str) -> bool {
     n.len() == 32 && n.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The versions: `store/v/`, beside the store's git repository, if one is
+/// made (`store/.git`), and apart from the keys: git's whole world is
+/// ciphertext. Moved from `v/`, where they lay before, the first time asked
+/// (one by one, if something made `store/v/` first).
+pub fn versions(dir: &Path) -> PathBuf {
+    let (v, old) = (dir.join("store").join("v"), dir.join("v"));
+    if old.is_dir() {
+        let _ = fs::create_dir_all(dir.join("store"));
+        if fs::rename(&old, &v).is_err() {
+            for e in fs::read_dir(&old).into_iter().flatten().flatten() {
+                let _ = fs::rename(e.path(), v.join(e.file_name()));
+            }
+            let _ = fs::remove_dir(&old);
+        }
+    }
+    v
+}
+
 pub fn home() -> PathBuf {
     let h = || std::env::home_dir().unwrap_or_default().join(".pasa");
     std::env::var_os("PASA_DIR").map_or_else(h, PathBuf::from)
@@ -138,6 +156,24 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     let _ = fs::File::open(dir).and_then(|d| d.sync_all());
     Ok(())
 }
+
+/// Where a rotation leaves word, sealed to the key it retires, for the
+/// devices still on it (hidden: a name part begins with a dot).
+const RETIRED: &str = ".pasa/retired/";
+
+/// What a device on a retired key is told, and why it writes nothing.
+pub const RETIRED_SAY: &str = "this device's store key was retired on \
+    another device (a revocation): pair again from it; nothing more is \
+    written under the old key";
+
+/// A store key's name in such word: 128 bits of its SHA-256.
+fn key_id(k: &[u8]) -> String {
+    HEXLOWER.encode(&Sha256::digest(k)[..16])
+}
+
+/// What is said where there is no store yet: both ways to have one.
+pub const NO_STORE: &str = "no store here: pasa init makes one; or pasa join \
+    NAME CODE takes one from a device that has it (pasa pair NAME there)";
 
 /// The YubiKey challenge in a key file, if it has one.
 pub fn challenge(key: &[u8]) -> Option<&[u8]> {
@@ -220,6 +256,8 @@ impl Index {
 
 pub struct Store {
     pub dir: PathBuf,
+    /// [`versions`].
+    v: PathBuf,
     /// Store keys, newest first: older ones open history.
     keys: Vec<Secret>,
     ids: Vec<age::scrypt::Identity>,
@@ -242,6 +280,7 @@ impl Store {
     ) -> Result<Store> {
         Ok(Store {
             dir: dir.into(),
+            v: versions(dir),
             ids: keys.iter().map(|k| identity(k)).collect(),
             newest: recipient(keys.first().context("no store key")?),
             keys,
@@ -268,7 +307,7 @@ impl Store {
 
     /// Open with the password and, if `key` asks, the YubiKey's response.
     pub fn open(dir: &Path, pw: &[u8], yk: Option<&[u8]>) -> Result<Store> {
-        let f = fs::read(dir.join("key")).context("no store: pasa init")?;
+        let f = fs::read(dir.join("key")).context(NO_STORE)?;
         let salt = f.get(..32).context("not a pasa key file")?;
         Store::unsealed(dir, kek(pw, salt, yk)?)
             .context("wrong password or key")
@@ -353,7 +392,7 @@ impl Store {
 
     /// With the key the password gives.
     fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
-        let f = fs::read(dir.join("key")).context("no store: pasa init")?;
+        let f = fs::read(dir.join("key")).context(NO_STORE)?;
         let (salt, sealed) =
             f.split_at_checked(33).context("not a pasa key file")?;
         let keys = open(&kek, sealed).context("the key does not open it")?;
@@ -443,19 +482,31 @@ impl Store {
     }
 
     /// A new store key, first; every entry sealed again to it. History
-    /// stays under the keys it was written to.
+    /// stays under the keys it was written to. Devices still on the old key
+    /// find word of it, sealed to that key, at their next sync, and write
+    /// nothing more under it ([`Store::retired`]): they pair again.
     pub fn rotate(&mut self) -> Result<()> {
         let e = self
             .entries()?
             .into_values()
             .map(|v| Ok((v.name.clone(), self.body(&v)?)));
         let e = e.collect::<Result<Vec<_>>>()?;
+        let old = key_id(self.keys.first().context("no store key")?);
+        self.put(&format!("{RETIRED}{old}"), b"retired")?;
         self.add_keys(&rand::<32>())?;
         e.iter().try_for_each(|(n, b)| self.put(n, b))
     }
 
+    /// Whether this device's store key was retired by a rotation on
+    /// another device (a revocation): nothing more is written under it.
+    pub fn retired(&self) -> bool {
+        let Some(k) = self.keys.first() else { return false };
+        let at = format!("{RETIRED}{}", key_id(k));
+        self.index().is_ok_and(|x| x.tips.contains_key(&at))
+    }
+
     fn version(&self, file: &str) -> Result<impl Read + use<'_>> {
-        reader(&self.ids, fs::File::open(self.dir.join("v").join(file))?)
+        reader(&self.ids, fs::File::open(self.v.join(file))?)
     }
 
     fn head(&self, file: &str) -> Option<Version> {
@@ -470,7 +521,7 @@ impl Store {
     /// no store key opens are counted in [`Store::unreadable`].
     fn index(&self) -> Result<std::sync::MutexGuard<'_, Index>> {
         let mut x = self.index.lock().unwrap_or_else(|p| p.into_inner());
-        let v = self.dir.join("v");
+        let v = self.v.clone();
         let mtime = fs::metadata(&v).and_then(|m| m.modified()).ok();
         // A listing made within the directory's own two seconds may be
         // behind it (a sync writes beside us, in the same tick).
@@ -534,7 +585,8 @@ impl Store {
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
         let mut m: BTreeMap<_, _> =
             self.versions()?.into_iter().map(|v| (v.name.clone(), v)).collect();
-        m.retain(|_, v| v.size > 0);
+        // Word of retired keys is the store's own, not an entry.
+        m.retain(|n, v| v.size > 0 && !n.starts_with(RETIRED));
         Ok(m)
     }
 
@@ -621,8 +673,7 @@ impl Store {
             .filter_map(|f| Some(f.0.rsplit_once('/')?.0))
             .collect();
         let unique: HashSet<&str> = forms.iter().map(|f| &*f.1.pass).collect();
-        let size =
-            fs::read_dir(self.dir.join("v")).into_iter().flatten().flatten();
+        let size = fs::read_dir(&self.v).into_iter().flatten().flatten();
         let size: u64 =
             size.filter_map(|e| Some(e.metadata().ok()?.len())).sum();
         let date = |ms: Option<u64>| {
@@ -731,6 +782,25 @@ impl Store {
     ) -> Result<()> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
+        // Nothing more under a key that may be retired: one a rotation or
+        // relock here replaced since this unlock, or one another device
+        // retired (word of it came by sync).
+        let loaded = self.loaded.lock().unwrap_or_else(|p| p.into_inner());
+        let now = fs::read(self.dir.join("key")).unwrap_or_default();
+        ensure!(
+            now == *loaded,
+            "the store key changed since this unlock (a rotation, a new \
+             password or a pairing): unlock again"
+        );
+        drop(loaded);
+        let newest = self.keys.first().context("no store key")?;
+        ensure!(
+            name.starts_with(RETIRED)
+                || !x
+                    .tips
+                    .contains_key(&format!("{RETIRED}{}", key_id(newest))),
+            "{RETIRED_SAY}"
+        );
         ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
         let mut v = Version {
             ms,
@@ -745,9 +815,8 @@ impl Store {
         pt.resize(n, 0);
         let ct = encrypt(&self.newest, &pt)?;
         v.file = name_of(&ct);
-        write(&self.dir.join("v").join(&v.file), &ct)?;
-        x.mtime =
-            fs::metadata(self.dir.join("v")).and_then(|m| m.modified()).ok();
+        write(&self.v.join(&v.file), &ct)?;
+        x.mtime = fs::metadata(&self.v).and_then(|m| m.modified()).ok();
         x.tip(&v);
         x.heads.insert(v.file.clone(), v);
         Ok(())
@@ -1317,13 +1386,17 @@ mod tests {
         let body = String::from_utf8(s.get("mail").unwrap().to_vec()).unwrap();
         assert_eq!(field(&body, "user").as_deref(), Some("me"));
         assert_eq!(field(&body, "pass").as_deref(), Some("b"));
-        assert_eq!(s.versions().unwrap().len(), 5);
+        // Four, mail sealed again, and word that the first key is retired.
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert!(s.conflicts().unwrap().is_empty());
-        fs::write(d.join("v/0123456789abcdef0123456789abcdef"), b"not ours")
-            .unwrap();
+        fs::write(
+            crate::versions(&d).join("0123456789abcdef0123456789abcdef"),
+            b"not ours",
+        )
+        .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
-        assert_eq!(s.versions().unwrap().len(), 5);
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert_eq!(s.unreadable.load(Relaxed), 1);
         s.lock(b"new", Some((&[9; 32], b"hmac"))).unwrap();
         let k = fs::read(d.join("key")).unwrap();
@@ -1345,6 +1418,73 @@ mod tests {
         assert_eq!(Store::open(&d, b"pw", None).unwrap().keys().len(), 2);
     }
 
+    /// Versions move from `v/` into `store/v/`, all of them, also when
+    /// something made `store/v/` first; the store opens there as before.
+    #[test]
+    fn versions_move_into_store() {
+        let d = dir("move");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        s.put("x", b"1").unwrap();
+        drop(s);
+        fs::rename(versions(&d), d.join("v")).unwrap();
+        fs::write(d.join("v/a"), b"").unwrap();
+        fs::create_dir_all(d.join("store/v")).unwrap();
+        let s = Store::open(&d, b"pw", None).unwrap();
+        assert!(!d.join("v").exists());
+        assert!(d.join("store/v/a").exists());
+        assert_eq!(&s.get("x").unwrap()[..], b"1");
+    }
+
+    /// A session opened before a rotation writes nothing more: its key
+    /// may be the one retired. Opened again, it writes.
+    #[test]
+    fn a_stale_session_writes_nothing() {
+        let d = dir("stale-write");
+        drop(Store::create(&d, b"pw", None).unwrap());
+        let mut a = Store::open(&d, b"pw", None).unwrap();
+        let b = Store::open(&d, b"pw", None).unwrap();
+        b.put("x", b"1").unwrap();
+        a.rotate().unwrap();
+        assert!(b.put("x", b"2").is_err(), "sealed to a retired key");
+        assert!(b.remove("x").is_err());
+        a.put("x", b"3").unwrap();
+        Store::open(&d, b"pw", None).unwrap().put("x", b"4").unwrap();
+    }
+
+    /// A device still on a key that another retired (a revocation) learns
+    /// it by sync, and writes nothing more under it; paired again, it does.
+    #[test]
+    fn a_retired_key_is_learnt_by_sync() {
+        let d = dir("retired");
+        let (a, b) = (d.join("a"), d.join("b"));
+        let s = Store::create(&a, b"pw", None).unwrap();
+        s.put("x", b"1").unwrap();
+        drop(s);
+        let sync = |from: &Path, to: &Path| {
+            fs::create_dir_all(crate::versions(to)).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                fs::copy(e.path(), crate::versions(to).join(e.file_name()))
+                    .unwrap();
+            }
+        };
+        sync(&a, &b);
+        fs::copy(a.join("key"), b.join("key")).unwrap();
+        Store::open(&b, b"pw", None).unwrap().put("y", b"2").unwrap();
+        let mut sa = Store::open(&a, b"pw", None).unwrap();
+        sa.rotate().unwrap();
+        assert!(!sa.retired());
+        sync(&a, &b);
+        let sb = Store::open(&b, b"pw", None).unwrap();
+        assert!(sb.retired());
+        assert!(sb.put("y", b"3").is_err());
+        assert_eq!(&sb.get("x").unwrap()[..], b"1", "it still reads");
+        // Paired again: the key file that holds the new key.
+        fs::copy(a.join("key"), b.join("key")).unwrap();
+        let sb = Store::open(&b, b"pw", None).unwrap();
+        assert!(!sb.retired());
+        sb.put("y", b"3").unwrap();
+    }
+
     /// Two devices changed one entry apart: the newer wins, and is flagged
     /// until an edit follows it.
     #[test]
@@ -1354,9 +1494,10 @@ mod tests {
         s.put("x", b"1").unwrap();
         let o = d.join("other");
         let copy = |from: &Path, to: &Path| {
-            for e in fs::read_dir(from.join("v")).unwrap().flatten() {
-                fs::create_dir_all(to.join("v")).unwrap();
-                fs::copy(e.path(), to.join("v").join(e.file_name())).unwrap();
+            for e in fs::read_dir(crate::versions(from)).unwrap().flatten() {
+                fs::create_dir_all(crate::versions(to)).unwrap();
+                fs::copy(e.path(), crate::versions(to).join(e.file_name()))
+                    .unwrap();
             }
         };
         copy(&d, &o);
@@ -1379,7 +1520,7 @@ mod tests {
         let s = Store::create(&d, b"pw", None).unwrap();
         s.put("x", b"hunter2").unwrap();
         let v = &s.entries().unwrap()["x"];
-        let ct = fs::read(d.join("v").join(&v.file)).unwrap();
+        let ct = fs::read(crate::versions(&d).join(&v.file)).unwrap();
         assert!(ct.starts_with(b"age-encryption.org/v1\n-> scrypt "));
         let pt = open(&s.keys()[0], &ct).unwrap();
         assert!(pt.starts_with(format!("{}\nhunter2", v.line()).as_bytes()));
@@ -1394,7 +1535,7 @@ mod tests {
         let s = Store::create(&d, b"pw", None).unwrap();
         let line = format!("{} - {} x\n", u64::MAX, usize::MAX);
         let ct = seal(&s.keys()[0], line.as_bytes()).unwrap();
-        write(&d.join("v").join(name_of(&ct)), &ct).unwrap();
+        write(&crate::versions(&d).join(name_of(&ct)), &ct).unwrap();
         assert!(s.get("x").is_err(), "damaged");
         s.put("y", b"after").unwrap();
         assert_eq!(&s.get("y").unwrap()[..], b"after");

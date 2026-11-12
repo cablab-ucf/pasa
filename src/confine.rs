@@ -1,4 +1,4 @@
-//! The network side runs as a process of its own that sees `v/` and `net/`
+//! The network side runs as a process of its own that sees `store/v/` and `net/`
 //! alone: never a key file, never the rest of the computer. On Linux it
 //! confines itself by Landlock before it opens a socket; on macOS its
 //! parent starts it inside the system's sandbox (`sandbox-exec`). Its
@@ -40,7 +40,7 @@ pub fn confine(dir: &Path) -> anyhow::Result<bool> {
         RulesetStatus, path_beneath_rules,
     };
     let abi = ABI::V5;
-    let own = [dir.join("v"), dir.join("net")];
+    let own = [crate::versions(dir), dir.join("net")];
     own.iter().try_for_each(std::fs::create_dir_all)?;
     let system = [
         "/etc",
@@ -77,7 +77,7 @@ fn profile(dir: &Path, exe: &Path) -> Option<String> {
         let p = std::fs::canonicalize(p).ok()?;
         Some(format!("{:?}", p.to_str()?))
     };
-    let own = [dir.join("v"), dir.join("net")];
+    let own = [crate::versions(dir), dir.join("net")];
     own.iter().try_for_each(std::fs::create_dir_all).ok()?;
     let (v, net, exe) = (at(&own[0])?, at(&own[1])?, at(exe)?);
     let certs: String = certs()
@@ -105,7 +105,7 @@ mod tests {
     /// Run in a child: what it may read and write.
     fn probe(dir: &Path) {
         assert!(confine(dir).unwrap(), "not confined");
-        assert!(fs::read(dir.join("v/x")).is_ok(), "v/");
+        assert!(fs::read(crate::versions(dir).join("x")).is_ok(), "v/");
         assert!(fs::write(dir.join("net/peers"), b"").is_ok(), "net/");
         assert!(fs::read(dir.join("key")).is_err(), "the key file");
         assert!(fs::read(dir.join("dev")).is_err(), "dev");
@@ -126,8 +126,8 @@ mod tests {
             return probe(Path::new(&d));
         }
         let d = crate::tests::dir("confine").join("store");
-        fs::create_dir_all(d.join("v")).unwrap();
-        fs::write(d.join("v/x"), b"age").unwrap();
+        fs::create_dir_all(crate::versions(&d)).unwrap();
+        fs::write(crate::versions(&d).join("x"), b"age").unwrap();
         fs::write(d.join("key"), b"sealed").unwrap();
         fs::write(d.join("dev"), b"sealed").unwrap();
         fs::write(d.parent().unwrap().join("beside"), b"mine").unwrap();

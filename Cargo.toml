@@ -1,6 +1,6 @@
 [package]
 name = "pasa"
-version = "0.4.13"
+version = "0.4.14"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.97"
@@ -21,7 +21,7 @@ sync = ["dep:irnet", "dep:pairir", "dep:pushir", "dep:iroh", "dep:tokio", "dep:q
 # A QR code by the camera, or in a picture (desktop; Android scans with ZXing).
 scan = ["sync", "dep:rqrr", "dep:rxing", "dep:nokhwa", "dep:image"]
 # Security keys by CTAP2 over USB, in-process (desktop; Android: Yubico's kit).
-fido = ["dep:authenticator"]
+fido = ["dep:authenticator", "dep:pcsc"]
 tui = ["dep:crossterm"]
 gui = ["dep:eframe", "dep:winit", "scan", "fido"]
 
@@ -56,6 +56,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # CTAP2 to security keys over USB HID: Firefox's own, with RustCrypto. No
 # tool to install, no keyboard access (macOS asks no Input Monitoring).
 authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"], optional = true }
+# Smart cards: a YubiKey held to an NFC reader (or its CCID side, plugged
+# in), through the system's PC/SC (pcsc-lite; macOS's own).
+pcsc = { version = "2.9", optional = true }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
 # The frame (close, minimise, maximise) that GNOME on Wayland leaves to the app.

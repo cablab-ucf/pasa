@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use data_encoding::HEXLOWER;
 use pasa::{Secret, Store, challenge, field, home, rand};
 use std::io::{IsTerminal, Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -21,11 +22,12 @@ use authenticator::ctap2::server::{
     Transport, UserVerificationRequirement,
 };
 use authenticator::statecallback::StateCallback;
-use authenticator::{Pin, StatusPinUv, StatusUpdate};
+use authenticator::{FidoDevice, Pin, StatusPinUv, StatusUpdate};
 use sha2::Digest;
 
 #[cfg(feature = "gui")]
 mod gui;
+mod nfc;
 #[cfg(feature = "scan")]
 mod scan;
 #[cfg(feature = "tui")]
@@ -40,7 +42,8 @@ pasa [show] NAME [FIELD]     entry, or a field: pass, user, otp, ...
 pasa cp NAME [FIELD]         to the clipboard for 45 s
 pasa pick [FIELD]            choose the entry with fzf, then as cp
 pasa set NAME                from stdin (a terminal: the password)
-pasa edit NAME               in $EDITOR
+pasa edit NAME               in $EDITOR, its file in memory where the system has room for
+                             it (not macOS); pasa set and the window never write it out
 pasa gen NAME [N] [-n] [-c]  new password of N characters (-n: no symbols, -c: copy)
 pasa gen NAME [N] -w [-d] [-s CHARS] [-l]
                              ... of N speakable words (-d: dash-ed, -s: one of
@@ -55,14 +58,15 @@ pasa rm NAME | mv OLD NEW
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
-pasa ctap | ctap off         let the security key plugged in open the store here beside
-                             the password, by CTAP2 (FIDO2 without the network: only
-                             this machine and the key, over USB); again for a spare, at
-                             any time. off: none does. Pairing brings them along
+pasa ctap | ctap off         let the security key plugged in (or held to an NFC reader)
+                             open the store here beside the password, by CTAP2 (FIDO2
+                             without the network: only this machine and the key); again
+                             for a spare, at any time. off: none does. Pairing brings them
 pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
                              spare with the same secret, now or never: have both at hand
-pasa quick [-n] | quick off  open here by a YubiKey tap and a PIN (-n: no PIN); the
-                             password still opens it alone, so make it long
+pasa quick [-n] | quick off  open here by a YubiKey (touched, or held to an NFC reader)
+                             and a PIN (-n: no PIN); the password still opens it alone,
+                             so make it long. A key on a reader: held there first
 pasa keys                    the store keys: age -d takes them as passphrases
 pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys' too), to
                              a new device called NAME here: a code to type, or a QR code
@@ -85,8 +89,15 @@ fn new_password() -> Result<Secret> {
     Ok(p)
 }
 
-/// The YubiKey's HMAC-SHA1 (slot 2) of `c`.
+/// The YubiKey's HMAC-SHA1 (slot 2) of `c`: on a reader (held to it, or
+/// its smart-card side plugged in), in this process; else by USB, ykman.
 fn yubikey(c: &[u8]) -> Result<Secret> {
+    if let Some(mut k) = nfc::card(nfc::OTP) {
+        match nfc::slot2(&mut k, c) {
+            Ok(r) => return Ok(Zeroizing::new(r)),
+            Err(e) => eprintln!("{e:#}: now by USB"),
+        }
+    }
     eprintln!("Touch your YubiKey");
     let o = Command::new("ykman")
         .args(["otp", "calculate", "2", &HEXLOWER.encode(c)])
@@ -152,14 +163,11 @@ fn ctap<T: Send + 'static>(
     typed: Option<&[u8]>,
     wait: u64,
     go: impl FnOnce(
-        &mut AuthenticatorService,
-        u64,
+        Via,
         Sender<StatusUpdate>,
         StateCallback<authenticator::Result<T>>,
     ) -> authenticator::Result<()>,
 ) -> Result<T> {
-    let mut m = AuthenticatorService::new()?;
-    m.add_u2f_usb_hid_platform_transports();
     let (status, said) = channel();
     let text =
         |p: &[u8]| Zeroizing::new(String::from_utf8_lossy(p).into_owned());
@@ -216,7 +224,19 @@ fn ctap<T: Send + 'static>(
     let done = StateCallback::new(Box::new(move |r| {
         let _ = tx.send(r);
     }));
-    go(&mut m, wait, status, done)?;
+    // A key on a reader (NFC) is used as it is held there; else USB's.
+    let mut usb = AuthenticatorService::new()?;
+    match nfc::card(nfc::FIDO).map(nfc::Fido::new) {
+        Some(mut f) => {
+            let init = f.init();
+            init.map_err(|e| anyhow::anyhow!("the key on the reader: {e}"))?;
+            go(Via::Card(&mut f), status, done)?
+        }
+        None => {
+            usb.add_u2f_usb_hid_platform_transports();
+            go(Via::Usb(&mut usb, wait), status, done)?
+        }
+    }
     let got = rx.recv()?;
     let why = *why.lock().unwrap_or_else(|p| p.into_inner());
     got.map_err(|e| {
@@ -225,6 +245,50 @@ fn ctap<T: Send + 'static>(
             why.map_or(e.to_string(), String::from)
         )
     })
+}
+
+/// Where a security key is asked: on a reader, or on USB (`wait`: ms).
+enum Via<'a> {
+    Usb(&'a mut AuthenticatorService, u64),
+    Card(&'a mut nfc::Fido),
+}
+
+type Done<R> = StateCallback<authenticator::Result<R>>;
+
+impl Via<'_> {
+    fn sign(
+        self,
+        ask: SignArgs,
+        status: Sender<StatusUpdate>,
+        done: Done<authenticator::SignResult>,
+    ) -> authenticator::Result<()> {
+        match self {
+            Via::Usb(m, t) => m.sign(t, ask, status, done),
+            Via::Card(f) => {
+                // It answers in this thread; `done` has the outcome.
+                let _ =
+                    authenticator::ctap2::sign(f, ask, status, done, &|| true);
+                Ok(())
+            }
+        }
+    }
+
+    fn register(
+        self,
+        ask: RegisterArgs,
+        status: Sender<StatusUpdate>,
+        done: Done<authenticator::RegisterResult>,
+    ) -> authenticator::Result<()> {
+        match self {
+            Via::Usb(m, t) => m.register(t, ask, status, done),
+            Via::Card(f) => {
+                let alive = &|| true;
+                let _ =
+                    authenticator::ctap2::register(f, ask, status, done, alive);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// `salt` as WebAuthn's PRF hands it to a key: SHA-256("WebAuthn PRF", 0,
@@ -251,7 +315,7 @@ fn fido_secret(
         true => UserVerificationRequirement::Preferred,
         false => UserVerificationRequirement::Discouraged,
     };
-    let got = ctap(typed, 30_000, |m, t, status, done| {
+    let got = ctap(typed, 30_000, |via, status, done| {
         let ask = SignArgs {
             client_data_hash: rand::<32>(),
             origin: RP.into(),
@@ -269,7 +333,7 @@ fn fido_secret(
             pin: None,
             use_ctap1_fallback: false,
         };
-        m.sign(t, ask, status, done)
+        via.sign(ask, status, done)
     })?;
     let out =
         got.extensions.hmac_get_secret.context("the key gave no secret")?;
@@ -297,7 +361,7 @@ fn allow(keys: &[(Vec<u8>, bool)]) -> Vec<PublicKeyCredentialDescriptor> {
 /// Whether a security key plugged in holds one of `keys`: asked without a
 /// touch or a PIN, a moment's wait.
 fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
-    let probe = |m: &mut AuthenticatorService, t, status, done| {
+    let probe = |via: Via, status, done| {
         let ask = SignArgs {
             client_data_hash: rand::<32>(),
             origin: RP.into(),
@@ -309,7 +373,7 @@ fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
             pin: None,
             use_ctap1_fallback: false,
         };
-        m.sign(t, ask, status, done)
+        via.sign(ask, status, done)
     };
     ctap(Some(b""), 1500, probe).is_ok()
 }
@@ -319,7 +383,7 @@ fn fido_here(keys: &[(Vec<u8>, bool)]) -> bool {
 /// of), with its PIN if it has one, and the key the password opens sealed
 /// to its secret. `typed`: its PIN, from a window.
 pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
-    let made = ctap(typed, 30_000, |m, t, status, done| {
+    let made = ctap(typed, 30_000, |via, status, done| {
         let ask = RegisterArgs {
             client_data_hash: rand::<32>(),
             relying_party: RelyingParty {
@@ -345,7 +409,7 @@ pub(crate) fn fido_add(s: &Store, typed: Option<&[u8]>) -> Result<()> {
             pin: None,
             use_ctap1_fallback: false,
         };
-        m.register(t, ask, status, done)
+        via.register(ask, status, done)
     })?;
     let a = made.att_obj.auth_data;
     let pin = a.flags.contains(AuthenticatorDataFlags::USER_VERIFIED);
@@ -387,6 +451,16 @@ fn factors(yk: bool) -> Result<(Secret, [u8; 32], Option<Secret>)> {
 /// With quick unlock on: the YubiKey and the PIN; else, or if that
 /// fails or no PIN is typed, the password.
 fn open() -> Result<Store> {
+    let s = unlocked()?;
+    if s.retired() {
+        eprintln!("{}", pasa::RETIRED_SAY);
+    }
+    Ok(s)
+}
+
+fn unlocked() -> Result<Store> {
+    // No store: said before any password is asked for.
+    ensure!(home().join("key").exists(), pasa::NO_STORE);
     // Devices apart for a month, said where a person reads.
     #[cfg(feature = "sync")]
     if std::io::stderr().is_terminal() {
@@ -420,7 +494,7 @@ fn open() -> Result<Store> {
 }
 
 fn unlock(pw: &[u8]) -> Result<Store> {
-    let k = std::fs::read(home().join("key")).context("no store: pasa init")?;
+    let k = std::fs::read(home().join("key")).context(pasa::NO_STORE)?;
     let yk = challenge(&k).map(yubikey).transpose()?;
     Store::open(&home(), pw, yk.as_deref().map(|v| &v[..]))
 }
@@ -506,20 +580,52 @@ fn clear_clipboard(i: usize) -> Result<()> {
     Ok(())
 }
 
+/// `old` edited in `$EDITOR` (else vi).
 fn edit(old: &[u8]) -> Result<Secret> {
-    let shm = std::path::Path::new("/dev/shm");
-    let d = if shm.is_dir() { shm.into() } else { std::env::temp_dir() };
-    let f = d.join(format!("pasa-{}", HEXLOWER.encode(&rand::<8>())));
-    pasa::write(&f, old)?;
-    let ed = std::env::var("EDITOR").unwrap_or("vi".into());
-    let ok = Command::new("sh")
-        .args(["-c", &format!("{ed} \"$1\""), "-"])
-        .arg(&f)
-        .status();
-    let new = std::fs::read(&f).map(Zeroizing::new);
-    std::fs::remove_file(&f)?;
-    ensure!(ok?.success(), "{ed} failed");
-    Ok(new?)
+    edit_with(&std::env::var("EDITOR").unwrap_or("vi".into()), old)
+}
+
+/// `old` edited in `ed`, in a directory of its own (owner alone) on a file
+/// system in memory where there is one (`$XDG_RUNTIME_DIR`, `/dev/shm`;
+/// macOS has none: its per-user temp dir), removed whole after, with what
+/// the editor left beside the file (swap, backup). Vim and Neovim also
+/// keep no swap, backup or undo file, and no history, elsewhere; another
+/// editor's own history is its own: `pasa set` and the window edit in
+/// memory.
+fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
+    let ram = [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
+    let ram = ram.into_iter().flatten().map(std::path::PathBuf::from);
+    let base =
+        ram.into_iter().find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+    let d = base.join(format!("pasa-{}", HEXLOWER.encode(&rand::<8>())));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(&d)?;
+    let f = d.join("entry");
+    let run = || -> Result<Secret> {
+        pasa::write(&f, old)?;
+        let prog = ed.split_whitespace().next().unwrap_or("vi");
+        let v =
+            Command::new(prog).arg("--version").stdin(Stdio::null()).output();
+        let vim = v.is_ok_and(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            s.starts_with("VIM") || s.starts_with("NVIM")
+        });
+        let quiet = match vim {
+            true => " -n -i NONE --cmd 'set nobackup nowritebackup noundofile'",
+            false => "",
+        };
+        let ok = Command::new("sh")
+            .args(["-c", &format!("{ed}{quiet} \"$1\""), "-"])
+            .arg(&f)
+            .status();
+        ensure!(ok?.success(), "{ed} failed");
+        Ok(Zeroizing::new(std::fs::read(&f)?))
+    };
+    let new = run();
+    std::fs::remove_dir_all(&d)?;
+    new
 }
 
 /// `pw` as the new password of `n`, its other lines kept.
@@ -548,24 +654,113 @@ fn pwned(pw: &str) -> Result<u64> {
     Ok(pasa::pwned_count(&kept, &String::from_utf8_lossy(&o.stdout)))
 }
 
-/// `git` in `v/`, where the user made that a repository: its output.
-fn git(a: &[&str]) -> Option<Vec<u8>> {
-    let v = home().join("v");
+/// `git` in `store/`, where the user made a repository (`git init
+/// ~/.pasa/store`): its work tree holds the versions (`v/`) and nothing
+/// of the keys. The network side may write in `v/`, never in `.git`;
+/// hooks never run. Its output, if it succeeded.
+fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
+    let s = dir.join("store");
+    if !s.join(".git").is_dir() {
+        return None;
+    }
     let mut c = Command::new("git");
-    c.arg("-C").arg(&v).args(a).env("GIT_TERMINAL_PROMPT", "0");
-    let o = v.join(".git").exists().then(|| c.stderr(Stdio::null()).output());
-    o?.ok().filter(|o| o.status.success()).map(|o| o.stdout)
+    c.arg("-C").arg(&s);
+    c.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]);
+    c.args(a).env("GIT_TERMINAL_PROMPT", "0");
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+    c.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut ch = c.spawn().ok()?;
+    if let (Some(i), Some(mut w)) = (input, ch.stdin.take()) {
+        w.write_all(i).ok()?;
+    }
+    let o = ch.wait_with_output().ok()?;
+    o.status.success().then_some(o.stdout)
 }
 
-/// Commit what `v/` gained, and push if that has somewhere to go. A file
-/// gone from `v/` is never committed as gone: `ls` says so instead.
+/// A repository made in `v/` before (`git init ~/.pasa/v`), which moved
+/// with it into `store/v/`, moves up to `store/.git`. The network side
+/// could write where it lay, so its hooks go, and of its config only what
+/// names remotes and branches stays.
+fn git_moved(dir: &Path) {
+    let old = pasa::versions(dir).join(".git");
+    let new = dir.join("store").join(".git");
+    if !old.is_dir() || new.exists() {
+        return;
+    }
+    let mut c = Command::new("git");
+    c.args(["config", "-z", "--file"]).arg(old.join("config"));
+    let keep = c.args(["--get-regexp", "."]).output().ok();
+    let keep = keep.map(|o| o.stdout).unwrap_or_default();
+    let kept = |k: &str| {
+        let p: Vec<&str> = k.split('.').collect();
+        matches!(
+            p[..],
+            ["remote", _, "url" | "pushurl" | "fetch"]
+                | ["branch", _, "remote" | "merge"]
+                | ["core", "repositoryformatversion"]
+                | ["extensions", _]
+        )
+    };
+    if std::fs::rename(&old, &new).is_err() {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(new.join("hooks"));
+    let cfg = new.join("config");
+    let _ = std::fs::write(&cfg, "[core]\n\tbare = false\n");
+    for e in keep.split(|b| *b == 0).filter_map(|e| std::str::from_utf8(e).ok())
+    {
+        if let Some((k, v)) = e.split_once('\n').filter(|(k, _)| kept(k)) {
+            let mut c = Command::new("git");
+            c.args(["config", "--file"]).arg(&cfg).args(["--add", k, v]);
+            let _ = c.output();
+        }
+    }
+    // What it held was the versions in v/; they are now under v/ here.
+    let _ = git(dir, &["rm", "-rq", "--cached", "--ignore-unmatch", "."], None);
+    eprintln!(
+        "pasa: the git repository moved from v/.git to store/.git, where \
+         the network side cannot write; its hooks were dropped, and of its \
+         config only remotes and branches kept"
+    );
+}
+
+/// Commit the versions `store/v/` gained, and push if that has somewhere
+/// to go. Only versions are staged (a name of 32 hex digits, an age file):
+/// nothing else that lies there. A file gone is never committed as gone:
+/// `ls` says so instead.
 fn record() {
+    record_in(&home())
+}
+
+fn record_in(dir: &Path) {
+    let v = pasa::versions(dir);
+    git_moved(dir);
+    let Some(out) = git(dir, &["ls-files", "-z", "--others", "v"], None) else {
+        return;
+    };
+    let age = |n: &str| {
+        let mut h = [0; 22];
+        let f = std::fs::File::open(v.join(n));
+        f.and_then(|mut f| f.read_exact(&mut h)).is_ok()
+            && &h == b"age-encryption.org/v1\n"
+    };
+    let names =
+        out.split(|b| *b == 0).filter_map(|n| std::str::from_utf8(n).ok());
+    let new: Vec<u8> = names
+        .filter_map(|n| n.strip_prefix("v/"))
+        .filter(|n| pasa::is_name(n) && age(n))
+        .flat_map(|n| [b"v/", n.as_bytes(), b"\0"].concat())
+        .collect();
+    let add = ["add", "--pathspec-from-file=-", "--pathspec-file-nul"];
+    if new.is_empty() || git(dir, &add, Some(&new)).is_none() {
+        return;
+    }
     let me =
         ["user.name=pasa", "user.email=pasa@localhost", "commit.gpgsign=false"];
     let me = me.iter().flat_map(|c| ["-c", c]);
-    git(&["add", "--ignore-removal", "."]);
-    if git(&me.chain(["commit", "-qm", "."]).collect::<Vec<_>>()).is_some() {
-        git(&["push", "-q"]);
+    let commit: Vec<&str> = me.chain(["commit", "-qm", "."]).collect();
+    if git(dir, &commit, None).is_some() {
+        git(dir, &["push", "-q"], None);
     }
 }
 
@@ -593,13 +788,15 @@ fn main() -> Result<()> {
                     "{n} versions no store key opens: damaged, or another store's"
                 ),
             }
-            match git(&["ls-files", "-d"])
+            let (h, gone) = (home(), &["ls-files", "-d"][..]);
+            match git(&h, gone, None)
                 .map_or(0, |d| d.split(|b| *b == b'\n').count() - 1)
             {
                 0 => {}
                 n => eprintln!(
-                    "{n} versions gone from v/: git -C {} checkout . brings them back",
-                    home().join("v").display()
+                    "{n} versions gone from store/v/: git -C {} checkout v \
+                     brings them back",
+                    h.join("store").display()
                 ),
             }
             return Ok(());
@@ -874,7 +1071,9 @@ fn report(who: &str, r: Result<usize>) {
 #[cfg(feature = "sync")]
 fn net(args: &[&str]) -> Result<std::process::Child> {
     let dir = home();
-    pasa::sync::net(&dir); // moved beside v/ here, where the child may not
+    // Moved into place here, where the child may not.
+    pasa::sync::net(&dir);
+    pasa::versions(&dir);
     let a: Vec<&str> = ["--net"].iter().chain(args).copied().collect();
     let mut c = pasa::confine::command(&dir, &std::env::current_exe()?, &a);
     c.stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -948,7 +1147,7 @@ fn net_side(a: &[&str]) -> Result<()> {
     net_go(&dir, a, got.trim())
 }
 
-/// `go`, while sync is on here: nothing goes online while it is off, and
+/// `go`, while sync is on here: no connection while it is off, and
 /// within seconds of the switch it starts or stops. A service running
 /// `pasa serve` follows the switch, as the window does.
 #[cfg(feature = "sync")]
@@ -960,7 +1159,7 @@ async fn while_on<F: std::future::Future<Output = Result<()>>>(
     let tick = || tokio::time::sleep(std::time::Duration::from_secs(2));
     loop {
         if !on(dir) {
-            eprintln!("Offline: nothing goes online until pasa sync on");
+            eprintln!("Offline: pasa opens no connection until pasa sync on");
             while !on(dir) {
                 tick().await
             }
@@ -1102,7 +1301,7 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["sync", "off"] => {
             sync::set_on(&dir, false)?;
-            eprintln!("Offline: nothing goes online until pasa sync on");
+            eprintln!("Offline: pasa opens no connection until pasa sync on");
         }
         ["sync", ..] => {
             ensure!(sync::on(&dir), "offline: pasa sync on, then pasa sync");
@@ -1129,7 +1328,9 @@ async fn sync(a: &[&str]) -> Result<()> {
             }
             eprintln!(
                 "A new store key: pair the other devices again (pasa pair \
-                 NAME here, join there), and forget {name} on each"
+                 NAME here, join there), and forget {name} on each. What \
+                 {name} knew it still knows: change those passwords at \
+                 their services"
             );
         }
         _ => bail!("{USAGE}"),
@@ -1139,6 +1340,100 @@ async fn sync(a: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+
+    /// An edit leaves nothing behind: the editor's swap and backup beside
+    /// the file go with its directory.
+    #[test]
+    fn an_edit_leaves_nothing_behind() {
+        let d = std::env::temp_dir()
+            .join(format!("pasa-ed-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let ed = d.join("ed.sh");
+        let script = "#!/bin/sh\nprintf 'new\\n' > \"$1\"\n\
+                      cp \"$1\" \"$1.swp\"; cp \"$1\" \"$1~\"\n\
+                      dirname \"$1\" > \"$0.at\"\n";
+        fs::write(&ed, script).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&ed, mode).unwrap();
+        let new = super::edit_with(ed.to_str().unwrap(), b"old\n").unwrap();
+        assert_eq!(&new[..], b"new\n");
+        let at = fs::read_to_string(d.join("ed.sh.at")).unwrap();
+        assert!(!std::path::Path::new(at.trim()).exists(), "left behind");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// git runs nothing planted where the network side writes: a
+    /// repository made in `v/` before moves (with `v/`) to `store/.git`
+    /// without its hooks or its other config (a monitor, a pack command a
+    /// push would run), and only versions are committed, nothing else that
+    /// lies in `v/`. The push still goes; git's work tree is `store/`,
+    /// which holds no key.
+    #[test]
+    fn git_runs_nothing_planted_and_commits_versions_alone() {
+        let d = std::env::temp_dir()
+            .join(format!("pasa-git-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let (v, ran) = (d.join("v"), d.join("ran"));
+        fs::create_dir_all(&v).unwrap();
+        let git = |a: &[&str]| {
+            let o = Command::new("git").args(a).output().unwrap();
+            assert!(
+                o.status.success(),
+                "{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        let at = |p: &std::path::Path| p.to_str().unwrap().to_string();
+        let remote = at(&d.join("remote.git"));
+        git(&["init", "-q", "-b", "main", "--bare", &remote]);
+        git(&["init", "-q", "-b", "main", &at(&v)]);
+        let evil = d.join("evil.sh");
+        fs::write(&evil, format!("#!/bin/sh\ntouch {}\n", ran.display()))
+            .unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&evil, mode).unwrap();
+        for h in ["pre-commit", "post-commit"] {
+            fs::copy(&evil, v.join(".git/hooks").join(h)).unwrap();
+        }
+        let cfg = at(&v.join(".git/config"));
+        for (k, val) in [
+            ("core.fsmonitor", at(&evil)),
+            ("remote.origin.url", remote.clone()),
+            ("remote.origin.receivepack", at(&evil)),
+            ("branch.main.remote", "origin".into()),
+            ("branch.main.merge", "refs/heads/main".into()),
+        ] {
+            git(&["config", "--file", &cfg, k, &val]);
+        }
+        let version = "0123456789abcdef0123456789abcdef";
+        fs::write(v.join(version), b"age-encryption.org/v1\n-> x\n").unwrap();
+        fs::write(v.join("notes.txt"), b"a plaintext left here").unwrap();
+        fs::write(v.join("fedcba9876543210fedcba9876543210"), b"no age")
+            .unwrap();
+        super::record_in(&d);
+        assert!(!ran.exists(), "something planted ran");
+        let store = d.join("store");
+        assert!(!v.exists(), "v/ moved into store/");
+        assert!(
+            store.join(".git").is_dir() && !store.join(".git/hooks").exists()
+        );
+        assert!(!store.join("v/.git").exists());
+        let tracked = super::git(&d, &["ls-files"], None).unwrap();
+        let tracked = String::from_utf8(tracked).unwrap();
+        assert_eq!(tracked, format!("v/{version}\n"));
+        let cfg = fs::read_to_string(store.join(".git/config")).unwrap();
+        assert!(cfg.contains("url = ") && cfg.contains("merge = "));
+        assert!(!cfg.contains("receivepack") && !cfg.contains("fsmonitor"));
+        let pushed = Command::new("git")
+            .args(["--git-dir", &remote, "log", "--oneline", "main"])
+            .output()
+            .unwrap();
+        assert!(pushed.status.success(), "the push went");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     /// The salt a key is asked with is WebAuthn's PRF form, as the phone
     /// (Yubico's kit) asks it: a key added there opens the store here.
     #[test]

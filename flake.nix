@@ -19,9 +19,13 @@
         buildFeatures = lib.optional gui "gui";
         doCheck = false;
         preBuild = "unset AWS_LC_SYS_USE_SYSTEM"; # aws-lc as Cargo.lock pins it, not nixpkgs' copy
-        nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optional linux pkgs.pkg-config
+        # Linux: pkg-config finds libudev (security keys); bindgen, with its
+        # libclang, writes V4L2's bindings (the camera) at build time.
+        nativeBuildInputs = [ pkgs.makeWrapper ]
+          ++ lib.optionals linux [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook ]
           ++ lib.optional (gui && linux) pkgs.copyDesktopItems;
-        buildInputs = lib.optional linux pkgs.udev; # libudev: security keys over USB
+        # libudev: security keys over USB; pcsc-lite: keys on NFC readers.
+        buildInputs = lib.optionals linux [ pkgs.udev pkgs.pcsclite ];
         desktopItems = lib.optional (gui && linux) (pkgs.makeDesktopItem {
           name = "pasa"; desktopName = "pasa"; exec = "pasa gui"; categories = [ "Utility" "Security" ];
         });
@@ -40,5 +44,14 @@
         pasa-gui = pasa pkgs true;   # cli, tui, gui
         pasa-cli = pasa pkgs false;  # cli, tui: no window libraries
       });
+      # `nix run` (or .#pasa-gui): the window; with arguments, pasa itself
+      # (`nix run . -- ls`).
+      apps = each (system: let
+        pkgs = nixpkgs.legacyPackages.${system};
+        gui = pkgs.writeShellScript "pasa-gui" ''
+          exec ${self.packages.${system}.pasa-gui}/bin/pasa "''${@:-gui}"
+        '';
+        app = { type = "app"; program = "${gui}"; meta.description = "pasa: the window"; };
+      in { default = app; pasa-gui = app; });
     };
 }
