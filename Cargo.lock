@@ -180,7 +180,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apasa-jni"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "jni 0.22.4",
@@ -3137,7 +3137,7 @@ dependencies = [
 
 [[package]]
 name = "kdbx2pasa"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4611,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "pasa"
-version = "0.4.15"
+version = "0.4.16"
 dependencies = [
  "age",
  "age-core",
@@ -5011,7 +5011,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 [[package]]
 name = "pushir"
 version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/pushir?rev=344430c2539df744420bd0180364a2a3cf867bd2#344430c2539df744420bd0180364a2a3cf867bd2"
+source = "git+https://github.com/cablab-ucf/pushir?rev=04c89d01832e73df15c16977272ca0aaf1d3ef23#04c89d01832e73df15c16977272ca0aaf1d3ef23"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
