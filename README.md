@@ -111,11 +111,15 @@ before the code, never beside it. A short code meets once at the
 [pairir](https://github.com/cablab-ucf/pairir) relay (CPace, then
 X-Wing; one try, one minute).
 
-Only ciphertext crosses the network, and received files must match
-their names. On a computer the network side is a child process that sees
-`store/v/` and `net/` alone (Landlock on Linux, `sandbox-exec` on macOS;
-best effort, and said when missing); the process with the open store
-opens no socket. On Android it is one process.
+Only ciphertext crosses the network, and received files must be
+versions that match their names. On a computer the network side is a
+child process that sees `store/v/` and `net/` alone (Landlock on Linux,
+`sandbox-exec` on macOS); on Linux it also signals no other process and
+opens no unix socket (Landlock scopes, seccomp), but `listen`'s to
+pushir. Unconfined, it does not run (`PASA_UNCONFINED=1`: it does). The
+process with the open store opens no socket, and no pasa process dumps
+core or lets another of yours read its memory. On Android it is one
+process.
 
 | Layer | Holds if the others fall |
 |---|---|

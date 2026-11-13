@@ -22,6 +22,21 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "sync")]
 pub mod confine;
+
+/// No core dump, and no same-user process reads this one's memory.
+pub fn harden() {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+        let none = Rlimit { current: Some(0), maximum: Some(0) };
+        let _ = setrlimit(Resource::Core, none);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let _ = rustix::process::set_dumpable_behavior(
+            rustix::process::DumpableBehavior::NotDumpable,
+        );
+    }
+}
+
 #[cfg(feature = "sync")]
 pub mod sync;
 

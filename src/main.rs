@@ -669,6 +669,7 @@ fn record_in(dir: &Path) {
 }
 
 fn main() -> Result<()> {
+    pasa::harden();
     let mut a: Vec<String> = std::env::args().skip(1).collect();
     if a.first().is_some_and(|f| f == "--dir") {
         ensure!(a.len() > 1, "{USAGE}");
@@ -1045,9 +1046,15 @@ fn serve_until(name: &str) -> Result<()> {
 #[cfg(feature = "sync")]
 fn net_side(a: &[&str]) -> Result<()> {
     let dir = home();
-    if !pasa::confine::confine(&dir)? {
-        eprintln!("pasa: the network side is not confined: no Landlock here");
-    }
+    // `listen` reaches pushir's daemon; nothing else reaches a unix socket.
+    let sock = pushir::local::sock();
+    let unix = (a == ["listen"]).then(|| sock.parent()).flatten();
+    let confined = pasa::confine::confine(&dir, unix)?;
+    ensure!(
+        confined || std::env::var_os("PASA_UNCONFINED").is_some(),
+        "the network side cannot be confined here (no Landlock), so pasa \
+         does not sync: PASA_UNCONFINED=1 syncs anyway"
+    );
     let mut got = String::new();
     if a == ["give"] {
         std::io::stdin().read_line(&mut got)?;

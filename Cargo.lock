@@ -4627,6 +4627,7 @@ dependencies = [
  "irnet",
  "iroh",
  "landlock",
+ "libc",
  "nokhwa",
  "openssl",
  "pairir",
@@ -4635,7 +4636,9 @@ dependencies = [
  "qrcode",
  "rpassword",
  "rqrr",
+ "rustix 1.1.6",
  "rxing",
+ "seccompiler",
  "sha1",
  "sha2 0.11.1",
  "tar",
@@ -5576,6 +5579,15 @@ dependencies = [
  "log",
  "smithay-client-toolkit 0.19.2",
  "tiny-skia",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

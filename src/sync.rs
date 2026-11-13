@@ -212,6 +212,11 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
                 break;
             }
             ensure!(want.remove(&name_of(&b)), "a file not asked for");
+            // Only versions: whatever else a peer sends, git and pasa skip.
+            ensure!(
+                b.starts_with(b"age-encryption.org/v1\n-> scrypt "),
+                "not a version"
+            );
             write(&v.join(name_of(&b)), &b)?;
         }
         rx.end().await?;
