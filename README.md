@@ -137,7 +137,8 @@ revoked device seals under the old key is ignored. Devices still on the
 old key stop writing when they hear of it.
 
 What it already read, it keeps: change those passwords at their
-services. Any device that opens the store can revoke, a bad one too, but
+services. `pasa health` (Health in the window) lists each entry whose
+password or one-time code it read, under any name. Any device that opens the store can revoke, a bad one too, but
 that only forks the store: the others keep everything, revoke it in
 turn, and pair again from a device you trust.
 

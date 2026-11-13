@@ -369,7 +369,9 @@ pub extern "system" fn Java_com_apasa_Native_health<'l>(
         let reused =
             h.reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
         let expired = h.expired.iter().map(|n| format!("expired\t{n}"));
-        let all: Vec<String> = weak.chain(reused).chain(expired).collect();
+        let exposed = h.exposed.iter().map(|n| format!("exposed\t{n}"));
+        let all: Vec<String> =
+            weak.chain(reused).chain(expired).chain(exposed).collect();
         Ok(e.new_string(all.join("\n"))?)
     })
 }

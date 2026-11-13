@@ -102,7 +102,7 @@ data class Form(
 
 data class Health(
     val weak: List<Pair<String, Int>> = listOf(), val reused: List<List<String>> = listOf(),
-    val expired: List<String> = listOf(),
+    val expired: List<String> = listOf(), val exposed: List<String> = listOf(),
 )
 
 /** Quick: a tap (and PIN) opens the store beside the password; Both: a second factor with it. */
@@ -1088,7 +1088,7 @@ private fun Health(host: Host, nav: Nav) {
             }
             return@Page
         }
-        val (weak, reused, expired) = found ?: Health()
+        val (weak, reused, expired, exposed) = found ?: Health()
         Label("WEAK: ${weak.size}")
         for ((n, bits) in weak) Row(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, verticalAlignment = Alignment.CenterVertically) {
             Text(n, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
@@ -1100,6 +1100,9 @@ private fun Health(host: Host, nav: Nav) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("EXPIRED: ${expired.size}")
         for (n in expired) Text(n, Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, style = MaterialTheme.typography.bodyLarge)
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Label("READ BY A REVOKED DEVICE: ${exposed.size}")
+        for (n in exposed) Text(n, Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, style = MaterialTheme.typography.bodyLarge)
         breached?.let { hits ->
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Label("IN KNOWN BREACHES: ${hits.size}")
@@ -1202,7 +1205,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                 }
             }
             TextButton({ go { host.forget(p); "$p: forgotten" } }) { Text("Forget") }
-            TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again. What it knew it still knows: change those passwords at their services." } }) { Text("Revoke") }
+            TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again. What it knew it still knows: Health lists the passwords to change at their services." } }) { Text("Revoke") }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("ADD A DEVICE")

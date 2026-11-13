@@ -51,7 +51,8 @@ pasa gen NAME [N] -w [-d] [-s CHARS] [-l]
                              CHARS between them, -l: some letters as 1337)
 pasa attach NAME FILE        keep a file with an entry
 pasa files NAME [FILE]       those files, or one, to stdout
-pasa health [--pwned]        weak, reused and expired passwords; --pwned: breached ones,
+pasa health [--pwned]        weak, reused, expired, and exposed: read by a revoked device;
+                             --pwned: breached ones,
                              from the list $PASA_PWNED names, else asking
                              haveibeenpwned.com by 5 hex digits of each SHA-1
 pasa stats                   the store in numbers
@@ -823,6 +824,7 @@ fn main() -> Result<()> {
                 .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
             h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
             h.expired.iter().for_each(|n| println!("expired {n}"));
+            h.exposed.iter().for_each(|n| println!("exposed {n}"));
             // Passwords alone: not what is attached, nor an empty one.
             let asked = |n: &String| {
                 flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
@@ -1223,16 +1225,18 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["forget", name] => sync::forget(&dir, name)?,
         ["revoke", name] => {
-            sync::revoke(&mut open()?, name)?;
+            let mut s = open()?;
+            sync::revoke(&mut s, name)?;
             if sync::on(&dir) {
                 net_run(&["sync", "--news"])?;
             }
             eprintln!(
                 "A new store key: pair the other devices again (pasa pair \
                  NAME here, join there), and forget {name} on each. What \
-                 {name} knew it still knows: change those passwords at \
-                 their services"
+                 {name} knew it still knows: change these passwords at \
+                 their services (pasa health lists those left):"
             );
+            s.health()?.exposed.iter().for_each(|n| println!("{n}"));
         }
         _ => bail!("{USAGE}"),
     }

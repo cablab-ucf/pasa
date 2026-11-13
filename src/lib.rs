@@ -656,7 +656,21 @@ impl Store {
     pub fn health(&self) -> Result<Health> {
         let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let (mut h, today) = (Health::default(), today());
+        // A revoked device read every version under a retired key.
+        let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
+        let past =
+            self.index()?.past().map(|p| p.0.clone()).collect::<Vec<_>>();
+        let past = past.into_iter().filter(|v| shown(&v.name));
+        let mut read: HashSet<String> = HashSet::new();
+        for v in past {
+            let Ok(b) = self.body(&v) else { continue };
+            let f = Form::parse(&String::from_utf8_lossy(&b));
+            read.extend([f.pass, f.otp].into_iter().filter(|s| !s.is_empty()));
+        }
         for (name, f) in self.forms()? {
+            if read.contains(&f.pass) || read.contains(&f.otp) {
+                h.exposed.push(name.clone());
+            }
             if !f.expires.is_empty() && f.expires < today {
                 h.expired.push(name.clone());
             }
@@ -1019,6 +1033,8 @@ pub struct Health {
     pub weak: Vec<(String, u32)>,
     pub reused: Vec<Vec<String>>,
     pub expired: Vec<String>,
+    /// Password or one-time code unchanged since a revoked device read it.
+    pub exposed: Vec<String>,
 }
 
 /// Top 10,000 passwords by rank (SecLists, MIT); EFF long list (CC BY 3.0).
@@ -1510,6 +1526,23 @@ mod tests {
         let mut sa = Store::open(&a, b"pw", None).unwrap();
         sa.rotate().unwrap();
         check(&sa, 3);
+    }
+
+    #[test]
+    fn health_lists_what_a_revoked_device_read_until_changed() {
+        let mut s = Store::create(&dir("exposed"), b"pw", None).unwrap();
+        s.put("a", b"pa\n").unwrap();
+        s.put("b", b"pb\notp: otpauth://totp/x?secret=AAAA\n").unwrap();
+        assert!(s.health().unwrap().exposed.is_empty());
+        s.rotate().unwrap();
+        assert_eq!(s.health().unwrap().exposed, ["a", "b"]);
+        s.put("a", b"new\n").unwrap();
+        s.put("b", b"new\notp: otpauth://totp/x?secret=AAAA\n").unwrap();
+        s.put("d", b"pa\n").unwrap();
+        let h = s.health().unwrap().exposed;
+        assert_eq!(h, ["b", "d"], "a seed unchanged; a password it read");
+        s.put("a", b"pa\n").unwrap();
+        assert_eq!(s.health().unwrap().exposed, ["a", "b", "d"]);
     }
 
     #[test]

@@ -290,6 +290,7 @@ class MainActivity : ComponentActivity(), Host {
             rows.filter { it[0] == "weak" }.map { it[1] to it[2].toInt() },
             rows.filter { it[0] == "reused" }.map { it.drop(1) },
             rows.filter { it[0] == "expired" }.map { it[1] },
+            rows.filter { it[0] == "exposed" }.map { it[1] },
         )
     }
 

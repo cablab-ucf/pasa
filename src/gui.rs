@@ -1687,7 +1687,8 @@ impl App {
             self.health = v.s.health().ok();
         }
         let h = self.health.clone().unwrap_or_default();
-        let (weak, reused, expired) = (h.weak, h.reused, h.expired);
+        let (weak, reused, expired, exposed) =
+            (h.weak, h.reused, h.expired, h.exposed);
         let part = |ui: &mut Ui, t: String| {
             ui.add_space(4.0);
             ui.label(RichText::new(t).small().color(l.muted));
@@ -1711,6 +1712,10 @@ impl App {
             }
             part(ui, format!("EXPIRED: {}", expired.len()));
             for name in &expired {
+                ui.label(name);
+            }
+            part(ui, format!("READ BY A REVOKED DEVICE: {}", exposed.len()));
+            for name in &exposed {
                 ui.label(name);
             }
             if let Some(found) =
@@ -2149,8 +2154,8 @@ impl App {
                             Ok(()) => format!(
                                 "{}: revoked. A new store key: pair the other \
                                  devices again, and forget {} on each. What it \
-                                 knew it still knows: change those passwords at \
-                                 their services",
+                                 knew it still knows: Health lists the passwords \
+                                 to change at their services",
                                 p.name, p.name
                             ),
                             Err(e) => format!("{e:#}"),
