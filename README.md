@@ -24,6 +24,26 @@ ad hoc: `xattr -dr com.apple.quarantine pasa.app`). Building on Linux
 needs libudev, libclang, pcsc-lite and CMake (Debian: `libudev-dev
 libclang-dev libpcsclite-dev cmake`); the flake brings them.
 
+## NixOS
+
+In `/etc/nixos/flake.nix` (with no `inputs.pasa.inputs.nixpkgs.follows`:
+pasa builds on its own pin):
+
+```nix
+inputs.pasa.url = "github:cablab-ucf/pasa";
+# nixosSystem's modules:
+pasa.nixosModules.default
+{ programs.pasa.enable = true; }   # serve = true: `pasa serve` per user
+```
+
+It installs the window, turns on `pcscd` (NFC readers), and daily runs
+`nixos-rebuild switch --update-input pasa` on `/etc/nixos` (Nix's
+`system.autoUpgrade`; `update = false` leaves it off). Only `pasa`
+moves; the rest stays as `flake.lock` pins it. While the repository is
+private, Nix needs a token that reads it, outside the store: in
+`/etc/nix/nix.conf` (`nix.extraOptions`), `!include /etc/nix/github.conf`,
+a root-only file holding `access-tokens = github.com=TOKEN`.
+
 ## Files
 
 ```

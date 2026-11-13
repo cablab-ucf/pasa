@@ -28,7 +28,7 @@
           name = "pasa"; desktopName = "pasa"; exec = "pasa gui"; categories = [ "Utility" "Security" ];
         });
         postFixup = lib.optionalString linux (''
-          wrapProgram $out/bin/pasa --suffix PATH : ${lib.makeBinPath [ pkgs.wl-clipboard pkgs.xclip ]}
+          wrapProgram $out/bin/pasa --suffix PATH : ${lib.makeBinPath [ pkgs.wl-clipboard pkgs.xclip pkgs.curl ]}
         '' + lib.optionalString gui ''
           patchelf --add-rpath ${lib.makeLibraryPath (with pkgs; [
             libGL libxkbcommon wayland xorg.libX11 xorg.libXcursor xorg.libXi xorg.libXrandr
@@ -50,5 +50,60 @@
         '';
         app = { type = "app"; program = "${gui}"; meta.description = "pasa: the window"; };
       in { default = app; pasa-gui = app; });
+
+      # NixOS: inputs.pasa.url = "github:cablab-ucf/pasa"; modules = [
+      # pasa.nixosModules.default { programs.pasa.enable = true; } ]. No
+      # `inputs.pasa.inputs.nixpkgs.follows`: pasa builds on its own pin.
+      nixosModules.default = { config, lib, pkgs, ... }: let cfg = config.programs.pasa; in {
+        options.programs.pasa = {
+          enable = lib.mkEnableOption "pasa, with PC/SC for NFC readers and YubiKeys";
+          package = lib.mkOption {
+            type = lib.types.package;
+            default = self.packages.${pkgs.stdenv.hostPlatform.system}.pasa-gui;
+            description = "pasa-gui (the window) or pasa-cli.";
+          };
+          update = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = ''
+              Daily, rebuild with pasa's newest main: system.autoUpgrade on the
+              flake system.autoUpgrade.flake names (default /etc/nixos), whose
+              input `pasa` alone is updated.
+            '';
+          };
+          serve = lib.mkEnableOption "`pasa serve` as each user's service, seeing only ~/.pasa/store/v and ~/.pasa/net";
+        };
+        config = lib.mkIf cfg.enable (lib.mkMerge [
+          {
+            environment.systemPackages = [ cfg.package ];
+            services.pcscd.enable = lib.mkDefault true;
+          }
+          (lib.mkIf cfg.update {
+            system.autoUpgrade = {
+              enable = true;
+              flake = lib.mkDefault "/etc/nixos";
+              flags = [ "--update-input" "pasa" ];
+              dates = lib.mkDefault "daily";
+            };
+          })
+          (lib.mkIf cfg.serve {
+            systemd.user.services.pasa-serve = {
+              description = "pasa serve";
+              wantedBy = [ "default.target" ];
+              unitConfig.ConditionPathExists = "%h/.pasa/net/peers";
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/pasa serve";
+                Restart = "on-failure";
+                RestartSec = 30;
+                NoNewPrivileges = true;
+                PrivateTmp = true;
+                ProtectSystem = "strict";
+                ProtectHome = "tmpfs";
+                BindPaths = [ "%h/.pasa/store/v" "%h/.pasa/net" ];
+              };
+            };
+          })
+        ]);
+      };
     };
 }
