@@ -56,7 +56,7 @@ openssl = { version = "0.10", default-features = false, features = ["aws-lc"], o
 # YubiKeys on NFC readers (or CCID) through PC/SC.
 pcsc = { version = "2.9", optional = true }
 crossterm = { version = "0.29.0", default-features = false, features = ["events"], optional = true }
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"], optional = true }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "clipboard"], optional = true }
 # Window frame, which GNOME on Wayland leaves to the app.
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"], optional = true }
 

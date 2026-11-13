@@ -633,6 +633,16 @@ impl eframe::App for App {
             None if self.joining => self.join(ui),
             None => self.create(ui),
         }
+        // Ctrl+C/X leave by crate::clip, cleared after 45 s; the clipboard
+        // crate only without wl-copy, xclip or pbcopy. Selections never
+        // reach PRIMARY, which nothing clears.
+        ui.ctx().output_mut(|o| {
+            o.commands.retain(|c| match c {
+                egui::OutputCommand::CopyText(s) => crate::clip(s).is_err(),
+                egui::OutputCommand::TextSelectionSettled(_) => false,
+                _ => true,
+            })
+        });
     }
 }
 
