@@ -1,6 +1,6 @@
 //! Pairing and sync; neither ever opens the key file or a version.
 
-use crate::{MAX, Store, is_name, name_of, rand, write};
+use crate::{MAX, Secret, Store, is_name, name_of, rand, write};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use data_encoding::HEXLOWER;
 use irnet::psk::{Rx, Tx};
@@ -427,9 +427,64 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 const KEYS: &[u8] = b"pasakeys";
+/// A group store's pairing: then its member key for the device taking it.
+const GROUP: &[u8] = b"pasagrup";
+
+/// Hands device `name` a member key of the group store in `dir`, which
+/// it opens with its own store: no key file goes, and none exists.
+pub fn offer_group(
+    dir: &Path,
+    name: &str,
+    seed: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let psk = rand::<32>();
+    let id = key(dir, "node")?.public();
+    let peer = Peer {
+        name: name.into(),
+        psk,
+        id: None,
+        lane: None,
+        seen: Some(now()),
+    };
+    add(dir, peer)?;
+    set_on(dir, true)?;
+    Ok(Zeroizing::new([id.as_bytes(), &psk[..], GROUP, seed].concat()))
+}
+
+/// [`offer_group`]'s other end: the member key, for the caller to seal.
+pub fn take_group(dir: &Path, name: &str, got: &[u8]) -> Result<Secret> {
+    named(name)?;
+    let bad = || anyhow!("not a group's pairing");
+    let (id, rest) = got.split_at_checked(32).ok_or_else(bad)?;
+    let (psk, rest) = rest.split_at_checked(32).ok_or_else(bad)?;
+    let seed =
+        rest.strip_prefix(GROUP).filter(|s| s.len() == 32).ok_or_else(bad)?;
+    let id = Some(PublicKey::from_bytes(id.try_into()?)?);
+    let peer = Peer {
+        name: name.into(),
+        psk: psk.try_into()?,
+        id,
+        lane: None,
+        seen: Some(now()),
+    };
+    add(dir, peer)?;
+    set_on(dir, true)?;
+    Ok(Zeroizing::new(seed.to_vec()))
+}
+
+/// pairir's app: a group's codes apart, so that nothing takes one for a
+/// store's key file (an older pasa least of all).
+fn app(group: bool) -> &'static str {
+    if group { "pasa-group" } else { "pasa" }
+}
+
+fn grouped(got: &[u8]) -> bool {
+    got.get(64..72) == Some(GROUP)
+}
 
 pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     named(name)?;
+    ensure!(!grouped(got), "a group's pairing: pasa group join");
     let bad = || anyhow!("not a pasa pairing");
     let (id, rest) = got.split_at_checked(32).ok_or_else(bad)?;
     let (psk, mut f) = rest.split_at_checked(32).ok_or_else(bad)?;
@@ -476,21 +531,35 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
 }
 
 pub async fn qr(got: &[u8], pw: &str) -> Result<String> {
-    pairir::seal_qr("pasa", got, pw).await
+    pairir::seal_qr(app(grouped(got)), got, pw).await
 }
 
 pub async fn unqr(text: &str, pw: &str) -> Result<Zeroizing<Vec<u8>>> {
-    pairir::open_qr("pasa", text.trim(), pw).await
+    unqr_in(text, pw, false).await
+}
+
+/// `group`: a group's QR code.
+pub async fn unqr_in(
+    text: &str,
+    pw: &str,
+    group: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
+    pairir::open_qr(app(group), text.trim(), pw).await
 }
 
 pub async fn give(
     got: &[u8],
 ) -> Result<(String, tokio::task::JoinHandle<pairir::End>)> {
-    pairir::give(&[relay()?], "pasa", got, None).await
+    pairir::give(&[relay()?], app(grouped(got)), got, None).await
 }
 
 pub async fn fetch(code: &str) -> Result<Zeroizing<Vec<u8>>> {
-    pairir::take(&[relay()?], "pasa", code.trim(), None).await
+    fetch_in(code, false).await
+}
+
+/// `group`: a group's code.
+pub async fn fetch_in(code: &str, group: bool) -> Result<Zeroizing<Vec<u8>>> {
+    pairir::take(&[relay()?], app(group), code.trim(), None).await
 }
 
 #[cfg(test)]

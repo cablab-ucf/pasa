@@ -2228,9 +2228,7 @@ impl App {
             });
         }
         for u in &v.s.unopened {
-            let say =
-                format!("@{u}: its password changed there: link it again");
-            ui.label(RichText::new(say).small().color(l.bad));
+            ui.label(RichText::new(u).small().color(l.bad));
         }
         if let Some(g) = gone {
             v.note = match v.s.unlink(&g) {

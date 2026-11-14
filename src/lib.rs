@@ -22,6 +22,7 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "sync")]
 pub mod confine;
+pub mod group;
 
 /// No core dump, and no same-user process reads this one's memory.
 pub fn harden() {
@@ -173,7 +174,8 @@ pub fn stores() -> Vec<PathBuf> {
     let t = fs::read_to_string(user(".pasa/stores")).unwrap_or_default();
     let mut all: Vec<PathBuf> = vec![];
     for p in [user(".pasa")].into_iter().chain(t.lines().map(PathBuf::from)) {
-        if p.join("key").exists() && !all.contains(&p) {
+        let held = p.join("key").exists() || p.join("member").exists();
+        if held && !all.contains(&p) {
             all.push(p);
         }
     }
@@ -330,8 +332,17 @@ pub struct Store {
     /// Stores opened with this one ([`Store::link`]), by label: their
     /// entries show as `@LABEL/NAME`.
     linked: Vec<(String, Store)>,
-    /// Linked stores whose link no longer opens them: link them again.
+    /// Linked stores that did not open, and why.
     pub unopened: Vec<String>,
+    /// A group store's: this device's member key (seed); it has no `key`.
+    member: Option<Secret>,
+    /// The member key pairing handed, while it may still open something.
+    handed: Option<Secret>,
+    /// How many of `keys` are current: 2 or more while rotations made at
+    /// once are not yet merged by the next.
+    current: usize,
+    /// The members the newest envelope is sealed to.
+    sealed_to: Vec<String>,
 }
 
 impl Store {
@@ -354,6 +365,10 @@ impl Store {
             unreadable: 0.into(),
             linked: vec![],
             unopened: vec![],
+            member: None,
+            handed: None,
+            current: 1,
+            sealed_to: vec![],
         })
     }
 
@@ -478,7 +493,7 @@ impl Store {
         ensure!(self.dirs().all(|d| d != other.dir), "linked already");
         self.seal_link(&other)?;
         let label = self.label(&other.dir);
-        self.unopened.retain(|u| *u != label);
+        self.unopened.retain(|u| !u.starts_with(&format!("@{label}:")));
         self.linked.push((label.clone(), other));
         Ok(label)
     }
@@ -490,6 +505,19 @@ impl Store {
         Ok(fs::remove_file(s.dir.join("link"))?)
     }
 
+    /// The linked store labelled so.
+    pub fn group(&mut self, label: &str) -> Result<&mut Store> {
+        let l = label.trim_start_matches('@');
+        let g = self.linked.iter_mut().find(|g| g.0 == l);
+        Ok(&mut g.with_context(|| format!("@{l}: no such linked store"))?.1)
+    }
+
+    /// The label `dir` has, or would have, among the linked stores.
+    pub fn label_of(&self, dir: &Path) -> String {
+        let l = self.linked.iter().find(|g| g.1.dir == dir);
+        l.map_or_else(|| self.label(dir), |g| g.0.clone())
+    }
+
     /// Linked stores: label and folder.
     pub fn links(&self) -> impl Iterator<Item = (&str, &Path)> {
         self.linked.iter().map(|(l, s)| (l.as_str(), s.dir.as_path()))
@@ -497,9 +525,69 @@ impl Store {
 
     /// `other`'s KEK, sealed to this one's, in `other/link`: never in `v/`,
     /// so never synced, and pairing hands none.
+    /// A group store's: `member` instead, its member key sealed so, the
+    /// byte between 1 if pairing handed it (so not this device's own yet).
     fn seal_link(&self, other: &Store) -> Result<()> {
+        if let Some(seed) = &other.member {
+            let newest = other.keys.first().map(|k| &k[..]);
+            let old = other.handed.as_deref().map(|h| &h[..]);
+            return self.seal_member(&other.dir, seed, newest, false, old);
+        }
         let sealed = seal(&self.kek, &other.kek)?;
         write(&other.dir.join("link"), &[&self.owner()[..], &sealed].concat())
+    }
+
+    /// `member`: owner (16), handed (1), then sealed: the member key and
+    /// the newest store key this device holds, if any.
+    fn seal_member(
+        &self,
+        dir: &Path,
+        seed: &[u8],
+        newest: Option<&[u8]>,
+        handed: bool,
+        old: Option<&[u8]>,
+    ) -> Result<()> {
+        let newest = newest.unwrap_or(&[0; 32]);
+        let all = [seed, newest, old.unwrap_or_default()].concat();
+        let sealed = seal(&self.kek, &all)?;
+        let head = [&self.owner()[..], &[handed as u8]].concat();
+        write(&dir.join("member"), &[&head[..], &sealed].concat())
+    }
+
+    /// Joins the group store in `dir` with the member key pairing handed:
+    /// it opens with this store once a sync brings its keys.
+    pub fn join_group(&mut self, dir: &Path, seed: &[u8]) -> Result<()> {
+        ensure!(!dir.join("key").exists(), "{} holds a store", dir.display());
+        self.seal_member(dir, seed, None, true, None)
+    }
+
+    /// A linked group store, by this device's member key: made its own if
+    /// handed, and settled (a removal or a member since, sealed anew).
+    fn open_group(&self, dir: &Path, f: &[u8]) -> Result<Store> {
+        let (head, sealed) =
+            f.split_at_checked(17).context("a damaged link")?;
+        let both = open(&self.kek, sealed).context("a damaged link")?;
+        ensure!(both.len() == 64 || both.len() == 96, "a damaged link");
+        let (seed, rest) = both.split_at(32);
+        let (known, old) = rest.split_at(32);
+        let known = (known != [0; 32]).then_some(known);
+        let old = (!old.is_empty()).then_some(old);
+        let mut g = Store::open_member(dir, seed, known, old)?;
+        if head[16] == 1 {
+            g.rekey()?;
+        }
+        g.settle()?;
+        if head[16] == 1 || known != g.keys.first().map(|k| &k[..]) {
+            self.seal_link(&g)?;
+        }
+        if g.retired() {
+            g.unopened.push(
+                "this device was removed from it: what it held it keeps, \
+                 nothing since"
+                    .into(),
+            );
+        }
+        Ok(g)
     }
 
     /// The folder's name, without `/` or `@`, made unique.
@@ -534,20 +622,32 @@ impl Store {
             if self.dirs().any(|d| d == dir) {
                 continue;
             }
-            let Ok(f) = fs::read(dir.join("link")) else { continue };
-            let Some((owner, sealed)) = f.split_at_checked(16) else {
-                continue;
+            let (group, file) = match fs::read(dir.join("member")) {
+                Ok(f) => (true, f),
+                Err(_) => match fs::read(dir.join("link")) {
+                    Ok(f) => (false, f),
+                    Err(_) => continue,
+                },
             };
-            if owner != self.owner() {
+            if file.get(..16) != Some(&self.owner()[..]) {
                 continue;
             }
             let label = self.label(&dir);
-            let opened = open(&self.kek, sealed).context("a damaged link");
-            match opened.and_then(|kek| Store::unsealed(&dir, kek)) {
-                Ok(s) => self.linked.push((label, s)),
-                Err(_) => {
-                    self.unopened.push(label);
+            let opened = match group {
+                true => self.open_group(&dir, &file),
+                false => open(&self.kek, &file[16..])
+                    .context("a damaged link")
+                    .and_then(|kek| Store::unsealed(&dir, kek))
+                    .context("its password changed there: link it again"),
+            };
+            match opened {
+                Ok(mut s) => {
+                    let said =
+                        s.unopened.drain(..).map(|m| format!("@{label}: {m}"));
+                    self.unopened.extend(said.collect::<Vec<_>>());
+                    self.linked.push((label, s));
                 }
+                Err(e) => self.unopened.push(format!("@{label}: {e:#}")),
             }
         }
         self
@@ -557,6 +657,17 @@ impl Store {
     pub fn dirs(&self) -> impl Iterator<Item = &Path> {
         let linked = self.linked.iter().map(|(_, s)| s.dir.as_path());
         std::iter::once(self.dir.as_path()).chain(linked)
+    }
+
+    /// `@LABEL/` names a linked store: never one of this store's own, so a
+    /// group's secret never lands here when its store did not open.
+    fn not_linked(&self, name: &str) -> Result<()> {
+        let label =
+            name.strip_prefix('@').map(|r| r.split('/').next().unwrap_or(r));
+        let say = |l| {
+            format!("@{l}: not open here (pasa link, or its note at unlock)")
+        };
+        label.map_or(Ok(()), |l| Err(anyhow::anyhow!(say(l))))
     }
 
     /// The linked store `name` is in, and its name there.
@@ -586,6 +697,9 @@ impl Store {
 
     /// Refuses if another process rewrote `key` since it was read.
     pub(crate) fn save(&self) -> Result<()> {
+        if self.member.is_some() {
+            return Ok(()); // a group store's keys are in its envelopes
+        }
         fs::create_dir_all(&self.dir)?;
         let mut lock = fs::OpenOptions::new();
         let lock = lock
@@ -681,9 +795,9 @@ impl Store {
             std::io::BufReader::new(r).read_line(&mut l).ok()?;
             Version::parse(l.strip_suffix('\n')?, file)
         };
-        let (newest, older) = self.ids.split_first()?;
+        let (now, older) = self.ids.split_at(self.current.min(self.ids.len()));
         let f = fs::File::open(self.v.join(file)).ok()?;
-        if let Ok(r) = reader(std::slice::from_ref(newest), f) {
+        if let Ok(r) = reader(now, f) {
             return Some((line(Box::new(r) as Box<dyn Read>)?, None));
         }
         let b = fs::read(self.v.join(file)).ok()?;
@@ -721,6 +835,8 @@ impl Store {
             match self.head(n) {
                 Some((h, None)) => drop(x.heads.insert(n.clone(), h)),
                 Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
+                // A group's envelope: its keys, not a version.
+                None if self.envelope(n) => {}
                 None => bad += 1,
             }
         }
@@ -737,11 +853,22 @@ impl Store {
         Ok(x)
     }
 
+    fn envelope(&self, file: &str) -> bool {
+        let mut head = [0; 40];
+        let f = fs::File::open(self.v.join(file));
+        f.and_then(|mut f| f.read_exact(&mut head)).is_ok()
+            && group::is_envelope(&head)
+    }
+
+    /// This store's own versions, oldest first, frozen history included.
+    fn versions_here(&self) -> Result<Vec<Version>> {
+        let x = self.index()?;
+        Ok(sorted(x.heads.values().chain(x.past().map(|(v, _)| v))))
+    }
+
     /// Oldest first, frozen history included.
     pub fn versions(&self) -> Result<Vec<Version>> {
-        let x = self.index()?;
-        let mine = sorted(x.heads.values().chain(x.past().map(|(v, _)| v)));
-        drop(x);
+        let mine = self.versions_here()?;
         let theirs = self.shown(Store::versions, |v| &mut v.name)?;
         Ok(match theirs.is_empty() {
             true => mine,
@@ -771,6 +898,15 @@ impl Store {
             all.insert(v.name.clone(), v);
         }
         Ok(all)
+    }
+
+    /// Live names under `prefix`, the store's own (`.pasa/`) ones too.
+    fn live(&self, prefix: &str) -> Result<Vec<String>> {
+        let x = self.index()?;
+        let tips = x.tips.iter().filter(|t| t.0.starts_with(prefix));
+        let live =
+            tips.filter(|t| x.heads.get(&t.1.1).is_some_and(|v| v.size > 0));
+        Ok(live.map(|t| t.0.clone()).collect())
     }
 
     /// This store's own entries: no linked store's.
@@ -962,6 +1098,7 @@ impl Store {
         if let Some((s, n)) = self.at(name) {
             return s.put(n, body);
         }
+        self.not_linked(name)?;
         self.put_on(name, body, None)
     }
 
@@ -986,6 +1123,7 @@ impl Store {
         if let Some((s, n)) = self.at(name) {
             return s.put_at(n, body, at);
         }
+        self.not_linked(name)?;
         let mut x = self.index()?;
         let named = |v: &&Version| v.name == name;
         let mut of: Vec<Version> =
@@ -1781,12 +1919,107 @@ mod tests {
         g.lock(b"changed", None).unwrap();
         let s =
             Store::open(&me, b"new", None).unwrap().links_in(vec![lab.clone()]);
-        assert_eq!(s.unopened, ["lab"]);
+        assert!(s.unopened[0].starts_with("@lab: its password changed"));
         assert!(s.get("@lab/github").is_err());
         let mut s = Store::open(&me, b"new", None).unwrap();
         s.link(Store::open(&lab, b"changed", None).unwrap()).unwrap();
         s.unlink("lab").unwrap();
         assert!(!lab.join("link").exists() && s.links().next().is_none());
+    }
+
+    #[test]
+    fn a_group_adds_and_removes_devices_without_pairing_again() {
+        let d = dir("group");
+        let me = |n: &str| {
+            let p = d.join(n);
+            Store::create(&p.join("own"), n.as_bytes(), None).unwrap();
+            p
+        };
+        let (a, b, c) = (me("alice"), me("bob"), me("carol"));
+        let lab = |p: &Path| p.join("lab");
+        // Sync: a union of v/.
+        let sync = |from: &Path, to: &Path| {
+            fs::create_dir_all(versions(&lab(to))).unwrap();
+            for e in fs::read_dir(versions(&lab(from))).unwrap().flatten() {
+                let at = versions(&lab(to)).join(e.file_name());
+                if !at.exists() {
+                    fs::copy(e.path(), at).unwrap();
+                }
+            }
+        };
+        let open = |p: &Path, n: &str| {
+            Store::open(&p.join("own"), n.as_bytes(), None)
+                .unwrap()
+                .links_in(vec![lab(p)])
+        };
+        let mut sa = Store::open(&a.join("own"), b"alice", None).unwrap();
+        let g = Store::create_group(&lab(&a), "alice").unwrap();
+        assert!(!lab(&a).join("key").exists(), "no group password");
+        sa.link(g).unwrap();
+        sa.put("@lab/wifi", b"w1\n").unwrap();
+        let seed = sa.linked[0].1.add_member("bob").unwrap();
+        let mut sb = Store::open(&b.join("own"), b"bob", None).unwrap();
+        sb.join_group(&lab(&b), &seed).unwrap();
+        assert!(open(&b, "bob").get("@lab/wifi").is_err(), "before a sync");
+        sync(&a, &b);
+        let sb = open(&b, "bob");
+        assert_eq!(&sb.get("@lab/wifi").unwrap()[..], b"w1\n");
+        let bob = sb.linked[0].1.member_id().unwrap();
+        assert_ne!(Some(&seed), sb.linked[0].1.member.as_ref(), "its own key");
+        sync(&b, &a);
+        let mut sa = open(&a, "alice");
+        let names: Vec<String> = sa.linked[0]
+            .1
+            .members()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names.len(), 2, "alice, and bob's own key alone");
+        let seed = sa.linked[0].1.add_member("carol").unwrap();
+        Store::open(&c.join("own"), b"carol", None)
+            .unwrap()
+            .join_group(&lab(&c), &seed)
+            .unwrap();
+        sync(&a, &c);
+        assert!(open(&c, "carol").get("@lab/wifi").is_ok());
+        // Bob leaves: a new key, sealed to alice and carol alone.
+        sa.linked[0].1.remove_member(&bob).unwrap();
+        sa.put("@lab/wifi", b"w2\n").unwrap();
+        for p in [&b, &c] {
+            sync(&a, p);
+        }
+        let sb = open(&b, "bob");
+        assert!(sb.linked[0].1.retired(), "bob is told");
+        assert_eq!(
+            &sb.get("@lab/wifi").unwrap()[..],
+            b"w1\n",
+            "the old one only"
+        );
+        let sc = open(&c, "carol");
+        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"w2\n");
+        assert_eq!(
+            sc.history("@lab/wifi").unwrap().len(),
+            3,
+            "w1, sealed again, w2"
+        );
+        assert_eq!(sc.linked[0].1.members().unwrap().len(), 2);
+        let g = &sc.linked[0].1;
+        let mine = g.member_id().unwrap();
+        assert!(g.sealed_to.contains(&mine), "carol's own key, not the handed");
+        // What bob writes now counts nowhere: not on the old key, nor on a
+        // new one he makes from it, sealed to carol.
+        sb.put("@lab/evil", b"x\n").ok();
+        let mut sb = open(&b, "bob");
+        let g = &mut sb.linked[0].1;
+        let ms = g.members().unwrap();
+        g.rotate_members(&ms.iter().collect::<Vec<_>>()).unwrap();
+        sb.put("@lab/evil", b"y\n").unwrap();
+        sync(&b, &c);
+        let sc = open(&c, "carol");
+        assert!(sc.get("@lab/evil").is_err());
+        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"w2\n");
+        assert!(sc.unopened[0].starts_with("@lab: 1 key(s) not built on"));
     }
 
     #[test]

@@ -37,8 +37,8 @@ impl View {
         if v.s.retired() {
             v.note = pasa::RETIRED_SAY.into();
         }
-        for u in &v.s.unopened {
-            v.note = format!("@{u}: its password changed there: link it again");
+        if let Some(u) = v.s.unopened.first() {
+            v.note = u.clone();
         }
         v
     }

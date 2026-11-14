@@ -4622,6 +4622,7 @@ dependencies = [
  "data-encoding",
  "eframe",
  "getrandom 0.4.3",
+ "hpke",
  "humantime",
  "image",
  "irnet",
