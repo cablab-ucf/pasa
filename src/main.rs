@@ -57,6 +57,9 @@ pasa health [--pwned]        weak, reused, expired, and exposed: read by a revok
                              haveibeenpwned.com by 5 hex digits of each SHA-1
 pasa stats                   the store in numbers
 pasa rm NAME | mv OLD NEW
+pasa recover [FILE]          versions written under a retired key that its rotation did
+                             not hold (an offline device's, or a revoked one's); one taken
+                             back
 pasa link DIR | unlink LABEL the store in DIR (a group's) opens with this one after its
                              password once: its entries show as @LABEL/NAME
 pasa group new DIR NAME      a group store in DIR: no password, a key per device (this
@@ -435,6 +438,12 @@ fn open() -> Result<Store> {
         eprintln!("{}", pasa::RETIRED_SAY);
     }
     s.unopened.iter().for_each(|u| eprintln!("{u}"));
+    if let Ok(n @ 1..) = s.excluded().map(|e| e.len()) {
+        eprintln!(
+            "{n} version(s) written under a retired key are left out (an \
+             offline device's, or a revoked one's): pasa recover"
+        );
+    }
     Ok(s)
 }
 
@@ -840,6 +849,19 @@ fn main() -> Result<()> {
             eprintln!("{}: opens with this store, as @{l}/NAME", d.display());
         }
         ["unlink", l] => open()?.unlink(l)?,
+        ["recover"] => {
+            for v in open()?.excluded()? {
+                let at = humantime::format_rfc3339_seconds(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_millis(v.ms),
+                );
+                println!("{}  {at}  {}", v.file, v.name);
+            }
+        }
+        ["recover", f] => {
+            let n = open()?.recover(f)?;
+            eprintln!("{n}: taken back, its newest version now");
+        }
         ["health", ..] => {
             let s = open()?;
             let h = s.health()?;

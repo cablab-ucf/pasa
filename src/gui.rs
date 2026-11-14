@@ -1810,6 +1810,30 @@ impl App {
             for name in &exposed {
                 ui.label(name);
             }
+            // Written under a retired key, held by no rotation: an offline
+            // device's edits, or a revoked one's. Never taken unasked.
+            let left = v.s.excluded().unwrap_or_default();
+            part(ui, format!("LEFT OUT AT A NEW STORE KEY: {}", left.len()));
+            for e in &left {
+                ui.horizontal(|ui| {
+                    ui.label(&e.name);
+                    let at = humantime::format_rfc3339_seconds(
+                        UNIX_EPOCH + Duration::from_millis(e.ms),
+                    );
+                    ui.label(
+                        RichText::new(at.to_string()).small().color(l.muted),
+                    );
+                    let why = "An offline device's edit, or a revoked one's: \
+                               take it back only if you know it";
+                    if ui.small_button("Take back").on_hover_text(why).clicked()
+                    {
+                        v.note = match v.s.recover(&e.file) {
+                            Ok(n) => format!("{n}: taken back"),
+                            Err(e) => format!("{e:#}"),
+                        };
+                    }
+                });
+            }
             if let Some(found) =
                 &*self.breached.lock().unwrap_or_else(|p| p.into_inner())
             {

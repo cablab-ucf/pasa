@@ -205,7 +205,9 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     f.write_all(b)?;
     f.sync_all()?;
     fs::rename(tmp, p)?;
-    let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+    // The rename is durable once its folder is (where a folder opens).
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -346,6 +348,8 @@ pub struct Store {
     current: usize,
     /// The members the newest envelope is sealed to.
     sealed_to: Vec<String>,
+    /// The key a rotation writes under before the key file holds it.
+    staged: Option<Secret>,
 }
 
 impl Store {
@@ -373,6 +377,7 @@ impl Store {
             handed: None,
             current: 1,
             sealed_to: vec![],
+            staged: None,
         })
     }
 
@@ -683,7 +688,9 @@ impl Store {
 
     /// Opens every store in [`stores`] linked to this one. One that no
     /// longer opens (its password changed) is left out, and said.
-    fn with_links(self) -> Store {
+    fn with_links(mut self) -> Store {
+        // A rotation cut short after its commit: finished here.
+        let _ = self.finish();
         self.links_in(stores())
     }
 
@@ -839,26 +846,84 @@ impl Store {
         Ok(!new.is_empty())
     }
 
-    /// Notice under the old key; [`HISTORY`] and entries under a new one.
+    /// A new store key, in three steps, each safe to be cut short:
+    /// [`HISTORY`] and every entry sealed again under it, while the key file
+    /// does not hold it yet (cut short: unreadable files, the store as it
+    /// was); the key file saved with it (the commit); then the notice to
+    /// devices on the old key, under that key (cut short: written at the
+    /// next open, by [`Store::finish`]).
     pub fn rotate(&mut self) -> Result<()> {
+        let new = Zeroizing::new(rand::<32>().to_vec());
+        self.stage(&new)?;
+        self.add_keys(&new)?;
+        self.finish()
+    }
+
+    /// Writes history and entries under `new`, not yet a key of the store.
+    pub(crate) fn stage(&mut self, new: &[u8]) -> Result<()> {
         let e = self.entries_here()?.into_values();
         let e = e.map(|v| Ok((self.body(&v)?, v)));
         let e = e.collect::<Result<Vec<_>>>()?;
-        let old = key_id(self.keys.first().context("no store key")?);
-        self.put(&format!("{RETIRED}{old}"), b"retired")?;
         let x = self.index()?;
         let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
         let now: Vec<String> = x.heads.keys().cloned().collect();
         drop(x);
         for f in now {
-            frozen.extend(Sha256::digest(fs::read(self.v.join(f))?));
+            frozen.extend(Sha256::digest(self.bytes(&f)?));
         }
-        self.add_keys(&rand::<32>())?;
-        self.put_on(HISTORY, &frozen, None)?;
-        let mut e = e.iter();
-        e.try_for_each(|(b, v)| self.put_on(&v.name, b, Some(v.file.clone())))
+        let was = std::mem::replace(&mut self.newest, recipient(new));
+        self.staged = Some(Zeroizing::new(new.to_vec()));
+        let go = || -> Result<()> {
+            self.put_on(HISTORY, &frozen, None)?;
+            let mut e = e.iter();
+            e.try_for_each(|(b, v)| {
+                self.put_on(&v.name, b, Some(v.file.clone()))
+            })
+        };
+        let r = go();
+        // Its versions are not this store's until the key file says so.
+        (self.newest, self.staged) = (was, None);
+        *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+            Index::default();
+        r
     }
 
+    /// Versions under a retired key that no rotation held: an offline
+    /// device's edits, or a revoked one's. Never counted, never shown as
+    /// entries; each may be taken back by hand ([`Store::recover`]).
+    pub fn excluded(&self) -> Result<Vec<Version>> {
+        let x = self.index()?;
+        let out = x.old.values().filter(|(v, d)| {
+            !x.frozen.contains(d) && !v.name.starts_with(OWN) && v.size > 0
+        });
+        Ok(sorted(out.map(|(v, _)| v)))
+    }
+
+    /// Takes left-out version `file` back: its body, its entry's newest
+    /// version now. The entry's name.
+    pub fn recover(&self, file: &str) -> Result<String> {
+        let v = self.excluded()?.into_iter().find(|v| v.file == file);
+        let v = v.context("no such left-out version")?;
+        self.put(&v.name, &self.body(&v)?)?;
+        Ok(v.name)
+    }
+
+    /// The notice to devices on the key before the newest, under that key,
+    /// if a rotation was cut short before it.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        let Some(old) = self.keys.get(1).cloned() else { return Ok(()) };
+        let at = format!("{RETIRED}{}", key_id(&old));
+        let said = self.index()?.old.values().any(|(v, _)| v.name == at);
+        if said {
+            return Ok(());
+        }
+        let now = std::mem::replace(&mut self.newest, recipient(&old));
+        let r = self.put(&at, b"retired");
+        self.newest = now;
+        *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+            Index::default();
+        r
+    }
     pub fn retired(&self) -> bool {
         let Some(k) = self.keys.first() else { return false };
         let at = format!("{RETIRED}{}", key_id(k));
@@ -1270,7 +1335,8 @@ impl Store {
              password or a pairing): unlock again"
         );
         drop(loaded);
-        let newest = self.keys.first().context("no store key")?;
+        let newest = self.staged.as_ref().or(self.keys.first());
+        let newest = newest.context("no store key")?;
         ensure!(
             name.starts_with(RETIRED)
                 || !x
@@ -1811,8 +1877,9 @@ mod tests {
         let body = String::from_utf8(s.get("mail").unwrap().to_vec()).unwrap();
         assert_eq!(field(&body, "user").as_deref(), Some("me"));
         assert_eq!(field(&body, "pass").as_deref(), Some("b"));
-        // 4 puts, the retired notice, the history list, mail resealed.
-        assert_eq!(s.versions().unwrap().len(), 7);
+        // 4 puts, the history list, mail resealed; the retired notice is
+        // under the old key, for devices still on it, not history.
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert!(s.conflicts().unwrap().is_empty());
         fs::write(
             crate::versions(&d).join("0123456789abcdef0123456789abcdef"),
@@ -1821,7 +1888,7 @@ mod tests {
         .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
-        assert_eq!(s.versions().unwrap().len(), 7);
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert_eq!(s.unreadable.load(Relaxed), 1);
         s.lock(b"new", Some((&[9; 32], b"hmac"))).unwrap();
         let k = fs::read(d.join("key")).unwrap();
@@ -2220,6 +2287,41 @@ mod tests {
         assert_eq!(&s.get("mail").unwrap()[..], b"m41l\n");
         // A file at the limit is refused before it is written.
         assert!(s.put("big", &vec![7; MAX - 400]).is_err());
+    }
+
+    #[test]
+    fn a_rotation_cut_short_loses_nothing_and_left_out_edits_come_back() {
+        let d = dir("cut");
+        let mut s = Store::create(&d, b"pw", None).unwrap();
+        s.put("bank", b"1\n").unwrap();
+        s.put("mail", b"m\n").unwrap();
+        // Cut before the commit: written under a key no file holds.
+        s.stage(&rand::<32>()).unwrap();
+        let mut s = Store::open(&d, b"pw", None).unwrap();
+        assert_eq!(s.entries().unwrap().len(), 2, "the store as it was");
+        assert_eq!(s.keys().len(), 1);
+        // Cut after the commit: the notice is written at the next open. An
+        // edit on the old key after the snapshot (another device's, offline
+        // through it) is no part of the new key's history.
+        let new = rand::<32>();
+        s.stage(&new).unwrap();
+        s.put("wifi", b"w\n").unwrap();
+        s.add_keys(&new).unwrap();
+        let s = Store::open(&d, b"pw", None).unwrap();
+        assert_eq!(s.keys().len(), 2);
+        assert_eq!(&s.get("bank").unwrap()[..], b"1\n");
+        assert_eq!(s.history("bank").unwrap().len(), 2, "1, sealed again");
+        let at = format!("{RETIRED}{}", key_id(&s.keys()[1]));
+        assert!(s.index().unwrap().old.values().any(|(v, _)| v.name == at));
+        // That edit: left out, said, and taken back by hand.
+        assert!(s.get("wifi").is_err());
+        let left = s.excluded().unwrap();
+        assert_eq!(
+            left.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["wifi"]
+        );
+        assert_eq!(s.recover(&left[0].file).unwrap(), "wifi");
+        assert_eq!(&s.get("wifi").unwrap()[..], b"w\n");
     }
 
     #[test]
