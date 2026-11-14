@@ -36,8 +36,8 @@ const INFO: &[u8] = b"pasa group keys 3";
 const CTX: &[u8] = b"pasa group 3";
 /// What an envelope's first stanza line starts with.
 const ENVELOPE: &[u8] = b"age-encryption.org/v1\n-> pasa-xwing ";
-/// Every envelope's signed body, named by its hash, under the store key
-/// of its epoch: a device added later reads the chain from the root.
+/// Copies of envelope bodies, named by their hashes, each the link of the
+/// envelope after: a device added later reads the chain from the root.
 const CHAIN: &str = ".pasa/chain/";
 /// Names this admin paired in and has not admitted: its own, never synced.
 const INVITES: &str = "invites";
@@ -290,27 +290,48 @@ fn list_of(mut b: &[u8]) -> Option<Vec<Member>> {
 struct Envelope {
     epoch: u64,
     prev: String,
+    /// The file in `v/` holding `prev`'s body, under one of the two newest
+    /// keys: the way back to the root, for a device added since.
+    link: String,
     list: Vec<Member>,
     keys: Vec<Secret>,
     signer: String,
     bundle: Vec<u8>,
     hash: String,
+    body: Secret,
 }
 
 fn envelope(pt: &[u8]) -> Option<Envelope> {
-    let (f, signer, bundle) = opened(b"k3", pt, 4)?;
+    let (f, signer, bundle) = opened(b"k3", pt, 5)?;
     let keys: Vec<Secret> =
-        f[3].chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
-    (!keys.is_empty() && f[3].len() % 32 == 0).then_some(())?;
+        f[4].chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
+    (!keys.is_empty() && f[4].len() % 32 == 0).then_some(())?;
     Some(Envelope {
         epoch: text(&f[0]).parse().ok()?,
         prev: text(&f[1]),
-        list: list_of(&f[2])?,
+        link: text(&f[2]),
+        list: list_of(&f[3])?,
         keys,
         signer,
         bundle,
         hash: HEXLOWER.encode(&Sha256::digest(pt)),
+        body: Zeroizing::new(pt.to_vec()),
     })
+}
+
+/// The envelope `n` is built on, from the file it links, if that file
+/// holds it (under either of `n`'s two newest keys).
+fn linked(dir: &Path, n: &Envelope) -> Option<Envelope> {
+    let f = fs::File::open(crate::versions(dir).join(&n.link)).ok()?;
+    let mut ct = vec![];
+    f.take(MAX as u64).read_to_end(&mut ct).ok()?;
+    (name_of(&ct) == n.link).then_some(())?;
+    let pt = n.keys.iter().take(2).find_map(|k| crate::open(k, &ct))?;
+    let at = pt.iter().position(|&c| c == b'\n')?;
+    let v = crate::Version::parse(std::str::from_utf8(&pt[..at]).ok()?, "")?;
+    let body = pt.get(at + 1..)?.get(..v.size)?;
+    (HEXLOWER.encode(&Sha256::digest(body)) == n.prev).then_some(())?;
+    envelope(body)
 }
 
 /// An age file's plaintext, if sealed to `me`.
@@ -347,6 +368,7 @@ fn genesis(e: &Envelope, root: &str) -> bool {
 }
 
 /// Whether `n` may follow `p`: signed by an admin of `p`, the keys kept,
+/// the root kept, an admin,
 /// every member kept as it was but for what that admin may change: one it
 /// outranks (or itself) removed or demoted, a member made admin (ranked
 /// last), devices added by it.
@@ -383,7 +405,7 @@ fn follows(p: &Envelope, n: &Envelope, root: &str) -> bool {
         && keys
         && kept
         && added
-        && n.list.iter().any(|m| m.admin)
+        && n.list.iter().any(|m| m.id == root && m.admin)
 }
 
 /// A group store's view, from its chain.
@@ -402,6 +424,11 @@ pub(crate) struct State {
     gone: Vec<Member>,
     /// Members asking to leave.
     leaves: Vec<String>,
+    /// The newest envelope's body: the next one links a copy.
+    body: Secret,
+    /// Removals (true) and demotions this device signed on a fork that
+    /// lost: made again, where it still may.
+    redo: Vec<(String, bool)>,
 }
 
 impl Store {
@@ -454,7 +481,7 @@ impl Store {
     ) -> Result<Store> {
         let k = Keys::of(seed);
         let me = Me(&k.x.0, k.id());
-        let mut all: BTreeMap<String, Envelope> = BTreeMap::new();
+        let mut found: Vec<Envelope> = vec![];
         let mut asks = vec![];
         for e in fs::read_dir(crate::versions(dir))?.flatten() {
             let Ok(f) = fs::File::open(e.path()) else { continue };
@@ -467,28 +494,25 @@ impl Store {
             }
             let Some(pt) = unsealed(&me, &b) else { continue };
             if let Some(n) = envelope(&pt) {
-                all.insert(n.hash.clone(), n);
+                found.push(n);
             } else if let Some((f, id, bundle)) = opened(b"l3", &pt, 1) {
                 (f[0] == root.as_bytes()).then(|| asks.push((id, bundle)));
             }
         }
-        // The bodies under each key these hold: all of the chain, for a
-        // device added since; every version, each one its name's hash.
-        let mut keys: Vec<Secret> = vec![];
-        for k in all.values().flat_map(|e| &e.keys) {
-            if !keys.contains(k) {
-                keys.push(k.clone());
+        // Back to the root by links: one file each, read once.
+        let mut all: BTreeMap<String, Envelope> = BTreeMap::new();
+        let mut linked_ok: HashSet<String> = HashSet::new();
+        while let Some(n) = found.pop() {
+            if all.contains_key(&n.hash) {
+                continue;
             }
-        }
-        for k in keys {
-            let s = Store::new(dir, vec![k], Default::default(), vec![])?;
-            for v in s.versions_here()? {
-                let Some(h) = v.name.strip_prefix(CHAIN) else { continue };
-                let Ok(b) = s.body(&v) else { continue };
-                if HEXLOWER.encode(&Sha256::digest(&b)) == h {
-                    envelope(&b).map(|n| all.insert(n.hash.clone(), n));
-                }
+            if !n.link.is_empty()
+                && let Some(p) = linked(dir, &n)
+            {
+                linked_ok.insert(n.hash.clone());
+                found.push(p);
             }
+            all.insert(n.hash.clone(), n);
         }
         // Valid: the root's first, then each by an admin of the one before;
         // with its signer's rank there.
@@ -497,7 +521,10 @@ impl Store {
         let mut valid: HashMap<&str, (u64, String)> = HashMap::new();
         for n in &order {
             let r = match all.get(&n.prev) {
-                Some(p) if valid.contains_key(p.hash.as_str()) => {
+                Some(p)
+                    if valid.contains_key(p.hash.as_str())
+                        && linked_ok.contains(&n.hash) =>
+                {
                     rank(&p.list, root, &n.signer)
                         .filter(|_| follows(p, n, root))
                 }
@@ -558,7 +585,23 @@ impl Store {
         }
         let member =
             |id: &String| at.list.iter().any(|m| m.id == *id && !m.admin);
+        // Removals and demotions this device signed, valid, on any fork.
+        let mut redo = vec![];
+        for n in all.values().filter(|n| n.signer == me.1 && ok(n)) {
+            let Some(p) = all.get(&n.prev) else { continue };
+            for m in p.list.iter().filter(|m| m.id != me.1) {
+                match n.list.iter().find(|x| x.id == m.id) {
+                    None => redo.push((m.id.clone(), true)),
+                    Some(x) if m.admin && !x.admin => {
+                        redo.push((m.id.clone(), false))
+                    }
+                    _ => {}
+                }
+            }
+        }
         s.g = State {
+            body: at.body.clone(),
+            redo,
             epoch: at.epoch,
             head: at.hash.clone(),
             list: at.list.clone(),
@@ -628,19 +671,48 @@ impl Store {
         prev: String,
         list: Vec<Member>,
     ) -> Result<()> {
+        self.seal_envelope_to(epoch, prev, list, None)
+    }
+
+    /// `to`: the members it is sealed to, if not all (a test's attacker).
+    fn seal_envelope_to(
+        &mut self,
+        epoch: u64,
+        prev: String,
+        list: Vec<Member>,
+        to: Option<&[String]>,
+    ) -> Result<()> {
         let keys: Zeroizing<Vec<u8>> = Zeroizing::new(
             self.keys.iter().flat_map(|k| k.iter().copied()).collect(),
         );
         let e = epoch.to_string();
+        // The one before, kept under the newest key: whoever sealed it.
+        let link = match prev.is_empty() {
+            true => String::new(),
+            false => {
+                let at = format!("{CHAIN}{prev}");
+                self.put_on(&at, &self.g.body.clone(), None)?
+            }
+        };
         let pt = Zeroizing::new(signed(
             b"k3",
-            &[e.as_bytes(), prev.as_bytes(), &list_bytes(&list), &keys],
+            &[
+                e.as_bytes(),
+                prev.as_bytes(),
+                link.as_bytes(),
+                &list_bytes(&list),
+                &keys,
+            ],
             &self.keys_mine()?,
         )?);
-        let ct = seal_to(&list.iter().collect::<Vec<_>>(), &pt)?;
+        let to: Vec<&Member> = list
+            .iter()
+            .filter(|m| to.is_none_or(|t| t.contains(&m.id)))
+            .collect();
+        let ct = seal_to(&to, &pt)?;
         write(&self.v.join(name_of(&ct)), &ct)?;
         let h = HEXLOWER.encode(&Sha256::digest(&pt));
-        self.put(&format!("{CHAIN}{h}"), &pt)?;
+        self.g.body = pt;
         let ids = list.iter().map(|m| m.id.clone());
         self.g.ever.extend(ids.clone());
         self.g.known.extend(ids);
@@ -713,6 +785,11 @@ impl Store {
     /// request, sealed to the admins.
     pub(crate) fn leave(&mut self) -> Result<()> {
         let me = self.member_id().context("not a group store")?;
+        // Nobody outranks the root: a leave of its own would not be final.
+        ensure!(
+            self.root() != Some(&me),
+            "the group's root stays in it: to hand it on, make a new group"
+        );
         if self.is_admin() {
             let others = self
                 .g
@@ -745,6 +822,20 @@ impl Store {
         let me = self.member_id().context("not a group store")?;
         let mut list: Vec<Member> = self.g.list.clone();
         list.retain(|m| m.admin || !self.g.leaves.contains(&m.id));
+        // A removal or demotion of this device's, lost to a fork made at
+        // once: made again.
+        for (id, out) in &self.g.redo {
+            if !self.outranks(id) {
+                continue;
+            }
+            match out {
+                true => list.retain(|m| m.id != *id),
+                false => list
+                    .iter_mut()
+                    .filter(|m| m.id == *id)
+                    .for_each(|m| m.admin = false),
+            }
+        }
         for (name, bundle) in self.requests()? {
             let id = id_of(&bundle);
             if !self.g.ever.contains(&id)
@@ -835,6 +926,19 @@ impl Store {
         admin: bool,
     ) -> Result<()> {
         self.puppet(seed, admin, true)
+    }
+
+    /// Removes `who` without a new key, sealed to `to` alone.
+    #[cfg(test)]
+    pub(crate) fn remove_quietly(
+        &mut self,
+        who: &str,
+        to: &[String],
+    ) -> Result<()> {
+        let id = self.one(who)?.id;
+        let list = self.g.list.iter().filter(|m| m.id != id).cloned().collect();
+        let epoch = self.g.epoch + 1;
+        self.seal_envelope_to(epoch, self.g.head.clone(), list, Some(to))
     }
 
     /// A device of this one's making in the next envelope (`key`: under a

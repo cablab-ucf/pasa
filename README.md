@@ -199,8 +199,8 @@ pasa group rm lab bob           # bob gets nothing written since
 
 The window and the phone do the same in Devices, Group stores.
 
-Admins rank by age, the root first; an admin removes or demotes only
-those below it. Of two forks, the one a higher admin signed in holds, and
+Admins rank by age, the root first, which stays in its group (to hand
+it on, make a new one); an admin removes or demotes only those below it. Of two forks, the one a higher admin signed in holds, and
 a device says when a key it may have written with was set aside: a
 removed admin's fork, made before its removal or after, loses to the
 branch holding the removal; a losing fork changes nothing in the other.

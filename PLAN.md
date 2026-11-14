@@ -29,16 +29,21 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
    - **Envelopes**: the only authority. Each: epoch, the hash of the one
      before, the member list (name, role, rank epoch, adder, public keys),
      every key; signed by an admin of the one before; sealed to each
-     member (X-Wing), and its body kept under that epoch's store key, so a
-     device added later checks the whole chain from the root.
-   - **Rules** (`follows`): the keys kept or one new; members unchanged
+     member (X-Wing), with a link: the file holding the body of the one
+     before, which its signer stores under the newest key. A device added
+     later follows links to the root, a file each; junk costs its size.
+   - **Rules** (`follows`): the keys kept or one new; the root kept, an
+     admin (nobody outranks it, so its own leave could not be final; to
+     hand a group on, make a new one); members unchanged
      but for those the signer outranks (or itself) removed or demoted, a
      member made admin at this epoch (ranked last), devices added by the
      signer at this epoch.
    - **Forks**: the one a higher admin signed in (anywhere in it) holds:
      a removed admin's fork, from before its removal or after, loses to
      the branch holding the removal; a losing fork changes nothing in the
-     other (a second review found that voiding by removals did). An admin
+     other (a second review found that voiding by removals did). A
+     removal or demotion of a device's, lost to a fork made at once, is
+     made again at its next open, while it still outranks. An admin
      can still undo its own changes and those of admins below it, made
      since its fork, while no higher admin has signed after them.
    - **Joining**: an admin's one-time invitation (local); the joiner's
@@ -53,6 +58,10 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      forced, a device added after opens); two admins at once; a
      stranger's and a member's requests; a member's retire notice; a new
      password; leaving.
+   - Third review (fixed): junk keys stalled opens (now links, no
+     trial over `v/`); a hidden envelope split the group (each signer
+     stores the body before); the root's leave was never final (the root
+     stays); a removal lost to an honest race (made again).
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

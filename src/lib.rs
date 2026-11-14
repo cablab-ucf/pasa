@@ -862,7 +862,7 @@ impl Store {
             self.put_on(HISTORY, &frozen, None)?;
             let mut e = e.iter();
             e.try_for_each(|(b, v)| {
-                self.put_on(&v.name, b, Some(v.file.clone()))
+                self.put_on(&v.name, b, Some(v.file.clone())).map(drop)
             })
         };
         let r = go();
@@ -1253,16 +1253,16 @@ impl Store {
             return s.put(n, body);
         }
         self.not_linked(name)?;
-        self.put_on(name, body, None)
+        self.put_on(name, body, None).map(drop)
     }
 
-    /// `parent`: for a rotation, the version under the retired key.
-    fn put_on(
+    /// `parent`: for a rotation, the version under the retired key. Its file.
+    pub(crate) fn put_on(
         &self,
         name: &str,
         body: &[u8],
         parent: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut x = self.index()?;
         let tip = || x.tips.get(name).map_or("-".into(), |t| t.1.clone());
         let parent = parent.unwrap_or_else(tip);
@@ -1297,7 +1297,7 @@ impl Store {
         };
         let before = of.iter().rfind(|v| v.ms < ms);
         let parent = before.map_or("-".into(), |v| v.file.clone());
-        self.keep(&mut x, name, body, ms, parent)
+        self.keep(&mut x, name, body, ms, parent).map(drop)
     }
 
     fn keep(
@@ -1307,7 +1307,7 @@ impl Store {
         body: &[u8],
         ms: u64,
         parent: String,
-    ) -> Result<()> {
+    ) -> Result<String> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
         // Never write under a key that may be retired, here or by sync.
@@ -1348,8 +1348,9 @@ impl Store {
         write(&self.v.join(&v.file), &ct)?;
         x.mtime = fs::metadata(&self.v).and_then(|m| m.modified()).ok();
         x.tip(&v);
+        let file = v.file.clone();
         x.heads.insert(v.file.clone(), v);
-        Ok(())
+        Ok(file)
     }
 }
 
@@ -2437,6 +2438,59 @@ mod tests {
             s.unopened
         );
         assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n");
+    }
+
+    #[test]
+    fn a_hidden_envelope_splits_nothing_and_a_lost_removal_is_made_again() {
+        let l = Lab::new("split", &["alice", "bob", "carol", "dave", "erin"]);
+        for w in ["bob", "carol", "dave"] {
+            l.add("alice", w);
+        }
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.g(&mut sa).promote("carol").unwrap();
+        for w in ["bob", "carol", "dave"] {
+            l.sync("alice", w);
+        }
+        // Carol removes dave, sealed to alice alone, no new key; alice's
+        // open makes one, and everyone follows.
+        let alice = l.open("alice").group("lab").unwrap().member_id().unwrap();
+        let mut sc = l.open("carol");
+        l.g(&mut sc).remove_quietly("dave", &[alice]).unwrap();
+        l.sync("carol", "alice");
+        l.open("alice").put("@lab/s", b"s\n").unwrap();
+        for _ in 0..2 {
+            for (f, t) in
+                [("alice", "bob"), ("alice", "carol"), ("bob", "carol")]
+            {
+                l.sync(f, t);
+            }
+        }
+        for w in ["alice", "bob", "carol"] {
+            assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
+            assert!(!l.names(w).contains(&"dave".into()), "{w}");
+        }
+        // Bob removes nobody yet; alice adds erin while bob, at once,
+        // removes carol: alice's holds, and bob's next open removes again.
+        let mut sb = l.open("bob");
+        sb.group_remove("lab", "carol").unwrap();
+        l.add("alice", "erin");
+        l.sync("bob", "alice");
+        l.sync("alice", "bob");
+        assert!(l.names("bob").contains(&"erin".into()));
+        drop(l.open("bob")); // removes carol again
+        l.sync("bob", "alice");
+        l.sync("bob", "erin");
+        for w in ["alice", "bob", "erin"] {
+            let n = l.names(w);
+            assert!(
+                !n.contains(&"carol".into()) && n.contains(&"erin".into()),
+                "{w} {n:?}"
+            );
+        }
+        // The root stays.
+        let mut sa = l.open("alice");
+        assert!(sa.unlink("lab").is_err());
     }
 
     #[test]
