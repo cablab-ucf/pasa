@@ -1,6 +1,6 @@
 [package]
 name = "apasa-jni"
-version = "0.4.16"
+version = "0.4.17"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -13,6 +13,6 @@ anyhow = "1"
 jni = "0.22"
 pasa = { path = "..", default-features = false, features = ["sync"] }
 # org.pushir.Native, for the shared push connection (android/pushir).
-pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "04c89d01832e73df15c16977272ca0aaf1d3ef23", features = ["jni"] }
+pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "55b14535bfee4453db62e0521f326b0544f22f28", features = ["jni"] }
 zeroize = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
