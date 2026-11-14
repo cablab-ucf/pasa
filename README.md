@@ -176,25 +176,33 @@ was; only the open view unites them, in memory, and each write goes to
 its own store, which syncs, serves and commits as before. Your password,
 changed, seals the links anew; the group's, changed, asks for a new link.
 
-Not on yet (PLAN.md: membership signed by admins first; a group already
-held keeps opening). A group made by pasa has no password: a key per device (X-Wing), and the
-store keys sealed to every member's in an age file in `v/`, which syncs as
-any version. Adding a device hands it a member key through pairing; it
-makes its own at once. Removing one is a new store key sealed to the rest
-alone: nobody pairs again, and no password exists to change.
+Not on yet (PLAN.md: an adversarial review of the signed membership
+first; a group already held keeps opening). A group made by pasa has no
+password. Each device makes its own seed, never sent: X-Wing (to open the
+keys) and Ed25519 with ML-DSA-65 (to sign; both must verify). The creator
+is the root; an admin is the root or one an admin's signed record names.
+Admins sign every member record, removal and key envelope (the store keys
+sealed to each member, in `v/`, which syncs as any version). Joining hands
+no key: the new device puts its public keys in `v/`, sealed with the
+pairing secret, and the admin that paired it admits it the next time it
+opens. Removing one is a new store key sealed to the rest alone: nobody
+pairs again, and no password exists to change.
 
 ```sh
-pasa group new ~/lab alice      # a group, this device in it as alice
+pasa group new ~/lab alice      # a group, this device its root, as alice
 pasa group add lab bob [--qr]   # a code; there: pasa group join ~/lab alice CODE
-pasa group ls lab               # members
+pasa group ls lab               # members, admins
+pasa group admin lab bob        # bob adds and removes too
 pasa group rm lab bob           # bob gets nothing written since
 ```
 
 The window and the phone do the same in Devices, Group stores.
 
-A device takes a new key only if it holds the one before: a removed
-member, who never had it, cannot make one others take. Removals are never
-undone, so two at once merge to what neither removed. What a removed
+A device takes a new key only from an admin's signed envelope built on
+the key it holds; non-admins never make keys. Two admins at once: the
+older one's wins, and a device says when a key it may have written with
+was set aside. A removal voids its subject's signatures from then on, so a
+removed admin's race lasts only until its removal syncs. What a removed
 device read it keeps (`pasa health` lists those passwords).
 
 ## Revocation

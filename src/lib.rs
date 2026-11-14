@@ -341,8 +341,10 @@ pub struct Store {
     waiting: Vec<PathBuf>,
     /// A group store's: this device's member key (seed); it has no `key`.
     member: Option<Secret>,
-    /// The member key pairing handed, while it may still open something.
-    handed: Option<Secret>,
+    /// A group store's root: whom its authority runs from.
+    root: Option<String>,
+    /// A group store's epoch: how many keys its chain holds, less one.
+    epoch: u64,
     /// How many of `keys` are current: 2 or more while rotations made at
     /// once are not yet merged by the next.
     current: usize,
@@ -374,7 +376,8 @@ impl Store {
             unopened: vec![],
             waiting: vec![],
             member: None,
-            handed: None,
+            root: None,
+            epoch: 0,
             current: 1,
             sealed_to: vec![],
             staged: None,
@@ -526,17 +529,19 @@ impl Store {
         Ok(label)
     }
 
-    /// Opens with this store no more: `link` goes.
-    /// A store with a password opens on its own again. A group store has
-    /// none: this device leaves it (its record goes, so the others' next
-    /// key is not sealed to it) and its member key goes.
+    /// Opens with this store no more. A store with a password opens on
+    /// its own again. A group store has none: this device leaves it (its
+    /// removal, signed by itself: the others' next key is not sealed to
+    /// it), and its member key goes.
     pub fn unlink(&mut self, label: &str) -> Result<()> {
         let i = self.linked.iter().position(|l| l.0 == label);
-        let (_, s) = self.linked.remove(i.context("no such linked store")?);
-        if let Some(me) = s.member_id() {
-            s.put(&format!("{}{me}", group::MEMBERS), b"")?;
+        let i = i.context("no such linked store")?;
+        if self.linked[i].1.member.is_some() {
+            self.linked[i].1.leave()?;
+            let (_, s) = self.linked.remove(i);
             return Ok(fs::remove_file(s.dir.join("member"))?);
         }
+        let (_, s) = self.linked.remove(i);
         Ok(fs::remove_file(s.dir.join("link"))?)
     }
 
@@ -581,31 +586,19 @@ impl Store {
 
     /// `other`'s KEK, sealed to this one's, in `other/link`: never in `v/`,
     /// so never synced, and pairing hands none.
-    /// A group store's: `member` instead, its member key sealed so, the
-    /// byte between 1 if pairing handed it (so not this device's own yet).
+    /// A group store's: `member` instead, its seed and root sealed so.
     fn seal_link(&self, other: &Store) -> Result<()> {
-        if let Some(seed) = &other.member {
-            let newest = other.keys.first().map(|k| &k[..]);
-            let old = other.handed.as_deref().map(|h| &h[..]);
-            return self.seal_member(&other.dir, seed, newest, false, old);
+        if let (Some(seed), Some(root)) = (&other.member, other.root()) {
+            return self.seal_member(&other.dir, seed, root);
         }
         let sealed = seal(&self.kek, &other.kek)?;
         write(&other.dir.join("link"), &[&self.owner()[..], &sealed].concat())
     }
 
-    /// `member`: owner (16), handed (1), then sealed: the member key and
-    /// the newest store key this device holds, if any.
-    fn seal_member(
-        &self,
-        dir: &Path,
-        seed: &[u8],
-        newest: Option<&[u8]>,
-        handed: bool,
-        old: Option<&[u8]>,
-    ) -> Result<()> {
-        let newest = newest.unwrap_or(&[0; 32]);
-        let all =
-            [&[handed as u8], seed, newest, old.unwrap_or_default()].concat();
+    /// `member`: owner (16), then sealed: this device's seed in the group
+    /// (32) and the group's root (its id, 32).
+    fn seal_member(&self, dir: &Path, seed: &[u8], root: &str) -> Result<()> {
+        let all = Zeroizing::new([seed, root.as_bytes()].concat());
         let sealed = seal(&self.kek, &all)?;
         write(&dir.join("member"), &[&self.owner()[..], &sealed].concat())
     }
@@ -623,16 +616,26 @@ impl Store {
         Ok(())
     }
 
-    /// Joins the group store in `dir` with the member key pairing handed:
-    /// it opens with this store once a sync brings its keys.
-    pub fn join_group(&mut self, dir: &Path, seed: &[u8]) -> Result<()> {
+    /// Joins group `root` in `dir`: a seed made here, never sent; its
+    /// public keys put in `v/` sealed to the pairing's secret `psk`, for the
+    /// admin that paired it to sign. It opens with this store once a sync
+    /// brings an envelope to it.
+    pub fn join_group(
+        &mut self,
+        dir: &Path,
+        root: &str,
+        psk: &[u8],
+    ) -> Result<()> {
         ensure!(group::ON, group::OFF);
         ensure!(
             !["key", "member", "link"].iter().any(|f| dir.join(f).exists()),
             "{} holds a store",
             dir.display()
         );
-        self.seal_member(dir, seed, None, true, None)?;
+        let seed = Zeroizing::new(rand::<32>().to_vec());
+        self.seal_member(dir, &seed, root)?;
+        let ask = group::request(&seed, psk, &group::node_of(dir))?;
+        write(&versions(dir).join(name_of(&ask)), &ask)?;
         self.waiting.push(dir.into());
         Ok(())
     }
@@ -642,20 +645,11 @@ impl Store {
     fn open_group(&self, dir: &Path, f: &[u8]) -> Result<Store> {
         let sealed = f.get(16..).context("a damaged link")?;
         let all = open(&self.kek, sealed).context("a damaged link")?;
-        ensure!(all.len() == 65 || all.len() == 97, "a damaged link");
-        let handed = all[0] == 1;
-        let (seed, rest) = all[1..].split_at(32);
-        let (known, old) = rest.split_at(32);
-        let known = (known != [0; 32]).then_some(known);
-        let old = (!old.is_empty()).then_some(old);
-        let mut g = Store::open_member(dir, seed, known, old)?;
-        if handed {
-            g.rekey()?;
-        }
+        ensure!(all.len() == 64, "a damaged link");
+        let (seed, root) = all.split_at(32);
+        let root = std::str::from_utf8(root).context("a damaged link")?;
+        let mut g = Store::open_member(dir, seed, root)?;
         g.settle()?;
-        if handed || known != g.keys.first().map(|k| &k[..]) {
-            self.seal_link(&g)?;
-        }
         if g.retired() {
             g.unopened.push(
                 "this device was removed from it: what it held it keeps, \
@@ -1069,15 +1063,6 @@ impl Store {
             all.insert(v.name.clone(), v);
         }
         Ok(all)
-    }
-
-    /// Live names under `prefix`, the store's own (`.pasa/`) ones too.
-    fn live(&self, prefix: &str) -> Result<Vec<String>> {
-        let x = self.index()?;
-        let tips = x.tips.iter().filter(|t| t.0.starts_with(prefix));
-        let live =
-            tips.filter(|t| x.heads.get(&t.1.1).is_some_and(|v| v.size > 0));
-        Ok(live.map(|t| t.0.clone()).collect())
     }
 
     /// This store's own entries: no linked store's.
@@ -2103,178 +2088,6 @@ mod tests {
     }
 
     #[test]
-    fn a_group_adds_and_removes_devices_without_pairing_again() {
-        let d = dir("group");
-        let me = |n: &str| {
-            let p = d.join(n);
-            Store::create(&p.join("own"), n.as_bytes(), None).unwrap();
-            p
-        };
-        let (a, b, c) = (me("alice"), me("bob"), me("carol"));
-        let lab = |p: &Path| p.join("lab");
-        // Sync: a union of v/.
-        let sync = |from: &Path, to: &Path| {
-            fs::create_dir_all(versions(&lab(to))).unwrap();
-            for e in fs::read_dir(versions(&lab(from))).unwrap().flatten() {
-                let at = versions(&lab(to)).join(e.file_name());
-                if !at.exists() {
-                    fs::copy(e.path(), at).unwrap();
-                }
-            }
-        };
-        let open = |p: &Path, n: &str| {
-            Store::open(&p.join("own"), n.as_bytes(), None)
-                .unwrap()
-                .links_in(vec![lab(p)])
-        };
-        let mut sa = Store::open(&a.join("own"), b"alice", None).unwrap();
-        let g = Store::create_group(&lab(&a), "alice").unwrap();
-        assert!(!lab(&a).join("key").exists(), "no group password");
-        sa.link(g).unwrap();
-        sa.put("@lab/wifi", b"w1\n").unwrap();
-        let seed = sa.linked[0].1.add_member("bob").unwrap();
-        let mut sb = Store::open(&b.join("own"), b"bob", None).unwrap();
-        sb.join_group(&lab(&b), &seed).unwrap();
-        assert!(open(&b, "bob").get("@lab/wifi").is_err(), "before a sync");
-        sync(&a, &b);
-        let sb = open(&b, "bob");
-        assert_eq!(&sb.get("@lab/wifi").unwrap()[..], b"w1\n");
-        let bob = sb.linked[0].1.member_id().unwrap();
-        assert_ne!(Some(&seed), sb.linked[0].1.member.as_ref(), "its own key");
-        sync(&b, &a);
-        let mut sa = open(&a, "alice");
-        let names: Vec<String> = sa.linked[0]
-            .1
-            .members()
-            .unwrap()
-            .into_iter()
-            .map(|m| m.name)
-            .collect();
-        assert_eq!(names.len(), 2, "alice, and bob's own key alone");
-        let seed = sa.linked[0].1.add_member("carol").unwrap();
-        Store::open(&c.join("own"), b"carol", None)
-            .unwrap()
-            .join_group(&lab(&c), &seed)
-            .unwrap();
-        sync(&a, &c);
-        assert!(open(&c, "carol").get("@lab/wifi").is_ok());
-        // Carol paired with bob's device too.
-        let node = crate::sync::node(&lab(&b)).unwrap();
-        let id = HEXLOWER.decode(node.as_bytes()).unwrap();
-        let id = iroh::PublicKey::from_bytes(&id.try_into().unwrap()).unwrap();
-        let peer = |name: &str| crate::sync::Peer {
-            name: name.into(),
-            psk: [1; 32],
-            id: Some(id),
-            lane: None,
-            seen: None,
-        };
-        crate::sync::add(&lab(&c), peer("bobby")).unwrap();
-        // Bob leaves: a new key, sealed to alice and carol alone.
-        sa.linked[0].1.remove_member(&bob).unwrap();
-        sa.put("@lab/wifi", b"w2\n").unwrap();
-        for p in [&b, &c] {
-            sync(&a, p);
-        }
-        let sb = open(&b, "bob");
-        assert!(sb.linked[0].1.retired(), "bob is told");
-        assert_eq!(
-            &sb.get("@lab/wifi").unwrap()[..],
-            b"w1\n",
-            "the old one only"
-        );
-        let sc = open(&c, "carol");
-        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"w2\n");
-        assert!(crate::sync::peers(&lab(&c)).is_empty(), "bob's pairing gone");
-        assert_eq!(
-            sc.history("@lab/wifi").unwrap().len(),
-            3,
-            "w1, sealed again, w2"
-        );
-        assert_eq!(sc.linked[0].1.members().unwrap().len(), 2);
-        let g = &sc.linked[0].1;
-        let mine = g.member_id().unwrap();
-        assert!(g.sealed_to.contains(&mine), "carol's own key, not the handed");
-        // What bob writes now counts nowhere: not on the old key, nor on a
-        // new one he makes from it, sealed to carol.
-        sb.put("@lab/evil", b"x\n").ok();
-        let mut sb = open(&b, "bob");
-        let g = &mut sb.linked[0].1;
-        let ms = g.members().unwrap();
-        g.rotate_members(&ms.iter().collect::<Vec<_>>()).unwrap();
-        sb.put("@lab/evil", b"y\n").unwrap();
-        sync(&b, &c);
-        let sc = open(&c, "carol");
-        assert!(sc.get("@lab/evil").is_err());
-        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"w2\n");
-        assert!(sc.unopened[0].starts_with("@lab: 1 key(s) not built on"));
-    }
-
-    #[test]
-    fn a_group_survives_bad_records_a_new_password_and_a_device_leaving() {
-        let d = dir("group-edges");
-        let (a, b) = (d.join("a"), d.join("b"));
-        let lab = |p: &Path| p.join("lab");
-        let sync = |from: &Path, to: &Path| {
-            fs::create_dir_all(versions(&lab(to))).unwrap();
-            for e in fs::read_dir(versions(&lab(from))).unwrap().flatten() {
-                let at = versions(&lab(to)).join(e.file_name());
-                if !at.exists() {
-                    fs::copy(e.path(), at).unwrap();
-                }
-            }
-        };
-        for (p, pw) in [(&a, b"a"), (&b, b"b")] {
-            Store::create(&p.join("own"), pw, None).unwrap();
-        }
-        let open = |p: &Path, pw: &[u8]| {
-            Store::open(&p.join("own"), pw, None)
-                .unwrap()
-                .links_in(vec![lab(p)])
-        };
-        let mut sa = Store::open(&a.join("own"), b"a", None).unwrap();
-        sa.link(Store::create_group(&lab(&a), "a").unwrap()).unwrap();
-        sa.put("@lab/x", b"1\n").unwrap();
-        let seed = sa.group("lab").unwrap().add_member("b").unwrap();
-        let mut sb = Store::open(&b.join("own"), b"b", None).unwrap();
-        // No pairing writes into a folder holding a store or a group.
-        assert!(sb.joinable(&b.join("own")).is_err());
-        sb.join_group(&lab(&b), &seed).unwrap();
-        assert!(sb.joinable(&lab(&b)).is_err());
-        assert!(
-            sb.join_group(&lab(&b), &seed).is_err(),
-            "no second join over it"
-        );
-        // A new password before its keys came: the group is kept.
-        sb.lock(b"b2", None).unwrap();
-        sync(&a, &b);
-        let sb = open(&b, b"b2");
-        assert_eq!(&sb.get("@lab/x").unwrap()[..], b"1\n");
-        sync(&b, &a);
-        // A record whose key does not parse stops no device.
-        let junk = b"junk\n-\n-\nxx";
-        let id = HEXLOWER.encode(&Sha256::digest(b"xx")[..8]);
-        sa.put(&format!("@lab/.pasa/members/{id}"), junk).ok();
-        sa.group("lab")
-            .unwrap()
-            .put(&format!("{}{id}", group::MEMBERS), junk)
-            .unwrap();
-        let mut sa = open(&a, b"a");
-        assert!(sa.unopened.is_empty(), "{:?}", sa.unopened);
-        assert_eq!(sa.group("lab").unwrap().members().unwrap().len(), 2);
-        // b leaves: a's next open seals a new key to a alone.
-        let mut sb = open(&b, b"b2");
-        sb.unlink("lab").unwrap();
-        assert!(!lab(&b).join("member").exists());
-        sync(&b, &a);
-        let mut sa = open(&a, b"a");
-        let g = sa.group("lab").unwrap();
-        assert_eq!(g.members().unwrap().len(), 1);
-        assert_eq!(g.sealed_to, [g.member_id().unwrap()]);
-        assert!(g.keys.len() > 1, "a new key since b left");
-    }
-
-    #[test]
     fn a_version_put_in_anothers_place_reads_as_nothing() {
         let s = Store::create(&dir("swap"), b"pw", None).unwrap();
         s.put("bank", b"b4nk\n").unwrap();
@@ -2323,6 +2136,266 @@ mod tests {
         );
         assert_eq!(s.recover(&left[0].file).unwrap(), "wifi");
         assert_eq!(&s.get("wifi").unwrap()[..], b"w\n");
+    }
+
+    /// Devices with stores of their own, a group folder each, and sync as a
+    /// union of `v/`.
+    struct Lab(PathBuf);
+
+    impl Lab {
+        fn new(t: &str, who: &[&str]) -> Lab {
+            let d = dir(t);
+            for w in who {
+                Store::create(&d.join(w).join("own"), w.as_bytes(), None)
+                    .unwrap();
+            }
+            Lab(d)
+        }
+        fn lab(&self, w: &str) -> PathBuf {
+            self.0.join(w).join("lab")
+        }
+        fn sync(&self, from: &str, to: &str) {
+            fs::create_dir_all(versions(&self.lab(to))).unwrap();
+            for e in fs::read_dir(versions(&self.lab(from))).unwrap().flatten()
+            {
+                let at = versions(&self.lab(to)).join(e.file_name());
+                if !at.exists() {
+                    fs::copy(e.path(), at).unwrap();
+                }
+            }
+        }
+        fn open(&self, w: &str) -> Store {
+            let own = self.0.join(w).join("own");
+            Store::open(&own, w.as_bytes(), None)
+                .unwrap()
+                .links_in(vec![self.lab(w)])
+        }
+        fn g<'a>(&self, s: &'a mut Store) -> &'a mut Store {
+            s.group("lab").unwrap()
+        }
+        /// `admin` pairs `w` in; `w` asks; `admin` admits it at its next open.
+        fn add(&self, admin: &str, w: &str) {
+            let mut sa = self.open(admin);
+            let root = self.g(&mut sa).invite().unwrap();
+            let got =
+                crate::sync::offer_group(&self.lab(admin), w, &root).unwrap();
+            let (root, psk) =
+                crate::sync::take_group(&self.lab(w), admin, &got).unwrap();
+            self.open(w).join_group(&self.lab(w), &root, &psk).unwrap();
+            self.sync(w, admin);
+            drop(self.open(admin)); // admits, seals
+            self.sync(admin, w);
+        }
+    }
+
+    #[test]
+    fn a_group_adds_and_removes_devices_by_signed_records() {
+        let l = Lab::new("group", &["alice", "bob", "carol"]);
+        let mut sa =
+            Store::open(&l.0.join("alice/own"), b"alice", None).unwrap();
+        sa.link(Store::create_group(&l.lab("alice"), "alice").unwrap())
+            .unwrap();
+        assert!(!l.lab("alice").join("key").exists(), "no group password");
+        sa.put("@lab/wifi", b"w1\n").unwrap();
+        l.add("alice", "bob");
+        let mut sb = l.open("bob");
+        let seed = l.g(&mut sb).member.clone().unwrap();
+        let has = |e: fs::DirEntry| {
+            fs::read(e.path()).unwrap().windows(32).any(|w| w == &seed[..])
+        };
+        assert!(
+            !versions(&l.lab("bob")).read_dir().unwrap().flatten().any(has),
+            "no seed in v/"
+        );
+        assert_eq!(&sb.get("@lab/wifi").unwrap()[..], b"w1\n");
+        assert!(!l.g(&mut sb).is_admin(), "a member, not an admin");
+        l.add("alice", "carol");
+        let mut sa = l.open("alice");
+        let names: Vec<String> = l
+            .g(&mut sa)
+            .members()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["alice", "bob", "carol"]);
+        // Bob, not an admin, adds nobody and removes nobody.
+        assert!(l.g(&mut sb).invite().is_err());
+        assert!(l.g(&mut sb).remove_member("carol").is_err());
+        // Alice removes bob: a new key for alice and carol alone.
+        let bob = l.g(&mut sb).member_id().unwrap();
+        sa.group_remove("lab", &bob).unwrap();
+        sa.put("@lab/wifi", b"w2\n").unwrap();
+        // Bob's own key from the old one, sealed to carol, his writes: none
+        // counts, whichever comes first (he is no admin).
+        let mut sb = l.open("bob");
+        l.g(&mut sb).rotate_members().ok();
+        sb.put("@lab/evil", b"x\n").ok();
+        l.sync("bob", "carol");
+        l.sync("alice", "carol");
+        l.sync("alice", "bob");
+        let sc = l.open("carol");
+        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"w2\n");
+        assert!(sc.get("@lab/evil").is_err());
+        let sb = l.open("bob");
+        assert_eq!(
+            &sb.get("@lab/wifi").unwrap()[..],
+            b"w1\n",
+            "the old one only"
+        );
+        assert!(
+            sb.unopened.iter().any(|u| u.contains("removed")),
+            "{:?}",
+            sb.unopened
+        );
+        // A removed device's request is never admitted again.
+        let mut sa = l.open("alice");
+        assert!(l.g(&mut sa).members().unwrap().iter().all(|m| m.id != bob));
+    }
+
+    #[test]
+    fn a_removed_admins_race_loses_to_the_admin_above() {
+        let l = Lab::new("race", &["alice", "bob", "carol"]);
+        let mut sa =
+            Store::open(&l.0.join("alice/own"), b"alice", None).unwrap();
+        sa.link(Store::create_group(&l.lab("alice"), "alice").unwrap())
+            .unwrap();
+        l.add("alice", "bob");
+        l.add("alice", "carol");
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.sync("alice", "bob");
+        l.sync("alice", "carol");
+        let mut sb = l.open("bob");
+        assert!(l.g(&mut sb).is_admin());
+        // Bob, about to go, makes a puppet admin and his own key; alice
+        // removes him at the same epoch.
+        let puppet = rand::<32>();
+        let pk = group::bundle_of(&puppet);
+        let g = l.g(&mut sb);
+        g.record(&pk, "carol-laptop", true, "").unwrap();
+        g.rotate_members().unwrap();
+        sb.put("@lab/wifi", b"bob's\n").unwrap();
+        let mut sa = l.open("alice");
+        let bob = l.g(&mut sb).member_id().unwrap();
+        sa.group_remove("lab", &bob).unwrap();
+        sa.put("@lab/wifi", b"alice's\n").unwrap();
+        // Carol hears bob first: she follows his key for now (the race).
+        l.sync("bob", "carol");
+        assert_eq!(&l.open("carol").get("@lab/wifi").unwrap()[..], b"bob's\n");
+        // Then alice's: alice outranks bob; his key and his puppet go.
+        l.sync("alice", "carol");
+        let mut sc = l.open("carol");
+        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"alice's\n");
+        let names: Vec<String> = l
+            .g(&mut sc)
+            .members()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["alice", "carol"]);
+        assert!(
+            sc.unopened.iter().any(|u| u.contains("beside the one taken")),
+            "{:?}",
+            sc.unopened
+        );
+    }
+
+    #[test]
+    fn two_admins_at_once_merge_to_the_higher_and_a_stranger_is_not_admitted() {
+        let l = Lab::new("admins", &["alice", "bob", "carol"]);
+        let mut sa =
+            Store::open(&l.0.join("alice/own"), b"alice", None).unwrap();
+        sa.link(Store::create_group(&l.lab("alice"), "alice").unwrap())
+            .unwrap();
+        l.add("alice", "bob");
+        l.add("alice", "carol");
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.sync("alice", "bob");
+        l.sync("alice", "carol");
+        // Both admins make a key at the same epoch: everyone takes alice's.
+        let (mut sa, mut sb) = (l.open("alice"), l.open("bob"));
+        l.g(&mut sb).rotate_members().unwrap();
+        sb.put("@lab/b", b"b\n").unwrap();
+        l.g(&mut sa).rotate_members().unwrap();
+        sa.put("@lab/a", b"a\n").unwrap();
+        for (f, t) in [
+            ("alice", "carol"),
+            ("bob", "carol"),
+            ("alice", "bob"),
+            ("bob", "alice"),
+        ] {
+            l.sync(f, t);
+        }
+        for w in ["alice", "bob", "carol"] {
+            let s = l.open(w);
+            assert_eq!(&s.get("@lab/a").unwrap()[..], b"a\n", "{w}");
+            assert!(s.get("@lab/b").is_err(), "{w}");
+        }
+        assert!(
+            l.open("carol")
+                .unopened
+                .iter()
+                .any(|u| u.contains("beside the one taken"))
+        );
+        // A request sealed with a secret no pairing made: never admitted.
+        let ask = group::request(&rand::<32>(), &rand::<32>(), "x").unwrap();
+        fs::write(versions(&l.lab("alice")).join(name_of(&ask)), &ask).unwrap();
+        let mut sa = l.open("alice");
+        assert_eq!(l.g(&mut sa).members().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_group_survives_bad_records_a_new_password_and_a_device_leaving() {
+        let l = Lab::new("group-edges", &["alice", "bob"]);
+        let mut sa =
+            Store::open(&l.0.join("alice/own"), b"alice", None).unwrap();
+        sa.link(Store::create_group(&l.lab("alice"), "alice").unwrap())
+            .unwrap();
+        sa.put("@lab/x", b"1\n").unwrap();
+        let mut sb = Store::open(&l.0.join("bob/own"), b"bob", None).unwrap();
+        // No pairing writes into a folder holding a store or a group.
+        assert!(sb.joinable(&l.0.join("bob/own")).is_err());
+        let root = l.open("alice").group("lab").unwrap().invite().unwrap();
+        let got =
+            crate::sync::offer_group(&l.lab("alice"), "bob", &root).unwrap();
+        let (root, psk) =
+            crate::sync::take_group(&l.lab("bob"), "alice", &got).unwrap();
+        sb.join_group(&l.lab("bob"), &root, &psk).unwrap();
+        assert!(sb.joinable(&l.lab("bob")).is_err());
+        assert!(
+            sb.join_group(&l.lab("bob"), &root, &psk).is_err(),
+            "no second join"
+        );
+        // A new password before its keys came: the group is kept.
+        sb.lock(b"b2", None).unwrap();
+        l.sync("bob", "alice");
+        drop(l.open("alice"));
+        l.sync("alice", "bob");
+        let own = l.0.join("bob/own");
+        let sb = Store::open(&own, b"b2", None)
+            .unwrap()
+            .links_in(vec![l.lab("bob")]);
+        assert_eq!(&sb.get("@lab/x").unwrap()[..], b"1\n");
+        // Records not signed by an admin count for nothing.
+        let mut sa = l.open("alice");
+        let g = l.g(&mut sa);
+        g.put(&format!("{}{}", group::MEMBERS, "00"), b"junk").unwrap();
+        g.put(&format!("{}{}", group::REMOVED, "00"), b"junk").unwrap();
+        assert_eq!(g.members().unwrap().len(), 2);
+        // Bob leaves: alice's next open seals a new key to alice alone.
+        let mut sb = Store::open(&own, b"b2", None)
+            .unwrap()
+            .links_in(vec![l.lab("bob")]);
+        sb.unlink("lab").unwrap();
+        assert!(!l.lab("bob").join("member").exists());
+        l.sync("bob", "alice");
+        let mut sa = l.open("alice");
+        let g = l.g(&mut sa);
+        assert_eq!(g.members().unwrap().len(), 1);
+        assert_eq!(g.sealed_to, [g.member_id().unwrap()]);
     }
 
     #[test]

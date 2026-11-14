@@ -872,8 +872,8 @@ pub extern "system" fn Java_com_apasa_Native_groupAdd<'l>(
                 .get_mut(&h)
                 .context("locked")?
                 .group(&label.to_string())?;
-            let seed = g.add_member(&device)?;
-            sync::offer_group(&g.dir, &device, &seed)?
+            let root = g.invite()?;
+            sync::offer_group(&g.dir, &device, &root)?
         };
         let code = match pw {
             Some(pw) => RT.block_on(sync::qr(&got, &pw))?,
@@ -915,8 +915,8 @@ pub extern "system" fn Java_com_apasa_Native_groupJoin<'l>(
             let mut stores = stores();
             let s = stores.get_mut(&h).context("locked")?;
             let dir = groups_at(&s.dir).join(&name);
-            let seed = sync::take_group(&dir, &peer, &got)?;
-            s.join_group(&dir, &seed)?;
+            let (root, psk) = sync::take_group(&dir, &peer, &got)?;
+            s.join_group(&dir, &root, &psk)?;
             dir
         };
         let said = report(RT.block_on(sync::sync(&dir, false))?);

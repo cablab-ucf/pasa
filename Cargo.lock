@@ -3490,6 +3490,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ml-dsa"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f6d49c3f3f0e10e18ca975ffda66f8da0ec36521c1d911adcbc521bf0743f5c"
+dependencies = [
+ "const-oid",
+ "crypto-common 0.2.2",
+ "ctutils",
+ "hybrid-array",
+ "module-lattice",
+ "pkcs8",
+ "shake",
+ "signature",
+]
+
+[[package]]
 name = "ml-kem"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4620,6 +4636,7 @@ dependencies = [
  "authenticator",
  "crossterm",
  "data-encoding",
+ "ed25519-dalek",
  "eframe",
  "getrandom 0.4.3",
  "hpke",
@@ -4629,6 +4646,7 @@ dependencies = [
  "iroh",
  "landlock",
  "libc",
+ "ml-dsa",
  "nokhwa",
  "openssl",
  "pairir",
@@ -5848,6 +5866,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 dependencies = [
+ "digest 0.11.3",
  "rand_core 0.10.1",
 ]
 

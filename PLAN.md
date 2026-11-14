@@ -11,7 +11,7 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
    the window's and phone's New group, Join a group, Add a device, refuse
    or are hidden. Linked stores with a password, and everything a group
    already holds, keep working.
-2. **App updates on the phone** (done, CI-built; to try on a phone): on start, at most daily, the newest
+2. **App updates on the phone** (done; to build in CI and try on a phone): on start, at most daily, the newest
    release's `apasa-vX.apk` (GitHub releases), its `.sha256` checked,
    installed by Android's package installer, which takes an update only
    signed by the installed app's key. Settings: Updates, on by default,
@@ -43,6 +43,9 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
    - **Forks**: two valid admins at once merge to what neither removed. A
      removed admin's race is bounded to the time before a member hears of
      the removal; a removed non-admin has nothing to race with.
+   - Built (tests: signed add/remove, a removed member's key and writes
+     ignored, a removed admin's race and puppet voided, two admins at once,
+     forged records, a stranger's request, a new password, leaving).
    - Then: an adversarial review again (fork races, puppet records,
      replayed envelopes, epochs, joins), a test for each, then `ON = true`.
 4. **Two removals at once**: said today; with admins, resolved by one

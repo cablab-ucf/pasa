@@ -68,6 +68,8 @@ pasa group add LABEL NAME [--qr]   a code for device NAME to join @LABEL
 pasa group join DIR NAME CODE|--scan   join the group NAME's code is for, into DIR
 pasa group ls LABEL | rm LABEL MEMBER   its members; one removed: a new key, the
                              rest's alone (nobody pairs again)
+pasa group admin LABEL MEMBER   MEMBER may add and remove devices too (admins
+                             rank by age: an older one's change wins)
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
@@ -1302,9 +1304,9 @@ async fn sync(a: &[&str]) -> Result<()> {
         ["group", "add", l, name, ..] => {
             let mut s = open()?;
             let g = s.group(l)?;
-            let seed = g.add_member(name)?;
+            let root = g.invite()?;
             let (d, got) =
-                (g.dir.clone(), sync::offer_group(&g.dir, name, &seed)?);
+                (g.dir.clone(), sync::offer_group(&g.dir, name, &root)?);
             drop(s);
             hand(
                 &d,
@@ -1319,11 +1321,15 @@ async fn sync(a: &[&str]) -> Result<()> {
             let (mut s, d) = (open()?, pasa::path(d));
             s.joinable(&d)?;
             let got = fetched(code, true).await?;
-            let seed = sync::take_group(&d, name, &got)?;
-            s.join_group(&d, &seed)?;
+            let (root, psk) = sync::take_group(&d, name, &got)?;
+            s.join_group(&d, &root, &psk)?;
             pasa::remember(&d)?;
             net_run_in(&d, &["sync"])?;
-            eprintln!("@{}: joined; it opens with your store", s.label_of(&d));
+            eprintln!(
+                "@{}: asked; it opens with your store once the admin that \
+                 paired this device has opened theirs and synced",
+                s.label_of(&d)
+            );
         }
         ["group", "ls", l] => {
             let mut s = open()?;
@@ -1335,8 +1341,20 @@ async fn sync(a: &[&str]) -> Result<()> {
                 } else {
                     ""
                 };
-                println!("{}  {}{here}", m.id, m.name);
+                let admin = if m.admin { "  admin" } else { "" };
+                println!("{}  {}{admin}{here}", m.id, m.name);
             }
+        }
+        ["group", "admin", l, who] => {
+            let mut s = open()?;
+            let g = s.group(l)?;
+            g.promote(who)?;
+            let d = g.dir.clone();
+            record_in(&d);
+            if sync::on(&d) {
+                net_run_in(&d, &["sync", "--news"])?;
+            }
+            eprintln!("{who}: an admin of @{l}");
         }
         ["group", "rm", l, who] => {
             let mut s = open()?;

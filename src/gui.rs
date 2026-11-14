@@ -804,9 +804,9 @@ impl App {
                     }
                 };
                 self.v.as_ref().context("locked")?.s.joinable(&d)?;
-                let seed = sync::take_group(&d, &peer, &got)?;
+                let (root, psk) = sync::take_group(&d, &peer, &got)?;
                 let v = self.v.as_mut().context("locked")?;
-                v.s.join_group(&d, &seed)?;
+                v.s.join_group(&d, &root, &psk)?;
                 pasa::remember(&d)?;
                 v.note = format!(
                     "Joined: it opens with this store once it has synced with {peer}"
@@ -2517,9 +2517,9 @@ impl App {
         qr: bool,
     ) -> Result<()> {
         let g = v.s.group(label)?;
-        let seed = g.add_member(name)?;
+        let root = g.invite()?;
         let (dir, got) =
-            (g.dir.clone(), sync::offer_group(&g.dir, name, &seed)?);
+            (g.dir.clone(), sync::offer_group(&g.dir, name, &root)?);
         let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));
         let (code, img, end, state) = Default::default();
         let (name, got) = (name.to_string(), Some(got));

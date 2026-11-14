@@ -469,10 +469,12 @@ const GROUP: &[u8] = b"pasagrup";
 
 /// Hands device `name` a member key of the group store in `dir`, which
 /// it opens with its own store: no key file goes, and none exists.
+/// Pairs device `name` into the group store in `dir`, of root `root`: no
+/// key goes; it sends its own back, sealed to the pairing's secret.
 pub fn offer_group(
     dir: &Path,
     name: &str,
-    seed: &[u8],
+    root: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let psk = rand::<32>();
     let id = key(dir, "node")?.public();
@@ -485,17 +487,27 @@ pub fn offer_group(
     };
     add(dir, peer)?;
     set_on(dir, true)?;
-    Ok(Zeroizing::new([id.as_bytes(), &psk[..], GROUP, seed].concat()))
+    Ok(Zeroizing::new(
+        [id.as_bytes(), &psk[..], GROUP, root.as_bytes()].concat(),
+    ))
 }
 
-/// [`offer_group`]'s other end: the member key, for the caller to seal.
-pub fn take_group(dir: &Path, name: &str, got: &[u8]) -> Result<Secret> {
+/// [`offer_group`]'s other end: the group's root and the pairing's secret.
+pub fn take_group(
+    dir: &Path,
+    name: &str,
+    got: &[u8],
+) -> Result<(String, Secret)> {
     named(name)?;
     let bad = || anyhow!("not a group's pairing");
     let (id, rest) = got.split_at_checked(32).ok_or_else(bad)?;
     let (psk, rest) = rest.split_at_checked(32).ok_or_else(bad)?;
-    let seed =
+    let root =
         rest.strip_prefix(GROUP).filter(|s| s.len() == 32).ok_or_else(bad)?;
+    let root = String::from_utf8(root.to_vec())
+        .ok()
+        .filter(|r| r.bytes().all(|b| b.is_ascii_hexdigit()));
+    let root = root.ok_or_else(bad)?;
     let id = Some(PublicKey::from_bytes(id.try_into()?)?);
     let peer = Peer {
         name: name.into(),
@@ -506,7 +518,7 @@ pub fn take_group(dir: &Path, name: &str, got: &[u8]) -> Result<Secret> {
     };
     add(dir, peer)?;
     set_on(dir, true)?;
-    Ok(Zeroizing::new(seed.to_vec()))
+    Ok((root, Zeroizing::new(psk.to_vec())))
 }
 
 /// pairir's app: a group's codes apart, so that nothing takes one for a
