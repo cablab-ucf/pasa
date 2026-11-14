@@ -5011,7 +5011,7 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 [[package]]
 name = "pushir"
 version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/pushir?rev=aff2028d1a0b28aca25f73119b1443514b039796#aff2028d1a0b28aca25f73119b1443514b039796"
+source = "git+https://github.com/cablab-ucf/pushir?rev=5c1681ba1440387039e07cf8c1d0450b32897701#5c1681ba1440387039e07cf8c1d0450b32897701"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
