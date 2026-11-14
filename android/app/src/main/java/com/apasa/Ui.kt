@@ -105,6 +105,11 @@ data class Health(
     val expired: List<String> = listOf(), val exposed: List<String> = listOf(),
 )
 
+data class Member(val id: String, val name: String, val me: Boolean)
+
+/** Linked group stores by label, with their members; notes on any that did not open. */
+data class Groups(val groups: Map<String, List<Member>> = mapOf(), val notes: List<String> = listOf())
+
 /** Quick: a tap (and PIN) opens the store beside the password; Both: a second factor with it. */
 enum class Key { None, Quick, Both }
 
@@ -202,6 +207,16 @@ interface Host {
     suspend fun revoke(name: String)
     /** With [qrPw], an offline QR code's text under it; else a short code. */
     suspend fun pair(name: String, qrPw: String?): String
+    suspend fun groups(): Groups
+    /** A group store [name], this device in it as [me]: its label. */
+    suspend fun groupNew(name: String, me: String): String
+    /** A code (or with [qrPw] a QR code's text) for [device] to join group [label]. */
+    suspend fun groupAdd(label: String, device: String, qrPw: String?): String
+    /** Joins, as group store [name], the group whose code [peer] shows. */
+    suspend fun groupJoin(name: String, peer: String, code: String, pw: String): String
+    /** Removes member [id] from group [label]: a new key for the rest. */
+    suspend fun groupRemove(label: String, id: String)
+    suspend fun unlink(label: String)
     /** Bumped as syncs bring versions. */
     val news: Int
 }
@@ -1207,6 +1222,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             TextButton({ go { host.forget(p); "$p: forgotten" } }) { Text("Forget") }
             TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again. What it knew it still knows: Health lists the passwords to change at their services." } }) { Text("Revoke") }
         }
+        GroupStores(host, tick, go) { who, code -> pairing = who to code }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("ADD A DEVICE")
         Field(name, { name = it }, "A name for it")
@@ -1238,6 +1254,62 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             }
         }
     }
+}
+
+/** Linked group stores: their members, one added or removed; a group made or joined. */
+@Composable
+private fun GroupStores(host: Host, tick: Int, go: (suspend () -> String) -> Unit, show: (String, String) -> Unit) {
+    val groups by produceState(Groups(), tick) { value = host.groups() }
+    var adding by remember { mutableStateOf<String?>(null) }
+    var device by remember { mutableStateOf("") }
+    var made by remember { mutableStateOf("") }
+    var me by remember { mutableStateOf("") }
+    var joined by remember { mutableStateOf("") }
+    var peer by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var pw by remember { mutableStateOf("") }
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+    Label("GROUP STORES")
+    Text(
+        "A group's passwords, kept with others in a store of its own, open with yours: @NAME/\u2026, each written to its own store. Each device holds a key of its own: one removed gets nothing written since, and nobody pairs again.",
+        style = MaterialTheme.typography.bodySmall, color = muted,
+    )
+    for (n in groups.notes) Text(n, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    for ((label, members) in groups.groups) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("@$label", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            TextButton({ go { host.unlink(label); "@$label: unlinked; it opens with yours no more" } }) { Text("Unlink") }
+        }
+        for (m in members) Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(m.name + if (m.me) "  (this device)" else "", Modifier.weight(1f).padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
+            if (!m.me) TextButton({
+                go { host.groupRemove(label, m.id); "${m.name}: removed from @$label; a new key for the rest. What it read it keeps: Health lists those passwords." }
+            }) { Text("Remove") }
+        }
+        if (members.isNotEmpty()) TextButton({ adding = label; device = "" }) { Text("Add a device to @$label") }
+    }
+    adding?.let { label ->
+        Field(device, { device = it }, "A name for the device joining @$label")
+        OutlinedButton({
+            val n = device.trim()
+            go { show(n, host.groupAdd(label, n, null)); adding = null; "" }
+        }, enabled = device.isNotBlank()) { Text("Show a code to type") }
+    }
+    Label("NEW GROUP")
+    Field(made, { made = it }, "Its name")
+    Field(me, { me = it }, "This device's name in it")
+    OutlinedButton({
+        go { val l = host.groupNew(made.trim(), me.trim()); made = ""; "@$l: made; add its devices here" }
+    }, enabled = made.isNotBlank() && me.isNotBlank()) { Text("Make it") }
+    Label("JOIN A GROUP")
+    Field(joined, { joined = it }, "Its name here")
+    Field(peer, { peer = it }, "The name of the device showing the code")
+    Field(code, { code = it }, "Code")
+    OutlinedButton({ host.scan { code = it } }) { Text("Scan a QR code") }
+    if (code.trim().startsWith("PAIRIR1:")) Field(pw, { pw = it }, "The QR code's password")
+    OutlinedButton({
+        go { val said = host.groupJoin(joined.trim(), peer.trim(), code.trim(), pw); code = ""; pw = ""; said.ifEmpty { "Joined" } }
+    }, enabled = joined.isNotBlank() && peer.isNotBlank() && code.isNotBlank()) { Text("Join") }
 }
 
 @Composable

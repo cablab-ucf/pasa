@@ -35,7 +35,14 @@ private suspend fun <T> io(f: () -> T): T = withContext(Dispatchers.IO) { f() }
 private fun lines(s: String) = s.lines().filter { it.isNotEmpty() }
 
 class MainActivity : ComponentActivity(), Host {
-    private var handle by mutableStateOf(0L)
+    private var opened by mutableStateOf(0L)
+    /** The open store; opened, its linked group stores are served and watched too. */
+    private var handle: Long
+        get() = opened
+        set(h) {
+            opened = h
+            if (h != 0L && sync) main.post { here(true) }
+        }
     private var stored by mutableStateOf(false)
     private val nav = Nav()
     private val dir get() = store(this).path
@@ -99,15 +106,17 @@ class MainActivity : ComponentActivity(), Host {
     }
 
     override var news by mutableStateOf(0)
-    private var watch: android.os.FileObserver? = null
+    private var watch: List<android.os.FileObserver> = listOf()
 
     @Suppress("DEPRECATION") // FileObserver(File) is API 29; this app runs from 26.
     private fun here(on: Boolean) {
         Native.serve(dir, on)
-        watch?.stopWatching()
-        watch = if (!on) null else object : android.os.FileObserver(File(dir, "store/v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
-            override fun onEvent(event: Int, path: String?) { main.post { news++ } }
-        }.apply { startWatching() }
+        watch.forEach { it.stopWatching() }
+        watch = if (!on) listOf() else lines(Native.dirs(dir)).map { d ->
+            object : android.os.FileObserver(File(d, "store/v").apply { mkdirs() }.path, android.os.FileObserver.MOVED_TO) {
+                override fun onEvent(event: Int, path: String?) { main.post { news++ } }
+            }.apply { startWatching() }
+        }
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -365,4 +374,31 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
     override suspend fun revoke(name: String) = changed { Native.revoke(handle, name) }
     override suspend fun pair(name: String, qrPw: String?) = io { Native.pair(handle, name, qrPw) }
+
+    override suspend fun groups() = io {
+        val rows = lines(Native.groups(handle)).map { it.split('\t') }
+        Groups(
+            rows.filter { it[0] == "g" }.associate { g ->
+                g[1] to rows.filter { it[0] == "m" && it[1] == g[1] }.map { Member(it[2], it[3], it[4] == "1") }
+            },
+            rows.filter { it[0] == "!" }.map { it[1] },
+        )
+    }
+    /** A group's change: synced, and its folder served and watched. */
+    private suspend fun grouped(f: () -> String): String {
+        val said = io { f() }
+        if (sync) { io { runCatching { Native.sync(dir, true) } }; main.post { here(true) } }
+        return said
+    }
+    override suspend fun groupNew(name: String, me: String) = grouped { Native.groupNew(handle, name, me) }
+    override suspend fun groupAdd(label: String, device: String, qrPw: String?): String {
+        sync = true
+        return grouped { Native.groupAdd(handle, label, device, qrPw) }
+    }
+    override suspend fun groupJoin(name: String, peer: String, code: String, pw: String): String {
+        sync = true
+        return grouped { Native.groupJoin(handle, name, peer, code, pw) }
+    }
+    override suspend fun groupRemove(label: String, id: String) { grouped { Native.groupRemove(handle, label, id); "" } }
+    override suspend fun unlink(label: String) { grouped { Native.unlink(handle, label); "" } }
 }
