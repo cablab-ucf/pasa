@@ -78,6 +78,32 @@ class MainActivity : ComponentActivity(), Host {
     override fun onResume() {
         super.onResume()
         nfcIsOff = nfcOff(this)
+        updates()
+    }
+
+    /** An update downloaded and checked, waiting to install. */
+    private val ready get() = File(cacheDir, "update").listFiles { f -> f.name.endsWith(".apk") }?.firstOrNull()
+    override val mayInstall get() = packageManager.canRequestPackageInstalls()
+    override fun allowInstalls() {
+        runCatching { startActivity(Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))) }
+    }
+
+    /** Daily, the newest release fetched and checked. Installed when the
+     *  app leaves the screen (Android 12 on, no prompt), or asked for here. */
+    private fun updates() {
+        if (setting("updates") == 0) return
+        ready?.let { if (android.os.Build.VERSION.SDK_INT < 31 && mayInstall) Update.install(this, it); return }
+        val prefs = getSharedPreferences("pasa", 0)
+        val day = 24 * 3600 * 1000L
+        if (System.currentTimeMillis() - prefs.getLong("checked", 0) < day) return
+        prefs.edit().putLong("checked", System.currentTimeMillis()).apply()
+        val ours = version
+        Thread {
+            runCatching {
+                val v = Update.latest() ?: return@runCatching
+                if (Update.newer(ours, v)) Update.fetch(File(cacheDir, "update"), v)
+            }
+        }.start()
     }
 
     override fun nfcSettings() {
@@ -86,6 +112,8 @@ class MainActivity : ComponentActivity(), Host {
 
     override fun onStop() {
         super.onStop()
+        // Off the screen: an update replaces the app now, mid-use never.
+        if (setting("updates") != 0 && android.os.Build.VERSION.SDK_INT >= 31 && mayInstall) ready?.let { Update.install(this, it) }
         here(false)
         keySecret?.fill(0)
         keySecret = null
@@ -127,7 +155,7 @@ class MainActivity : ComponentActivity(), Host {
     private val locker = Runnable { lock() }
 
     private val settings = mutableStateMapOf<String, Int>()
-    private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0)
+    private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0, "updates" to 1)
     override fun setting(name: String) = settings.getOrPut(name) { getSharedPreferences("pasa", 0).getInt(name, usual[name] ?: 0) }
     override fun set(name: String, value: Int) {
         settings[name] = value

@@ -155,6 +155,9 @@ interface Host {
     /** null: off; else whether a PIN goes with the tap. */
     val quick: Boolean?
     val nfcOff: Boolean
+    /** Whether the app may install its own updates (Android asks once). */
+    val mayInstall: Boolean
+    fun allowInstalls()
     val fidoKeys: Int
     val fidoPin: Boolean
     suspend fun fidoAdd(pin: String)
@@ -1347,6 +1350,11 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     pick("clip", "Clipboard", "Copied secrets are marked sensitive and leave the clipboard after this long.", listOf(15 to "15 s", 30 to "30 s", 45 to "45 s", 90 to "90 s"))
     pick("lock", "Locking", "The store locks when the app has been off the screen this long.", listOf(0 to "At once", 60 to "1 min", 300 to "5 min"))
     pick("theme", "Looks", "Dark or light.", listOf(0 to "As the phone", 1 to "Dark", 2 to "Light"))
+    pick("updates", "Updates", "Daily, the newest release is asked of GitHub (your address and the time, nothing of the store), checked, and installed when the app is off the screen. Android installs it only if signed as this app is.", listOf(1 to "On", 0 to "Off"))
+    if (host.setting("updates") != 0 && !host.mayInstall) {
+        Text("Android asks once before an app installs its own updates.", style = MaterialTheme.typography.bodySmall, color = muted)
+        OutlinedButton({ host.allowInstalls() }) { Text("Allow updates to install") }
+    }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     var keyPin by remember { mutableStateOf("") }
     val keys = rememberJob()

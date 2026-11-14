@@ -7,11 +7,11 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
 
 ## Now
 
-1. **Per-device groups off** (`group::ON = false`): `pasa group`, and
+1. **Per-device groups off** (done) (`group::ON = false`): `pasa group`, and
    the window's and phone's New group, Join a group, Add a device, refuse
    or are hidden. Linked stores with a password, and everything a group
    already holds, keep working.
-2. **App updates on the phone**: on start, at most daily, the newest
+2. **App updates on the phone** (done, CI-built; to try on a phone): on start, at most daily, the newest
    release's `apasa-vX.apk` (GitHub releases), its `.sha256` checked,
    installed by Android's package installer, which takes an update only
    signed by the installed app's key. Settings: Updates, on by default,

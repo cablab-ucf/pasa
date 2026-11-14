@@ -6,6 +6,11 @@ same Rust (`apasa-jni`).
 
 - Several stores side by side, one per person or purpose: Store, on the
   lock screen.
+- Updates: daily, the newest release's APK is fetched from GitHub,
+  checked against its `.sha256`, and installed by the package installer
+  when the app is off the screen (Android 12 on; before, asked at the next
+  open). Android takes it only signed by this app's key. Settings, Updates:
+  off stops the asking.
 - Group stores open with the store, one unlock: @NAME/... beside its
   entries. Devices, Group stores: make one, join one (a code or a QR
   code), add a device, remove one (a new key for the rest). They sit in
