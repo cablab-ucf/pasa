@@ -428,6 +428,8 @@ struct App {
     /// A store to link: its folder and password.
     link_dir: String,
     link_pw: Zeroizing<String>,
+    /// Locked: egui's memory (text fields' undo history) goes next frame.
+    forget: bool,
     /// Stores served from here: this one and its linked ones.
     serving: std::collections::HashSet<PathBuf>,
     rt: Option<tokio::runtime::Runtime>,
@@ -624,14 +626,18 @@ impl eframe::App for App {
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Q)) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
-            self.used = Some(SystemTime::now());
-        }
         let idle = Duration::from_secs(self.prefs.lock * 60);
-        // A clock set back counts as idle too.
+        // A clock set back counts as idle too. Before this frame's input,
+        // so a key pressed on waking does not undo the time asleep.
         let left = |t: SystemTime| t.elapsed().map_or(true, |e| e > idle);
         if self.v.is_some() && self.used.is_some_and(left) {
             self.lock();
+        }
+        if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
+            self.used = Some(SystemTime::now());
+        }
+        if std::mem::take(&mut self.forget) {
+            ui.ctx().data_mut(|d| d.clear());
         }
         ui.ctx().request_repaint_after(idle);
         self.serve(&ui.ctx().clone(), self.dirs());
@@ -642,6 +648,11 @@ impl eframe::App for App {
                 .err()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_default();
+            // Opened: what was typed to open it goes from egui's memory too
+            // (a text field keeps its undo history there, a password's too).
+            if !was.0 && self.v.is_some() {
+                ui.ctx().data_mut(|d| d.clear());
+            }
             // Joined or opened: sync. Joined, the store precedes its password.
             if was != (self.v.is_some(), self.joined) {
                 self.sync_now(ui.ctx(), false, self.dirs());
@@ -678,6 +689,7 @@ impl App {
             serving: self.serving.clone(),
             peer: "home".into(),
             quick: true,
+            forget: true,
             ..App::default()
         };
     }
@@ -2754,5 +2766,43 @@ impl App {
             home().display()
         );
         ui.label(RichText::new(about).small().color(l.muted));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{Context, Event, RawInput, TextEdit};
+
+    /// One frame of a password field, with `events`; its text after.
+    fn frame(ctx: &Context, text: &mut String, events: Vec<Event>) {
+        // A second a frame: egui keeps an undo point once text is still.
+        let time = Some(ctx.input(|i| i.time) + 1.0);
+        let input =
+            RawInput { events, focused: true, time, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            let r =
+                ui.add(TextEdit::singleline(text).password(true).id_salt("pw"));
+            r.request_focus();
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_lock_leaves_no_text_field_state_behind() {
+        use eframe::egui::text_edit::TextEditState;
+        let ctx = Context::default();
+        let mut pw = String::new();
+        frame(&ctx, &mut pw, vec![]);
+        frame(&ctx, &mut pw, vec![Event::Text("hunter2".into())]);
+        frame(&ctx, &mut pw, vec![]);
+        assert_eq!(pw, "hunter2");
+        // A text field's state (its undo history, a password's too).
+        assert!(ctx.data_mut(|d| d.count::<TextEditState>()) > 0);
+        // What lock, and an unlock, do.
+        ctx.data_mut(|d| d.clear());
+        assert_eq!(ctx.data_mut(|d| d.count::<TextEditState>()), 0);
+        pw.clear();
+        frame(&ctx, &mut pw, vec![]);
+        assert_eq!(pw, "");
     }
 }

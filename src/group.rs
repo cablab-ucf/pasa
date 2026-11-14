@@ -202,6 +202,10 @@ impl Store {
         let mut other = vec![];
         for e in fs::read_dir(crate::versions(dir))?.flatten() {
             let Ok(b) = fs::read(e.path()) else { continue };
+            // Its own name, as every version: none in another's place.
+            if e.file_name().to_str() != Some(&name_of(&b)) {
+                continue;
+            }
             let mine = |me| is_envelope(&b).then(|| open(me, &b)).flatten();
             let Some(f) = me.iter().find_map(mine) else { continue };
             match known.is_none_or(|k| f.0.iter().any(|m| m[..] == *k)) {

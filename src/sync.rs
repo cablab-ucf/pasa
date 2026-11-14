@@ -209,7 +209,9 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     let give = async {
         for n in mine.difference(&other) {
             let b = fs::read(v.join(n))?;
-            if name_of(&b) == *n {
+            // One too large for a frame (an older pasa's) is kept back,
+            // not fatal: the rest goes.
+            if name_of(&b) == *n && b.len() <= MAX {
                 tx.send(&b).await?;
             }
         }

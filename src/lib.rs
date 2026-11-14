@@ -865,8 +865,17 @@ impl Store {
         self.index().is_ok_and(|x| x.tips.contains_key(&at))
     }
 
-    fn version(&self, file: &str) -> Result<impl Read + use<'_>> {
-        reader(&self.ids, fs::File::open(self.v.join(file))?)
+    /// A version file's bytes, read once and checked against its name: a
+    /// file put in another's place opens as nothing.
+    fn bytes(&self, file: &str) -> Result<Vec<u8>> {
+        let f = fs::File::open(self.v.join(file))?;
+        let mut b = vec![];
+        f.take(MAX as u64 + 1).read_to_end(&mut b)?;
+        ensure!(
+            b.len() <= MAX && name_of(&b) == file,
+            "{file}: not the version named so"
+        );
+        Ok(b)
     }
 
     /// A version's head, and its file's SHA-256 if an older key opened it.
@@ -877,11 +886,10 @@ impl Store {
             Version::parse(l.strip_suffix('\n')?, file)
         };
         let (now, older) = self.ids.split_at(self.current.min(self.ids.len()));
-        let f = fs::File::open(self.v.join(file)).ok()?;
-        if let Ok(r) = reader(now, f) {
+        let b = self.bytes(file).ok()?;
+        if let Ok(r) = reader(now, &b[..]) {
             return Some((line(Box::new(r) as Box<dyn Read>)?, None));
         }
-        let b = fs::read(self.v.join(file)).ok()?;
         let r = reader(older, &b[..]).ok()?;
         Some((line(Box::new(r))?, Some(Sha256::digest(&b).into())))
     }
@@ -962,11 +970,27 @@ impl Store {
             return s.body(v);
         }
         let mut b = Zeroizing::new(vec![]);
-        self.version(&v.file)?
+        let ct = self.bytes(&v.file)?;
+        reader(&self.ids, &ct[..])?
             .read_to_end(&mut b)
             .context("damaged version")?;
         let at =
             b.iter().position(|&c| c == b'\n').context("damaged version")? + 1;
+        // The version it says it is: the one asked for (a linked store's
+        // name shown here under its label).
+        let head = std::str::from_utf8(&b[..at - 1]).ok();
+        let said = head.and_then(|l| Version::parse(l, &v.file));
+        let named = |n: &str| {
+            n == v.name
+                || v.name.ends_with(&format!("/{n}")) && v.name.starts_with('@')
+        };
+        let same = said.is_some_and(|s| {
+            s.ms == v.ms
+                && s.size == v.size
+                && s.parent == v.parent
+                && named(&s.name)
+        });
+        ensure!(same, "{}: not the version it was read as", v.file);
         // `size` comes from another device: no sum that can overflow.
         let body = b.get(at..).and_then(|b| b.get(..v.size));
         Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
@@ -1267,6 +1291,8 @@ impl Store {
         let n = padded(pt.len());
         pt.resize(n, 0);
         let ct = encrypt(&self.newest, &pt)?;
+        // As sync takes it: a larger file would fail every sync.
+        ensure!(ct.len() <= MAX, "over {MAX} bytes sealed");
         v.file = name_of(&ct);
         write(&self.v.join(&v.file), &ct)?;
         x.mtime = fs::metadata(&self.v).and_then(|m| m.modified()).ok();
@@ -2178,6 +2204,22 @@ mod tests {
         assert_eq!(g.members().unwrap().len(), 1);
         assert_eq!(g.sealed_to, [g.member_id().unwrap()]);
         assert!(g.keys.len() > 1, "a new key since b left");
+    }
+
+    #[test]
+    fn a_version_put_in_anothers_place_reads_as_nothing() {
+        let s = Store::create(&dir("swap"), b"pw", None).unwrap();
+        s.put("bank", b"b4nk\n").unwrap();
+        s.put("mail", b"m41l\n").unwrap();
+        let e = s.entries().unwrap();
+        assert_eq!(&s.get("bank").unwrap()[..], b"b4nk\n");
+        // Cached, then mail's ciphertext where bank's was.
+        let at = |n: &str| versions(&s.dir).join(&e[n].file);
+        fs::copy(at("mail"), at("bank")).unwrap();
+        assert!(s.get("bank").is_err(), "not mail's password as bank's");
+        assert_eq!(&s.get("mail").unwrap()[..], b"m41l\n");
+        // A file at the limit is refused before it is written.
+        assert!(s.put("big", &vec![7; MAX - 400]).is_err());
     }
 
     #[test]

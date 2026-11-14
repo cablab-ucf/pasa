@@ -24,7 +24,11 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.SecureRandom
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import org.pairir.ScanQr
 
@@ -162,10 +166,25 @@ class MainActivity : ComponentActivity(), Host {
     private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 }; readFido() }
     private fun fresh() = ByteArray(32).also { SecureRandom().nextBytes(it) }
 
+    /** Bumped by each lock: an unlock begun before it keeps nothing open. */
+    private var era = 0
+
+    /** [f]'s open store: never dropped on a cancel, and closed at once if
+     *  the app locked (or the attempt was cancelled) while it opened. */
+    private suspend fun opening(f: () -> Long): Long {
+        val at = era
+        val h = withContext(NonCancellable + Dispatchers.IO) { f() }
+        if (at != era || !currentCoroutineContext().isActive) {
+            Native.close(h)
+            throw CancellationException("locked while it opened")
+        }
+        return h
+    }
+
     override suspend fun create(pw: String, key: Key, pin: String) {
         val c = if (key == Key.Both) fresh() else null
         val r = c?.let { yubikey(this, it, enroll = true) }
-        val h = io { Native.open(dir, pw.toByteArray(), c, r, true) }
+        val h = opening { Native.open(dir, pw.toByteArray(), c, r, true) }
         if (key == Key.Quick) runCatching { quickOn(h, pin) }.onFailure { Native.close(h); File(dir, "key").delete(); throw it }
         handle = h
         stored = true
@@ -206,7 +225,7 @@ class MainActivity : ComponentActivity(), Host {
                 (quick!![32].toInt() != 1).also { if (it) unlockQuick("") }
             }
             is Tapped.Ctap -> {
-                handle = io { Native.openFido(dir, t.cred, t.secret) }
+                handle = opening { Native.openFido(dir, t.cred, t.secret) }
                 t.secret.fill(0)
                 if (sync) io { runCatching { Native.sync(dir, false) } }
                 true
@@ -217,7 +236,7 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun unlockQuick(pin: String) {
         val r = answer ?: yubikey(this, Native.quick(dir)!!.copyOf(32))
         // A wrong PIN throws here, keeping the answer for the next try.
-        handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
+        handle = opening { Native.openQuick(dir, pin.toByteArray(), r) }
         r.fill(0)
         answer = null
         if (sync) io { runCatching { Native.sync(dir, false) } }
@@ -247,7 +266,7 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun unlock(pw: String) {
         val r = Native.challenge(dir)?.let { yubikey(this, it) }
-        handle = io { Native.open(dir, pw.toByteArray(), null, r, false) }
+        handle = opening { Native.open(dir, pw.toByteArray(), null, r, false) }
         if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
@@ -263,6 +282,7 @@ class MainActivity : ComponentActivity(), Host {
     }
 
     override fun lock() {
+        era++
         if (handle != 0L) Native.close(handle)
         handle = 0
         nav.screen = Screen.List
