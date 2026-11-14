@@ -56,8 +56,9 @@ pub fn confine(dir: &Path, unix: Option<&Path>) -> anyhow::Result<bool> {
         .add_rules(path_beneath_rules(unix, AccessFs::ResolveUnix))?
         .restrict_self()?;
     #[cfg(target_os = "linux")]
-    if unix.is_none() {
-        no_unix_sockets()?;
+    if let Some(e) = unix.is_none().then(no_unix_sockets).and_then(Result::err)
+    {
+        eprintln!("pasa: unix sockets stay open to the network side: {e:#}");
     }
     Ok(s.ruleset != RulesetStatus::NotEnforced)
 }
@@ -143,6 +144,31 @@ mod tests {
             assert!(out.is_err(), "a signal out");
             assert!(std::net::UdpSocket::bind("127.0.0.1:0").is_ok(), "udp");
         }
+        // Sync still gets through: QUIC, TLS and irnet's sealed channel.
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use iroh::RelayMode;
+            let bind = || {
+                let alpn = vec![b"probe".to_vec()];
+                irnet::endpoint()
+                    .alpns(alpn)
+                    .relay_mode(RelayMode::Disabled)
+                    .bind()
+            };
+            let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+            let at = b.addr();
+            let srv = tokio::spawn(async move {
+                let c = b.accept().await.unwrap().await.unwrap();
+                let (_, mut tx, _rx) =
+                    irnet::psk::accept(&c, &[&[7; 32]]).await.unwrap();
+                tx.send(b"through").await.unwrap();
+                tx.finish().await.unwrap();
+            });
+            let c = a.connect(at, b"probe").await.unwrap();
+            let (_tx, mut rx) = irnet::psk::dial(&c, &[7; 32]).await.unwrap();
+            assert_eq!(rx.recv(64).await.unwrap(), b"through");
+            rx.end().await.unwrap();
+            srv.await.unwrap();
+        });
         assert!(fs::read(crate::versions(dir).join("x")).is_ok(), "v/");
         assert!(fs::write(dir.join("net/peers"), b"").is_ok(), "net/");
         assert!(fs::read(dir.join("key")).is_err(), "the key file");

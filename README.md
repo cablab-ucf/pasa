@@ -136,7 +136,7 @@ versions that match their names. On a computer the network side is a
 child process that sees `store/v/` and `net/` alone (Landlock on Linux,
 `sandbox-exec` on macOS); on Linux it also signals no other process and
 opens no unix socket (Landlock scopes, seccomp), but `listen`'s to
-pushir. Unconfined, it does not run (`PASA_UNCONFINED=1`: it does). The
+pushir. Where that cannot be had, it says so and syncs still. The
 process with the open store opens no socket, and no pasa process dumps
 core or lets another of yours read its memory. On Android it is one
 process.

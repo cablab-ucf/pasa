@@ -1049,12 +1049,14 @@ fn net_side(a: &[&str]) -> Result<()> {
     // `listen` reaches pushir's daemon; nothing else reaches a unix socket.
     let sock = pushir::local::sock();
     let unix = (a == ["listen"]).then(|| sock.parent()).flatten();
-    let confined = pasa::confine::confine(&dir, unix)?;
-    ensure!(
-        confined || std::env::var_os("PASA_UNCONFINED").is_some(),
-        "the network side cannot be confined here (no Landlock), so pasa \
-         does not sync: PASA_UNCONFINED=1 syncs anyway"
-    );
+    // Never at sync's cost: unconfined, it is said and syncs still.
+    match pasa::confine::confine(&dir, unix) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "pasa: the network side is not confined: no Landlock here"
+        ),
+        Err(e) => eprintln!("pasa: the network side is not confined: {e:#}"),
+    }
     let mut got = String::new();
     if a == ["give"] {
         std::io::stdin().read_line(&mut got)?;

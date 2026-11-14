@@ -205,22 +205,22 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     };
     let take = async {
         let mut want: HashSet<&String> = other.difference(&mine).collect();
-        let n = want.len();
+        let mut n = 0;
         loop {
             let b = rx.recv(MAX).await?;
             if b.is_empty() {
                 break;
             }
             ensure!(want.remove(&name_of(&b)), "a file not asked for");
-            // Only versions: whatever else a peer sends, git and pasa skip.
-            ensure!(
-                b.starts_with(b"age-encryption.org/v1\n-> scrypt "),
-                "not a version"
-            );
-            write(&v.join(name_of(&b)), &b)?;
+            // Only versions are kept; anything else is passed over, not
+            // fatal: a peer that holds one still syncs the rest.
+            if b.starts_with(b"age-encryption.org/v1\n") {
+                write(&v.join(name_of(&b)), &b)?;
+                n += 1;
+            }
         }
         rx.end().await?;
-        anyhow::Ok(n - want.len())
+        anyhow::Ok(n)
     };
     let (g, t) = tokio::join!(give, take);
     g?;
@@ -567,7 +567,12 @@ mod tests {
         assert!(unqr(&qr, "ac").await.is_err());
         take(&desk, "phone", &unqr(&qr, "ab").await.unwrap()).unwrap();
         assert_eq!(fs::read(desk.join("key")).unwrap(), file);
+        // A file no version, held by a peer: passed over, the rest arrives.
+        let junk = b"not a version".as_slice();
+        fs::write(crate::versions(&phone).join(name_of(junk)), junk).unwrap();
         assert_eq!(swap_once(&desk, &phone, "phone", "desk").await, (2, 0));
+        assert!(!crate::versions(&desk).join(name_of(junk)).exists());
+        fs::remove_file(crate::versions(&phone).join(name_of(junk))).unwrap();
         let at = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
         let node = |d: &Path| key(d, "node").unwrap().public();
         assert_eq!(at(&desk, "phone").unwrap().id, Some(node(&phone)));
