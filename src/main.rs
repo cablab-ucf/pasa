@@ -559,8 +559,11 @@ fn edit(old: &[u8]) -> Result<Secret> {
 fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
     let ram = [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
     let ram = ram.into_iter().flatten().map(std::path::PathBuf::from);
-    let base =
-        ram.into_iter().find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+    // Never the disk: an entry there outlives a kill, and backups take it.
+    let base = ram.into_iter().find(|d| d.is_dir()).context(
+        "no folder in memory here (XDG_RUNTIME_DIR, /dev/shm): an editor would \
+         leave the entry on disk; pasa set (from stdin) or the window instead",
+    )?;
     let d = base.join(format!("pasa-{}", HEXLOWER.encode(&rand::<8>())));
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]

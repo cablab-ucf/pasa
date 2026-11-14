@@ -430,6 +430,8 @@ struct App {
     link_pw: Zeroizing<String>,
     /// Locked: egui's memory (text fields' undo history) goes next frame.
     forget: bool,
+    /// When the clipboard crate's copy is cleared.
+    wipe: Option<SystemTime>,
     /// Stores served from here: this one and its linked ones.
     serving: std::collections::HashSet<PathBuf>,
     rt: Option<tokio::runtime::Runtime>,
@@ -668,16 +670,32 @@ impl eframe::App for App {
             None if self.joining => self.join(ui),
             None => self.create(ui),
         }
+        // The clipboard crate's copy (no wl-copy, xclip or pbcopy) is
+        // cleared after 45 s too, by this window, locked or not.
+        if self.wipe.is_some_and(|t| t.elapsed().is_ok()) {
+            self.wipe = None;
+            ui.ctx().copy_text(String::new());
+        }
         // Ctrl+C/X leave by crate::clip, cleared after 45 s; the clipboard
         // crate only without wl-copy, xclip or pbcopy. Selections never
         // reach PRIMARY, which nothing clears.
+        let mut fell = false;
         ui.ctx().output_mut(|o| {
             o.commands.retain(|c| match c {
-                egui::OutputCommand::CopyText(s) => crate::clip(s).is_err(),
+                egui::OutputCommand::CopyText(s) => {
+                    let kept = crate::clip(s).is_err();
+                    fell |= kept && !s.is_empty();
+                    kept
+                }
                 egui::OutputCommand::TextSelectionSettled(_) => false,
                 _ => true,
             })
         });
+        if fell {
+            let clear = Duration::from_secs(45);
+            self.wipe = Some(SystemTime::now() + clear);
+            ui.ctx().request_repaint_after(clear);
+        }
     }
 }
 
@@ -690,6 +708,7 @@ impl App {
             peer: "home".into(),
             quick: true,
             forget: true,
+            wipe: self.wipe,
             ..App::default()
         };
     }
