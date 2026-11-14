@@ -151,7 +151,10 @@ fn reach(dir: &str) -> Vec<std::path::PathBuf> {
     let at = Path::new(dir);
     let st = stores();
     let open = st.values().find(|s| s.dir == at);
-    open.map_or_else(|| vec![at.into()], |s| s.dirs().map(Into::into).collect())
+    open.map_or_else(
+        || vec![at.into()],
+        |s| s.reach().map(Into::into).collect(),
+    )
 }
 
 /// [`sync::sync`] of each folder [`reach`]ed, its peers' results said.
@@ -168,6 +171,12 @@ fn sync_all(dir: &str, news: bool) -> anyhow::Result<String> {
             Err(e) if own => return Err(e),
             Err(e) => said.push(format!("{}: {e:#}", d.display())),
         }
+    }
+    // Groups as the sync left them; one joined opens once its keys came.
+    if let Some(s) = stores().values_mut().find(|s| s.dir == Path::new(dir)) {
+        s.refresh_groups();
+        let all = groups(&s.dir);
+        s.add_links(all);
     }
     Ok(said
         .into_iter()

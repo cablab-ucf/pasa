@@ -89,6 +89,17 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      version count for the re-check); junk keys fields (64 KiB at most);
      a rotation whose envelope failed (the keys put back); an invitation
      replacing a peer's pairing (names in use refused).
+   - Eighth review (fixed): a version no write would make (a long name,
+     a size at the limit) stopped every rotation, in any store (passed
+     over now); key-only envelopes grew the key list past what parses (the
+     newest 1,024 kept; an envelope that would not parse is not sealed);
+     a lower admin's new key sealed to the root alone split the group
+     (each recipient's stanza now comes from the file key and its id, so
+     any member checks an envelope was sealed to all it lists; one not is
+     taken only if built on); a settle that failed stopped the group's
+     open and sync (said now; an admission over the bound left out); joins
+     from the window or phone never completed (their folders sync; groups
+     open again after each sync); an invitation that failed stuck.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

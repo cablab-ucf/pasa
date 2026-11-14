@@ -246,6 +246,14 @@ fn kek(pw: &[u8], salt: &[u8], yk: Option<&[u8]>) -> Result<Secret> {
 }
 
 /// Bounds what a file's size reveals.
+/// Whether a version named `name` of `len` bytes is one [`Store::keep`]
+/// writes: its name, and its size sealed (line, padding, age's overhead).
+fn fits(name: &str, len: usize) -> bool {
+    let pt = padded(len + name.len() + 80);
+    let ok = !name.is_empty() && !name.contains(['\n', '\r']);
+    ok && name.len() <= 255 && pt + pt.div_ceil(64 << 10) * 16 + 1024 <= MAX
+}
+
 fn padded(n: usize) -> usize {
     match n.max(256).next_power_of_two() {
         p if p <= 64 << 10 => p,
@@ -661,8 +669,40 @@ impl Store {
         let (seed, root) = all.split_at(32);
         let root = std::str::from_utf8(root).context("a damaged link")?;
         let mut g = Store::open_member(dir, seed, root)?;
-        g.settle()?;
+        // An admin's work undone opens the group all the same: its sync,
+        // and what it holds, go on.
+        if let Err(e) = g.settle() {
+            g.unopened.push(format!("{e:#}"));
+        }
         Ok(g)
+    }
+
+    /// Linked groups opened again, as a sync left them: their chain now,
+    /// an admin's work done (admissions, removals asked for).
+    pub fn refresh_groups(&mut self) {
+        for i in 0..self.linked.len() {
+            let (label, g) = &self.linked[i];
+            let (label, dir) = (label.clone(), g.dir.clone());
+            let Ok(f) = fs::read(dir.join("member")) else { continue };
+            let was = format!("@{label}:");
+            self.unopened.retain(|u| !u.starts_with(&was));
+            match self.open_group(&dir, &f) {
+                Ok(mut g) => {
+                    let said = g.unopened.drain(..);
+                    let said: Vec<_> =
+                        said.map(|m| format!("@{label}: {m}")).collect();
+                    self.unopened.extend(said);
+                    self.linked[i].1 = g;
+                }
+                Err(e) => self.unopened.push(format!("@{label}: {e:#}")),
+            }
+        }
+    }
+
+    /// What a sync or serve covers: this store's folder, its linked
+    /// stores', and groups joined but not open yet (their keys come so).
+    pub fn reach(&self) -> impl Iterator<Item = &Path> {
+        self.dirs().chain(self.waiting.iter().map(PathBuf::as_path))
     }
 
     /// The folder's name, without `/` or `@`, made unique.
@@ -876,14 +916,18 @@ impl Store {
         // rotation, and so no removal: left behind, and said.
         let all: Vec<Version> = self.entries_here()?.into_values().collect();
         let n = all.len();
+        // So is one no write would make (a name, a size): any key holder
+        // can put one there.
         let e: Vec<_> = all
             .into_iter()
             .filter_map(|v| Some((self.body(&v).ok()?, v)))
+            .filter(|(b, v)| fits(&v.name, b.len()))
             .collect();
         if e.len() < n {
             let d = n - e.len();
-            self.unopened
-                .push(format!("{d} damaged version(s) left at the old key"));
+            self.unopened.push(format!(
+                "{d} damaged or oversized version(s) left at the old key"
+            ));
         }
         let x = self.index()?;
         let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
@@ -1393,7 +1437,7 @@ impl Store {
                     .contains_key(&format!("{RETIRED}{}", key_id(newest))),
             "{RETIRED_SAY}"
         );
-        ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
+        ensure!(fits(name, body.len()), "over {MAX} bytes");
         let mut v = Version {
             ms,
             size: body.len(),
@@ -2522,11 +2566,15 @@ mod tests {
         for w in ["bob", "carol", "dave"] {
             l.sync("alice", w);
         }
-        // Carol removes dave, sealed to alice alone, no new key; alice's
-        // open makes one, and everyone follows.
+        // Carol removes dave, sealed to alice alone, with a new key and
+        // without: not sealed to all it lists, it counts nowhere.
         let alice = l.open("alice").group("lab").unwrap().member_id().unwrap();
-        let mut sc = l.open("carol");
-        l.g(&mut sc).remove_quietly("dave", &[alice]).unwrap();
+        for key in [false, true] {
+            let mut sc = l.open("carol");
+            l.g(&mut sc)
+                .remove_quietly("dave", std::slice::from_ref(&alice), key)
+                .unwrap();
+        }
         l.sync("carol", "alice");
         l.open("alice").put("@lab/s", b"s\n").unwrap();
         for _ in 0..2 {
@@ -2538,7 +2586,7 @@ mod tests {
         }
         for w in ["alice", "bob", "carol"] {
             assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
-            assert!(!l.names(w).contains(&"dave".into()), "{w}");
+            assert!(l.names(w).contains(&"dave".into()), "{w}");
         }
         // Bob removes nobody yet; alice adds erin while bob, at once,
         // removes carol: alice's holds, and bob's next open removes again.
@@ -2676,6 +2724,11 @@ mod tests {
         let ms = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis();
         let pt = format!("{ms} - 999999 zzz\n12345");
         let ct = encrypt(&recipient(&k), pt.as_bytes()).unwrap();
+        fs::write(versions(&l.lab("bob")).join(name_of(&ct)), &ct).unwrap();
+        // And a version no write would make (its name too long): rotation
+        // passes it over (a body at the limit goes the same way).
+        let long = format!("{ms} - 1 {}\nx", "n".repeat(300));
+        let ct = encrypt(&recipient(&k), long.as_bytes()).unwrap();
         fs::write(versions(&l.lab("bob")).join(name_of(&ct)), &ct).unwrap();
         l.sync("bob", "alice");
         l.sync("alice", "carol");

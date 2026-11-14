@@ -42,6 +42,10 @@ const CHAIN: &str = ".pasa/chain/";
 /// Names this admin paired in and has not admitted: its own, never synced.
 const INVITES: &str = "invites";
 
+/// The most keys an envelope holds: the newest, so the list never grows
+/// past what parses (a lower admin's key-only envelopes would make it).
+const KEEP: usize = 1024;
+
 /// The most an envelope, a link or a request may take: a list of about
 /// 200 devices; junk costs no more than this to read.
 const MOST: u64 = 1 << 20;
@@ -173,24 +177,92 @@ impl age::Recipient for To {
         k: &FileKey,
     ) -> Result<(Vec<Stanza>, HashSet<String>), age::EncryptError> {
         use age::secrecy::ExposeSecret;
-        let (enc, ct) = hpke::single_shot_seal::<Aead, Kdf, XWing>(
-            &OpModeS::Base,
-            &self.0,
-            INFO,
-            k.expose_secret(),
-            self.1.as_bytes(),
-        )
-        .map_err(|e| age::EncryptError::Io(std::io::Error::other(e)))?;
-        let body = [&enc.to_bytes()[..], &ct].concat();
-        let s = Stanza { tag: TAG.into(), args: vec![self.1.clone()], body };
+        let s = stanza(&self.0, &self.1, k.expose_secret())
+            .map_err(|e| age::EncryptError::Io(std::io::Error::other(e)))?;
         Ok((vec![s], HashSet::new()))
     }
 }
 
-/// This device's key, as an age identity.
-struct Me<'a>(&'a Sk, String);
+/// Randomness from a seed alone: SHA-256 in counter mode.
+struct Det([u8; 32], u64);
+
+impl hpke::rand_core::TryRng for Det {
+    type Error = std::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, d: &mut [u8]) -> Result<(), Self::Error> {
+        for c in d.chunks_mut(32) {
+            let h = Sha256::new().chain_update(self.0);
+            let h = h.chain_update(self.1.to_le_bytes()).finalize();
+            self.1 += 1;
+            c.copy_from_slice(&h[..c.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl hpke::rand_core::TryCryptoRng for Det {}
+
+/// Member `id`'s stanza for file key `k`, its randomness from `k` and `id`:
+/// any member that opens the file makes every other's again, and so knows
+/// whether it was sealed to all it lists.
+fn stanza(pk: &Pk, id: &str, k: &[u8]) -> Result<Stanza, hpke::HpkeError> {
+    let seed = Sha256::new().chain_update(b"pasa group stanza ");
+    let seed = seed.chain_update(k).chain_update(id).finalize().into();
+    let (enc, ct) = hpke::single_shot_seal_with_rng::<Aead, Kdf, XWing>(
+        &OpModeS::Base,
+        pk,
+        INFO,
+        k,
+        id.as_bytes(),
+        &mut Det(seed, 0),
+    )?;
+    let body = [&enc.to_bytes()[..], &ct].concat();
+    Ok(Stanza { tag: TAG.into(), args: vec![id.into()], body })
+}
+
+/// Whether `seen` (a file's stanzas, its key) holds each of `list`'s.
+fn sealed_all(list: &[Member], seen: &Seen) -> bool {
+    list.iter().all(|m| {
+        let Ok(pk) = Pk::from_bytes(&m.bundle[..XPK]) else { return false };
+        let Ok(want) = stanza(&pk, &m.id, &seen.1) else { return false };
+        seen.0.contains(&want)
+    })
+}
+
+/// A file's stanzas, and its key.
+type Seen = (Vec<Stanza>, [u8; 16]);
+
+/// This device's key, as an age identity; what it opened, kept.
+struct Me<'a>(&'a Sk, String, std::cell::RefCell<Option<Seen>>);
 
 impl age::Identity for Me<'_> {
+    fn unwrap_stanzas(
+        &self,
+        ss: &[Stanza],
+    ) -> Option<Result<FileKey, age::DecryptError>> {
+        use age::secrecy::ExposeSecret;
+        let r = ss.iter().find_map(|s| self.unwrap_stanza(s))?;
+        if let Ok(k) = &r {
+            let copy = |s: &Stanza| Stanza {
+                tag: s.tag.clone(),
+                args: s.args.clone(),
+                body: s.body.clone(),
+            };
+            let all = ss.iter().map(copy).collect();
+            *self.2.borrow_mut() = Some((all, *k.expose_secret()));
+        }
+        Some(r)
+    }
+
     fn unwrap_stanza(
         &self,
         s: &Stanza,
@@ -387,7 +459,11 @@ fn follows(p: &Envelope, n: &Envelope, root: &str) -> bool {
     let Some(r) = rank(&p.list, root, &n.signer) else { return false };
     let signer =
         p.list.iter().any(|m| m.id == n.signer && m.bundle == n.bundle);
-    let keys = n.keys == p.keys || n.keys.get(1..) == Some(&p.keys[..]);
+    // The keys before, the newest [`KEEP`]; or one new before them.
+    let newest = |k: usize| &p.keys[..p.keys.len().min(k)];
+    let keys = n.keys == newest(KEEP)
+        || n.keys.get(1..) == Some(newest(KEEP - 1))
+            && !p.keys.contains(&n.keys[0]);
     let may_drop =
         |m: &Member| rank(&p.list, root, &m.id).is_none_or(|o| r < o);
     let kept =
@@ -496,8 +572,10 @@ impl Store {
         root: &str,
     ) -> Result<Store> {
         let k = Keys::of(seed);
-        let me = Me(&k.x.0, k.id());
+        let me = Me(&k.x.0, k.id(), Default::default());
         let mut found: Vec<Envelope> = vec![];
+        // Each envelope that came sealed to this device: its stanzas.
+        let mut seen: HashMap<String, Seen> = HashMap::new();
         let mut asks = vec![];
         for e in fs::read_dir(crate::versions(dir))?.flatten() {
             let mut head = [0; ENVELOPE.len()];
@@ -512,6 +590,9 @@ impl Store {
             }
             let Some(pt) = unsealed(&me, &b) else { continue };
             if let Some(n) = envelope(&pt) {
+                if let Some(x) = me.2.take() {
+                    seen.entry(n.hash.clone()).or_insert(x);
+                }
                 found.push(n);
             } else if let Some((f, id, bundle)) = opened(b"l3", &pt, 1) {
                 (f[0] == root.as_bytes()).then(|| asks.push((id, bundle)));
@@ -562,6 +643,19 @@ impl Store {
                 valid.insert(&n.hash, r);
             }
         }
+        // Taken only if sealed to every member it lists, or built on by one
+        // taken: no admin keeps a key from members it does not remove.
+        // (Checked where needed: in a chain, its newest alone.)
+        let (mut taken, mut built) = (HashSet::new(), HashSet::new());
+        for n in order.iter().rev() {
+            let h = n.hash.as_str();
+            let sealed = || seen.get(h).is_some_and(|x| sealed_all(&n.list, x));
+            if valid.contains_key(h) && (built.contains(h) || sealed()) {
+                taken.insert(h);
+                built.insert(n.prev.as_str());
+            }
+        }
+        valid.retain(|h, _| taken.contains(h));
         // Each one's best: the highest signer in it and all built on it. Of
         // two forks, the one a higher admin signed in holds: a removed
         // admin's fork, made before its removal or after, loses to the
@@ -724,7 +818,11 @@ impl Store {
         to: Option<&[String]>,
     ) -> Result<()> {
         let keys: Zeroizing<Vec<u8>> = Zeroizing::new(
-            self.keys.iter().flat_map(|k| k.iter().copied()).collect(),
+            self.keys
+                .iter()
+                .take(KEEP)
+                .flat_map(|k| k.iter().copied())
+                .collect(),
         );
         let e = epoch.to_string();
         // The one before, kept under the newest key: whoever sealed it.
@@ -750,6 +848,7 @@ impl Store {
             .iter()
             .filter(|m| to.is_none_or(|t| t.contains(&m.id)))
             .collect();
+        ensure!(envelope(&pt).is_some(), "an envelope no device would read");
         let ct = seal_to(&to, &pt)?;
         // Its copy, a padded version, stays within the bound too.
         ensure!(
@@ -772,13 +871,17 @@ impl Store {
         ensure!(ON, OFF);
         ensure!(self.is_admin(), "only an admin adds devices");
         ensure!(sane(name), "{name}: a bad name");
-        // A name in use: its pairing would be replaced, its sync stopped.
+        // A name in use: its pairing would be replaced, its sync stopped;
+        // but for an invitation of this device's no device took yet.
+        let mut i = self.invites();
+        #[cfg(feature = "sync")]
+        let mine = i.iter().any(|e| e.0 == name && e.1.is_none());
         let taken = self.g.list.iter().any(|m| m.name == name);
         #[cfg(feature = "sync")]
         let taken = taken
-            || crate::sync::peers(&self.dir).iter().any(|p| p.name == name);
+            || !mine
+                && crate::sync::peers(&self.dir).iter().any(|p| p.name == name);
         ensure!(!taken, "{name}: a name in use here");
-        let mut i = self.invites();
         i.retain(|n| n.0 != name);
         i.push((name.into(), None));
         self.save_invites(&i)?;
@@ -894,6 +997,7 @@ impl Store {
         }
         // One device per invitation: the first admitted, again if set
         // aside by a fork, never another.
+        let mut added = vec![];
         for (name, bundle) in self.requests()? {
             let id = id_of(&bundle);
             let Some(e) = inv.iter_mut().find(|e| e.0 == name) else {
@@ -906,6 +1010,7 @@ impl Store {
                 continue;
             }
             e.1 = Some(id.clone());
+            added.push(id.clone());
             let since = self.g.epoch + 1;
             let by = me.clone();
             list.push(Member { id, name, admin: false, by, since, bundle });
@@ -913,7 +1018,18 @@ impl Store {
         let ids: HashSet<&String> = list.iter().map(|m| &m.id).collect();
         if list != self.g.list || self.g.known.iter().any(|i| !ids.contains(i))
         {
-            self.extend(list, true)?;
+            let all = list.clone();
+            // Over the bound with those just admitted: the rest done all the
+            // same, and said.
+            if let Err(e) = self.extend(all, true) {
+                ensure!(!added.is_empty(), e);
+                list.retain(|m| !added.contains(&m.id));
+                inv.iter_mut()
+                    .filter(|i| i.1.as_ref().is_some_and(|x| added.contains(x)))
+                    .for_each(|i| i.1 = None);
+                self.unopened.push(format!("{e:#}: none admitted"));
+                self.extend(list, true)?;
+            }
         }
         // Invitations whose device the chain held: done, whatever came
         // after; pairings with devices gone, forgotten.
@@ -1017,7 +1133,11 @@ impl Store {
         &mut self,
         who: &str,
         to: &[String],
+        key: bool,
     ) -> Result<()> {
+        if key {
+            self.rotate()?;
+        }
         let id = self.one(who)?.id;
         let list = self.g.list.iter().filter(|m| m.id != id).cloned().collect();
         let epoch = self.g.epoch + 1;
@@ -1041,7 +1161,7 @@ impl Store {
         let mut list = self.g.list.clone();
         list.push(Member {
             id: k.id(),
-            name: format!("puppet{}", list.len()),
+            name: format!("p{}", &k.id()[..8]),
             admin,
             by: self.member_id().context("no member")?,
             since: self.g.epoch + 1,

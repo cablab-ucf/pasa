@@ -1145,11 +1145,11 @@ impl App {
             self.synced.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             v.note = s;
-            // A group joined opens once a sync brought its keys.
-            if !v.s.unopened.is_empty() {
-                v.s.add_links(pasa::stores());
-                v.load();
-            }
+            // Groups as the sync left them; one joined opens once a sync
+            // brought its keys.
+            v.s.refresh_groups();
+            v.s.add_links(pasa::stores());
+            v.load();
         }
         // View's filter matches names alone; this search looks further.
         let query = std::mem::take(&mut v.filter);
@@ -2236,7 +2236,7 @@ impl App {
                 self.sync_now(
                     ui.ctx(),
                     false,
-                    v.s.dirs().map(Into::into).collect(),
+                    v.s.reach().map(Into::into).collect(),
                 );
             }
         }
@@ -2292,7 +2292,11 @@ impl App {
         }
         if on && !peers.is_empty() && ui.button("Sync now").clicked() {
             v.note = "Syncing".into();
-            self.sync_now(ui.ctx(), true, v.s.dirs().map(Into::into).collect());
+            self.sync_now(
+                ui.ctx(),
+                true,
+                v.s.reach().map(Into::into).collect(),
+            );
         }
         self.groups(ui, v);
         ui.separator();
@@ -2549,7 +2553,7 @@ impl App {
     /// This store's folder, and its linked stores' once open.
     fn dirs(&self) -> Vec<PathBuf> {
         let open =
-            self.v.as_ref().map(|v| v.s.dirs().map(Into::into).collect());
+            self.v.as_ref().map(|v| v.s.reach().map(Into::into).collect());
         open.unwrap_or_else(|| vec![home()])
     }
 
