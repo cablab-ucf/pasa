@@ -82,6 +82,13 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      and then ignored (now refused). Known: a version dated just under a
      day ahead dates later edits that far (a rotation clears it); a device
      with a clock over a day fast has its edits held back until then.
+   - Seventh review (fixed): a device a higher admin removed rejoined
+     through its old invitation (now one device per invitation, done for
+     good once the chain held it, its pairing then forgotten); a removal
+     whose link came late stopped no open window (files that are no
+     version count for the re-check); junk keys fields (64 KiB at most);
+     a rotation whose envelope failed (the keys put back); an invitation
+     replacing a peer's pairing (names in use refused).
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

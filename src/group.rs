@@ -309,7 +309,9 @@ fn envelope(pt: &[u8]) -> Option<Envelope> {
     let (f, signer, bundle) = opened(b"k3", pt, 5)?;
     let keys: Vec<Secret> =
         f[4].chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
-    (!keys.is_empty() && f[4].len() % 32 == 0).then_some(())?;
+    // A key a rotation: 2,048 of them at most, not a junk megabyte.
+    let fits = f[4].len() % 32 == 0 && f[4].len() <= 64 << 10;
+    (!keys.is_empty() && fits).then_some(())?;
     Some(Envelope {
         epoch: text(&f[0]).parse().ok()?,
         prev: text(&f[1]),
@@ -686,12 +688,22 @@ impl Store {
     /// it held the newest (unless this one leaves: then the next admin's).
     fn extend(&mut self, list: Vec<Member>, rotate: bool) -> Result<()> {
         let ids: HashSet<&String> = list.iter().map(|m| &m.id).collect();
-        if rotate && self.g.known.iter().any(|i| !ids.contains(i)) {
-            self.rotate()?;
-            self.g.known.clear();
-        }
+        let (keys, known) = (self.keys.clone(), self.g.known.clone());
+        let new = rotate && self.g.known.iter().any(|i| !ids.contains(i));
         let epoch = self.g.epoch.checked_add(1).context("no epoch after")?;
-        self.seal_envelope(epoch, self.g.head.clone(), list)
+        let r = (|| {
+            if new {
+                self.rotate()?;
+                self.g.known.clear();
+            }
+            self.seal_envelope(epoch, self.g.head.clone(), list)
+        })();
+        // No envelope: no new key either, which nobody else would hold.
+        if r.is_err() && new {
+            self.set_keys(keys);
+            self.g.known = known;
+        }
+        r
     }
 
     fn seal_envelope(
@@ -760,16 +772,38 @@ impl Store {
         ensure!(ON, OFF);
         ensure!(self.is_admin(), "only an admin adds devices");
         ensure!(sane(name), "{name}: a bad name");
+        // A name in use: its pairing would be replaced, its sync stopped.
+        let taken = self.g.list.iter().any(|m| m.name == name);
+        #[cfg(feature = "sync")]
+        let taken = taken
+            || crate::sync::peers(&self.dir).iter().any(|p| p.name == name);
+        ensure!(!taken, "{name}: a name in use here");
         let mut i = self.invites();
-        i.retain(|n| n != name);
-        i.push(name.into());
-        write(&self.dir.join(INVITES), i.join("\n").as_bytes())?;
+        i.retain(|n| n.0 != name);
+        i.push((name.into(), None));
+        self.save_invites(&i)?;
         Ok(self.root().context("not a group store")?.into())
     }
 
-    fn invites(&self) -> Vec<String> {
+    /// Invitations: a name, and the one device admitted under it, once
+    /// one is. Kept until the chain holds that device: then done for good.
+    fn save_invites(&self, i: &[(String, Option<String>)]) -> Result<()> {
+        let line = |(n, id): &(String, Option<String>)| match id {
+            Some(id) => format!("{n} {id}\n"),
+            None => format!("{n}\n"),
+        };
+        let b: String = i.iter().map(line).collect();
+        write(&self.dir.join(INVITES), b.as_bytes())
+    }
+
+    fn invites(&self) -> Vec<(String, Option<String>)> {
         let f = fs::read_to_string(self.dir.join(INVITES)).unwrap_or_default();
-        f.lines().filter(|l| !l.is_empty()).map(String::from).collect()
+        let one = |l: &str| {
+            let mut w = l.split(' ');
+            let n = w.next().filter(|n| !n.is_empty())?;
+            Some((n.to_string(), w.next().map(String::from)))
+        };
+        f.lines().filter_map(one).collect()
     }
 
     /// Makes member `who` an admin, ranked after every admin now.
@@ -843,9 +877,10 @@ impl Store {
             return Ok(());
         }
         let me = self.member_id().context("not a group store")?;
-        // Admitted: in the chain as this open found it; one admitted now
-        // keeps its invitation until a later open finds that it held.
-        let found = self.g.list.clone();
+        // The devices the chain held as this open found it.
+        let held = self.g.ever.clone();
+        let mut inv = self.invites();
+        let was = inv.clone();
         let mut list: Vec<Member> = self.g.list.clone();
         list.retain(|m| {
             !self.g.leaves.contains(&m.id) || !self.outranks(&m.id)
@@ -857,33 +892,39 @@ impl Store {
                 list.retain(|m| m.id != *id);
             }
         }
+        // One device per invitation: the first admitted, again if set
+        // aside by a fork, never another.
         for (name, bundle) in self.requests()? {
             let id = id_of(&bundle);
-            if !self.g.ever.contains(&id)
-                && !list.iter().any(|m| m.name == name)
+            let Some(e) = inv.iter_mut().find(|e| e.0 == name) else {
+                continue;
+            };
+            if e.1.as_ref().is_some_and(|x| *x != id)
+                || held.contains(&id)
+                || list.iter().any(|m| m.name == name)
             {
-                let since = self.g.epoch + 1;
-                let by = me.clone();
-                list.push(Member { id, name, admin: false, by, since, bundle });
+                continue;
             }
+            e.1 = Some(id.clone());
+            let since = self.g.epoch + 1;
+            let by = me.clone();
+            list.push(Member { id, name, admin: false, by, since, bundle });
         }
         let ids: HashSet<&String> = list.iter().map(|m| &m.id).collect();
         if list != self.g.list || self.g.known.iter().any(|i| !ids.contains(i))
         {
             self.extend(list, true)?;
         }
-        // Invitations taken, and pairings with devices gone, forgotten.
-        let mut i = self.invites();
-        let done =
-            |n: &String| found.iter().any(|m| m.by == me && m.name == *n);
-        if i.iter().any(done) {
-            i.retain(|n| !done(n));
-            write(&self.dir.join(INVITES), i.join("\n").as_bytes())?;
+        // Invitations whose device the chain held: done, whatever came
+        // after; pairings with devices gone, forgotten.
+        inv.retain(|(_, id)| id.as_ref().is_none_or(|i| !held.contains(i)));
+        if inv != was {
+            self.save_invites(&inv)?;
         }
         #[cfg(feature = "sync")]
         for m in &self.g.gone {
-            let held = self.g.list.iter().any(|x| x.name == m.name);
-            if m.by == me && !held && !i.contains(&m.name) {
+            let here = self.g.list.iter().any(|x| x.name == m.name);
+            if m.by == me && !here && !inv.iter().any(|e| e.0 == m.name) {
                 let _ = crate::sync::forget(&self.dir, &m.name);
             }
         }
@@ -901,7 +942,7 @@ impl Store {
             let invited = self.invites();
             let peers: Vec<crate::sync::Peer> = crate::sync::peers(&self.dir)
                 .into_iter()
-                .filter(|p| invited.contains(&p.name))
+                .filter(|p| invited.iter().any(|i| i.0 == p.name))
                 .collect();
             if peers.is_empty() {
                 return Ok(out);

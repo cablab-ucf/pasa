@@ -294,7 +294,8 @@ struct Index {
     mtime: Option<SystemTime>,
     tips: HashMap<String, (u64, String)>,
     last: u64,
-    /// A group's envelope files, and those its chain was last checked at.
+    /// Files that are no version here (a group's envelopes, their links
+    /// before they open, requests), and those its chain was last checked at.
     envelopes: HashSet<String>,
     checked: Option<HashSet<String>>,
 }
@@ -826,6 +827,17 @@ impl Store {
     }
 
     /// Keys a rotation made elsewhere, newest first; true if any was new.
+    /// Back to `keys`, as before a rotation that went no further.
+    pub(crate) fn set_keys(&mut self, keys: Vec<Secret>) {
+        self.ids = keys.iter().map(|k| identity(k)).collect();
+        if let Some(k) = keys.first() {
+            self.newest = recipient(k);
+        }
+        self.keys = keys;
+        *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+            Index::default();
+    }
+
     pub(crate) fn add_keys(&mut self, ks: &[u8]) -> Result<bool> {
         let new: Vec<_> = ks
             .chunks(32)
@@ -1018,7 +1030,10 @@ impl Store {
                 Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
                 // A group's envelope: its keys, not a version.
                 None if self.envelope(n) => drop(x.envelopes.insert(n.clone())),
-                None => bad += 1,
+                None => {
+                    bad += 1;
+                    x.envelopes.insert(n.clone());
+                }
             }
         }
         self.unreadable.store(bad, Relaxed);
@@ -2708,6 +2723,61 @@ mod tests {
         l.open("alice").put("@lab/s", b"s\n").unwrap();
         l.sync("alice", "dave");
         assert_eq!(&l.open("dave").get("@lab/s").unwrap()[..], b"s\n");
+    }
+
+    #[test]
+    fn an_invitation_admits_one_device_once() {
+        let l = Lab::new("once", &["alice", "bob", "dave"]);
+        l.add("alice", "bob");
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.sync("alice", "bob");
+        let psk = l.add("bob", "dave");
+        l.sync("bob", "alice");
+        assert!(l.names("alice").contains(&"dave".into()));
+        // A name in use is no invitation.
+        let mut sb = l.open("bob");
+        assert!(l.g(&mut sb).invite("alice").is_err());
+        // Alice removes dave; bob's next open forgets dave's pairing.
+        l.open("alice").group_remove("lab", "dave").unwrap();
+        l.sync("alice", "bob");
+        drop(l.open("bob"));
+        assert!(
+            crate::sync::peers(&l.lab("bob")).iter().all(|p| p.name != "dave")
+        );
+        // Dave asks again, a new device, with the old secret: in vain.
+        let root =
+            l.open("bob").group("lab").unwrap().root().unwrap().to_string();
+        let ask = group::request(&rand::<32>(), &psk, &root).unwrap();
+        fs::write(versions(&l.lab("bob")).join(name_of(&ask)), &ask).unwrap();
+        drop(l.open("bob"));
+        l.sync("bob", "alice");
+        assert!(!l.names("alice").contains(&"dave".into()));
+        assert!(!l.names("bob").contains(&"dave".into()));
+    }
+
+    #[test]
+    fn a_removal_whose_link_comes_late_still_stops_a_window() {
+        let l = Lab::new("late", &["alice", "bob", "carol"]);
+        l.add("alice", "bob");
+        l.add("alice", "carol");
+        let mut sc = l.open("carol");
+        l.open("alice").group_remove("lab", "bob").unwrap();
+        // Envelopes first, as a sync cut short might bring them.
+        for e in fs::read_dir(versions(&l.lab("alice"))).unwrap().flatten() {
+            let mut head = [0; 40];
+            let f = fs::File::open(e.path())
+                .and_then(|mut f| f.read_exact(&mut head));
+            let at = versions(&l.lab("carol")).join(e.file_name());
+            if f.is_ok() && group::is_envelope(&head) && !at.exists() {
+                fs::copy(e.path(), at).unwrap();
+            }
+        }
+        let _ = sc.put("@lab/early", b"e\n");
+        // Then the rest: carol's window writes no more under the old key.
+        l.sync("alice", "carol");
+        assert!(sc.put("@lab/late", b"secret\n").is_err());
+        assert!(l.g(&mut sc).put("late", b"secret\n").is_err());
     }
 
     #[test]
