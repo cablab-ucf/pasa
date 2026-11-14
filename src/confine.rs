@@ -53,13 +53,42 @@ pub fn confine(dir: &Path, unix: Option<&Path>) -> anyhow::Result<Confined> {
         landlock::RulesetStatus::FullyEnforced => {
             Confined::Partly(lacks(String::new()))
         }
-        landlock::RulesetStatus::PartiallyEnforced => Confined::Partly(lacks(
-            "this kernel's Landlock lacks some rules (signals, abstract or \
-             path sockets)"
-                .into(),
-        )),
+        // What is left open, not what Landlock lacks: unix sockets by path
+        // are seccomp's when it applies.
+        landlock::RulesetStatus::PartiallyEnforced => {
+            use landlock::{Access, RulesetAttr};
+            let mut gaps = vec![];
+            if !has(|r| r.scope(landlock::Scope::from_all(landlock::ABI::V6))) {
+                gaps.push("signals and abstract sockets");
+            }
+            let path = |r: landlock::Ruleset| {
+                r.handle_access(landlock::AccessFs::ResolveUnix)
+            };
+            if unix.is_some() && !has(path) {
+                gaps.push("unix sockets by path");
+            }
+            match gaps.is_empty() && seccomp.is_none() {
+                true => Confined::Fully,
+                false => Confined::Partly(lacks(format!(
+                    "this kernel's Landlock leaves open: {}",
+                    gaps.join(", ")
+                ))),
+            }
+        }
         landlock::RulesetStatus::NotEnforced => Confined::No,
     })
+}
+
+/// Whether this kernel's Landlock has what `f` asks for (tried, not applied).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn has(
+    f: impl FnOnce(
+        landlock::Ruleset,
+    ) -> Result<landlock::Ruleset, landlock::RulesetError>,
+) -> bool {
+    use landlock::{CompatLevel, Compatible, Ruleset};
+    let r = Ruleset::default().set_compatibility(CompatLevel::HardRequirement);
+    f(r).and_then(|r| r.create()).is_ok()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

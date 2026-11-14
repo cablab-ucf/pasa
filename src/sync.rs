@@ -7,7 +7,7 @@ use irnet::psk::{Rx, Tx};
 use iroh::{EndpointAddr, PublicKey, RelayUrl, SecretKey, TransportAddr};
 use pushir::Lane;
 use std::path::{Path, PathBuf};
-use std::{collections::HashSet, fs, time::Duration};
+use std::{collections::HashSet, fs, sync::Arc, time::Duration};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
@@ -356,14 +356,29 @@ pub async fn serve(
         _ => {}
     }
     let ep = ep()?.secret_key(node).alpns(vec![ALPN.into()]).bind().await?;
+    // Bounded work: handshakes before a proof (each 10 s at most), and
+    // swaps after one, far above what a person's devices ask.
+    use tokio::sync::Semaphore;
+    let (pending, active) =
+        (Arc::new(Semaphore::new(64)), Arc::new(Semaphore::new(16)));
     while let Some(inc) = ep.accept().await {
-        let (dir, log) = (dir.to_path_buf(), log.clone());
+        let Ok(first) = pending.clone().try_acquire_owned() else {
+            inc.refuse();
+            continue;
+        };
+        let (dir, log, active) =
+            (dir.to_path_buf(), log.clone(), active.clone());
         tokio::spawn(async move {
             let ps = peers(&dir);
             let psks: Vec<&[u8; 32]> = ps.iter().map(|p| &p.psk).collect();
             let go = async {
                 let (i, tx, rx) =
                     irnet::psk::accept(&inc.await?, &psks).await?;
+                drop(first);
+                let _busy = active
+                    .try_acquire_owned()
+                    .ok()
+                    .context("busy: sync later")?;
                 anyhow::Ok((i, swap(&dir, tx, rx).await?))
             };
             match timeout(SWAP, go).await {
@@ -392,6 +407,7 @@ pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
             pushir::local::attach(&pushir::local::sock(), &secret).await?;
         set_mailbox(dir, id)?;
         while lane(dir)? == secret {
+            let began = tokio::time::Instant::now();
             sync(dir, false).await?.into_iter().for_each(|(w, r)| log(&w, r));
             loop {
                 match timeout(Duration::from_secs(900), rx.recv()).await {
@@ -401,10 +417,16 @@ pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
                     Err(_) => {}
                 }
             }
+            // A wake replayed (a relay can) costs one sync in [`EVERY`] at
+            // most; those meanwhile are one more.
+            tokio::time::sleep_until(began + EVERY).await;
             while rx.try_recv().is_ok() {}
         }
     }
 }
+
+/// The least time between two syncs a wake starts.
+pub const EVERY: Duration = Duration::from_secs(5);
 
 /// Wire: endpoint key (32), psk (32), then the key file bare, or with hardware
 /// keys KEYS and the key, quick and ctap files framed.

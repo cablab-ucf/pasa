@@ -791,6 +791,14 @@ pub extern "system" fn Java_com_apasa_Native_wake<'l>(
             return Ok(e.new_string("")?);
         }
         let _one = SYNC.lock().unwrap_or_else(|p| p.into_inner());
+        // A wake replayed (a relay can) costs one sync in EVERY at most.
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let last = *LAST.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = last {
+            std::thread::sleep(sync::EVERY.saturating_sub(t.elapsed()));
+        }
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(std::time::Instant::now());
         WAITING.store(false, SeqCst);
         Ok(e.new_string(sync_all(&dir.to_string(), false)?)?)
     })
