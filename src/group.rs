@@ -229,13 +229,16 @@ fn stanza(pk: &Pk, id: &str, k: &[u8]) -> Result<Stanza, hpke::HpkeError> {
     Ok(Stanza { tag: TAG.into(), args: vec![id.into()], body })
 }
 
-/// Whether `seen` (a file's stanzas, its key) holds each of `list`'s.
+/// Whether `seen` (a file's stanzas, its key) holds each of `list`'s, and
+/// no other: none a member would try in place of its own.
 fn sealed_all(list: &[Member], seen: &Seen) -> bool {
-    list.iter().all(|m| {
-        let Ok(pk) = Pk::from_bytes(&m.bundle[..XPK]) else { return false };
-        let Ok(want) = stanza(&pk, &m.id, &seen.1) else { return false };
-        seen.0.contains(&want)
-    })
+    let ours = seen.0.iter().filter(|s| s.tag == TAG).count();
+    ours == list.len()
+        && list.iter().all(|m| {
+            let Ok(pk) = Pk::from_bytes(&m.bundle[..XPK]) else { return false };
+            let Ok(want) = stanza(&pk, &m.id, &seen.1) else { return false };
+            seen.0.contains(&want)
+        })
 }
 
 /// A file's stanzas, and its key.
@@ -250,7 +253,20 @@ impl age::Identity for Me<'_> {
         ss: &[Stanza],
     ) -> Option<Result<FileKey, age::DecryptError>> {
         use age::secrecy::ExposeSecret;
-        let r = ss.iter().find_map(|s| self.unwrap_stanza(s))?;
+        // Each of its own, not the first alone: a junk one before it
+        // opens nothing.
+        let mut r = None;
+        for s in ss {
+            match self.unwrap_stanza(s) {
+                Some(Ok(k)) => {
+                    r = Some(Ok(k));
+                    break;
+                }
+                Some(e) => r = r.or(Some(e)),
+                None => {}
+            }
+        }
+        let r = r?;
         if let Ok(k) = &r {
             let copy = |s: &Stanza| Stanza {
                 tag: s.tag.clone(),
@@ -287,6 +303,38 @@ impl age::Identity for Me<'_> {
         let Ok(k) = <[u8; 16]>::try_from(&k[..]) else { return bad() };
         Some(Ok(FileKey::new(Box::new(k))))
     }
+}
+
+/// A stanza for `id` that opens nothing.
+#[cfg(test)]
+struct Junk(String);
+
+#[cfg(test)]
+impl age::Recipient for Junk {
+    fn wrap_file_key(
+        &self,
+        _: &FileKey,
+    ) -> Result<(Vec<Stanza>, HashSet<String>), age::EncryptError> {
+        let body = rand::<32>().repeat(40);
+        let s = Stanza { tag: TAG.into(), args: vec![self.0.clone()], body };
+        Ok((vec![s], HashSet::new()))
+    }
+}
+
+/// `pt` sealed to `to`, a junk stanza for `id` ahead of all.
+#[cfg(test)]
+fn seal_junk(id: &str, to: &[&Member], pt: &[u8]) -> Result<Vec<u8>> {
+    let mut rs: Vec<Box<dyn age::Recipient>> = vec![Box::new(Junk(id.into()))];
+    for m in to {
+        let pk = Pk::from_bytes(&m.bundle[..XPK]).ok().context("a bad key")?;
+        rs.push(Box::new(To(pk, m.id.clone())));
+    }
+    let e = age::Encryptor::with_recipients(rs.iter().map(|r| r.as_ref()))?;
+    let mut out = vec![];
+    let mut w = e.wrap_output(&mut out)?;
+    std::io::Write::write_all(&mut w, pt)?;
+    w.finish()?;
+    Ok(out)
 }
 
 /// `pt` sealed to each member's X-Wing key.
@@ -510,6 +558,9 @@ pub(crate) struct State {
     gone: Vec<Member>,
     /// Members asking to leave.
     leaves: Vec<String>,
+    /// A test's attacker: a junk stanza for this member, ahead of all.
+    #[cfg(test)]
+    pub(crate) junk: Option<String>,
     /// The newest envelope's body: the next one links a copy.
     body: Secret,
     /// Removals this device signed on a fork set aside: made again, where
@@ -575,7 +626,9 @@ impl Store {
         let me = Me(&k.x.0, k.id(), Default::default());
         let mut found: Vec<Envelope> = vec![];
         // Each envelope that came sealed to this device: its stanzas.
-        let mut seen: HashMap<String, Seen> = HashMap::new();
+        // Every copy: one sealed to all is enough, whatever other copies a
+        // member sealed again to fewer.
+        let mut seen: HashMap<String, Vec<Seen>> = HashMap::new();
         let mut asks = vec![];
         for e in fs::read_dir(crate::versions(dir))?.flatten() {
             let mut head = [0; ENVELOPE.len()];
@@ -591,7 +644,7 @@ impl Store {
             let Some(pt) = unsealed(&me, &b) else { continue };
             if let Some(n) = envelope(&pt) {
                 if let Some(x) = me.2.take() {
-                    seen.entry(n.hash.clone()).or_insert(x);
+                    seen.entry(n.hash.clone()).or_default().push(x);
                 }
                 found.push(n);
             } else if let Some((f, id, bundle)) = opened(b"l3", &pt, 1) {
@@ -649,7 +702,10 @@ impl Store {
         let (mut taken, mut built) = (HashSet::new(), HashSet::new());
         for n in order.iter().rev() {
             let h = n.hash.as_str();
-            let sealed = || seen.get(h).is_some_and(|x| sealed_all(&n.list, x));
+            let sealed = || {
+                let all = seen.get(h).into_iter().flatten();
+                all.into_iter().any(|x| sealed_all(&n.list, x))
+            };
             if valid.contains_key(h) && (built.contains(h) || sealed()) {
                 taken.insert(h);
                 built.insert(n.prev.as_str());
@@ -724,6 +780,8 @@ impl Store {
             redo.extend(p.list.iter().filter(out).map(|m| m.id.clone()));
         }
         s.g = State {
+            #[cfg(test)]
+            junk: None,
             body: at.body.clone(),
             redo,
             epoch: at.epoch,
@@ -849,6 +907,12 @@ impl Store {
             .filter(|m| to.is_none_or(|t| t.contains(&m.id)))
             .collect();
         ensure!(envelope(&pt).is_some(), "an envelope no device would read");
+        #[cfg(test)]
+        let ct = match self.g.junk.take() {
+            Some(id) => seal_junk(&id, &to, &pt)?,
+            None => seal_to(&to, &pt)?,
+        };
+        #[cfg(not(test))]
         let ct = seal_to(&to, &pt)?;
         // Its copy, a padded version, stays within the bound too.
         ensure!(
@@ -1028,7 +1092,12 @@ impl Store {
                     .filter(|i| i.1.as_ref().is_some_and(|x| added.contains(x)))
                     .for_each(|i| i.1 = None);
                 self.unopened.push(format!("{e:#}: none admitted"));
-                self.extend(list, true)?;
+                let ids: HashSet<&String> =
+                    list.iter().map(|m| &m.id).collect();
+                let stale = self.g.known.iter().any(|i| !ids.contains(i));
+                if list != self.g.list || stale {
+                    self.extend(list, true)?;
+                }
             }
         }
         // Invitations whose device the chain held: done, whatever came
@@ -1125,6 +1194,15 @@ impl Store {
             write(&self.v.join(name_of(&ct)), &ct)?;
         }
         Ok(())
+    }
+
+    /// The newest envelope, sealed again to `to` alone (any member can).
+    #[cfg(test)]
+    pub(crate) fn reseal_head(&self, to: &[String]) -> Result<()> {
+        let to: Vec<&Member> =
+            self.g.list.iter().filter(|m| to.contains(&m.id)).collect();
+        let ct = seal_to(&to, &self.g.body)?;
+        write(&self.v.join(name_of(&ct)), &ct)
     }
 
     /// Removes `who` without a new key, sealed to `to` alone.

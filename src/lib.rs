@@ -771,11 +771,14 @@ impl Store {
                     let said =
                         s.unopened.drain(..).map(|m| format!("@{label}: {m}"));
                     self.unopened.extend(said.collect::<Vec<_>>());
+                    self.waiting.retain(|d| *d != dir);
                     self.linked.push((label, s));
                 }
                 Err(e) => {
                     self.unopened.push(format!("@{label}: {e:#}"));
-                    self.waiting.push(dir);
+                    if !self.waiting.contains(&dir) {
+                        self.waiting.push(dir);
+                    }
                 }
             }
         }
@@ -935,6 +938,15 @@ impl Store {
         drop(x);
         for f in now {
             frozen.extend(Sha256::digest(self.bytes(&f)?));
+        }
+        // A list too long for a version keeps its newest digests (any key
+        // holder could fill it): the oldest history goes, no rotation.
+        if !fits(HISTORY, frozen.len()) {
+            let n = frozen.len() / 32;
+            let keep =
+                (0..n).rev().find(|k| fits(HISTORY, k * 32)).unwrap_or(0);
+            frozen.drain(..(n - keep) * 32);
+            self.unopened.push("the oldest history is no longer kept".into());
         }
         let was = std::mem::replace(&mut self.newest, recipient(new));
         self.staged = Some(Zeroizing::new(new.to_vec()));
@@ -2831,6 +2843,50 @@ mod tests {
         l.sync("alice", "carol");
         assert!(sc.put("@lab/late", b"secret\n").is_err());
         assert!(l.g(&mut sc).put("late", b"secret\n").is_err());
+    }
+
+    #[test]
+    fn copies_sealed_to_fewer_and_junk_stanzas_split_nothing() {
+        let l = Lab::new("copies", &["alice", "bob", "carol", "dave"]);
+        for w in ["bob", "carol", "dave"] {
+            l.add("alice", w);
+        }
+        // Alice removes dave; bob, a member, seals the envelope again to
+        // alice and carol alone, many times.
+        l.open("alice").group_remove("lab", "dave").unwrap();
+        l.sync("alice", "bob");
+        let mut sb = l.open("bob");
+        let ids: Vec<String> = ["alice", "carol"]
+            .iter()
+            .map(|w| l.open(w).group("lab").unwrap().member_id().unwrap())
+            .collect();
+        for _ in 0..8 {
+            l.g(&mut sb).reseal_head(&ids).unwrap();
+        }
+        l.sync("bob", "alice");
+        l.sync("bob", "carol");
+        l.sync("alice", "carol");
+        l.open("alice").put("@lab/s", b"s\n").unwrap();
+        l.sync("alice", "carol");
+        for w in ["alice", "carol"] {
+            assert!(!l.names(w).contains(&"dave".into()), "{w}");
+            assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
+        }
+        // An admin's envelope with a junk stanza for carol ahead of hers:
+        // taken by nobody.
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.sync("alice", "bob");
+        let carol = ids[1].clone();
+        let mut sb = l.open("bob");
+        let g = l.g(&mut sb);
+        g.g.junk = Some(carol);
+        g.add_puppet(&rand::<32>(), false).unwrap();
+        l.sync("bob", "alice");
+        l.sync("bob", "carol");
+        for w in ["alice", "carol"] {
+            assert_eq!(l.names(w).len(), 3, "{w}");
+        }
     }
 
     #[test]

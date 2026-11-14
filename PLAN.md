@@ -100,6 +100,14 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      open and sync (said now; an admission over the bound left out); joins
      from the window or phone never completed (their folders sync; groups
      open again after each sync); an invitation that failed stuck.
+   - Ninth review (fixed): copies of the newest envelope sealed again to
+     fewer, by any member, got it set aside (every copy kept now; one
+     sealed to all is enough); a junk stanza for one member blinded it
+     (exactly one stanza per member; each of its own tried); waiting
+     folders synced again and again; a full history list stopped every
+     rotation (the newest digests kept, said); an admission over the bound
+     wrote an empty envelope at each sync. Known: a promotion set aside by
+     a higher admin's envelope made at once is not made again.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until
