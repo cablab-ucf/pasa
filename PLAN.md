@@ -52,8 +52,9 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      outranks the device removes it (a new key): a removal by a higher
      admin is final, a device's own would not be.
    - **Bounds**: envelopes, links and requests read at most 1 MiB; each
-     link file read once. A fork's keys set aside stay readable: what was
-     written with them shows as left out (`pasa recover`).
+     link file read once, its bytes tried with each envelope's own keys.
+     A fork's keys set aside are said, not read: what was written with
+     them is to be made again.
    - **Retire notices** do not count in groups (any member could write
      one); the envelope chain says which key is newest.
    - Tests: signed add/remove; a non-admin's envelope; a removed admin's
@@ -68,6 +69,11 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      stays); a removal lost to an honest race (made again).
    - Fourth review (fixed): an admin's own leave undone from an old copy;
      links to large files stalled opens; a fork's writes lost unsaid.
+   - Fifth review (fixed): junk naming a link file poisoned its cache
+     (a removal hidden); forks' keys slowed every read; a far-off date
+     outdated every edit after (any store: a version dated over a day
+     ahead still syncs, but is never the newest); recovery missed linked
+     stores.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

@@ -296,6 +296,12 @@ struct Index {
     last: u64,
 }
 
+/// A day from now, in ms.
+fn ahead() -> u64 {
+    let now = std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis());
+    now as u64 + 86_400_000
+}
+
 fn sorted<'a>(vs: impl Iterator<Item = &'a Version>) -> Vec<Version> {
     let mut out: Vec<Version> = vs.cloned().collect();
     out.sort_by(|a, b| (a.ms, &a.name, &a.file).cmp(&(b.ms, &b.name, &b.file)));
@@ -307,7 +313,12 @@ impl Index {
         self.old.values().filter(|(_, d)| self.frozen.contains(d))
     }
 
+    /// A version dated over a day ahead is never the newest: one far-off
+    /// date (a member's, or an import's) would outdate every edit after.
     fn tip(&mut self, v: &Version) {
+        if v.ms > ahead() {
+            return;
+        }
         let t = (v.ms, v.file.clone());
         match self.tips.get_mut(&v.name) {
             Some(old) if *old >= t => {}
@@ -876,12 +887,21 @@ impl Store {
     /// Versions under a retired key that no rotation held: an offline
     /// device's edits, or a revoked one's. Never counted, never shown as
     /// entries; each may be taken back by hand ([`Store::recover`]).
+    /// Linked stores' too, as `@LABEL/NAME`.
     pub fn excluded(&self) -> Result<Vec<Version>> {
         let x = self.index()?;
         let out = x.old.values().filter(|(v, d)| {
             !x.frozen.contains(d) && !v.name.starts_with(OWN) && v.size > 0
         });
-        Ok(sorted(out.map(|(v, _)| v)))
+        let mut all = sorted(out.map(|(v, _)| v));
+        drop(x);
+        for (l, s) in &self.linked {
+            for mut v in s.excluded()? {
+                v.name = format!("@{l}/{}", v.name);
+                all.push(v);
+            }
+        }
+        Ok(all)
     }
 
     /// Takes left-out version `file` back: its body, its entry's newest
@@ -1277,6 +1297,7 @@ impl Store {
         if let Some((s, n)) = self.at(name) {
             return s.put_at(n, body, at);
         }
+        ensure!(at <= ahead(), "{name}: dated ahead of now");
         self.not_linked(name)?;
         let mut x = self.index()?;
         let named = |v: &&Version| v.name == name;
@@ -1980,7 +2001,10 @@ mod tests {
         sr.put("bank", b"forged").unwrap();
         sr.put("new", b"planted").unwrap();
         sr.put_at("mail", b"backdated", 1).unwrap();
-        sr.put_at("bank", b"ahead", u64::MAX / 4).unwrap();
+        assert!(sr.put_at("bank", b"ahead", u64::MAX / 4).is_err());
+        let mut x = sr.index().unwrap();
+        sr.keep(&mut x, "bank", b"ahead", u64::MAX / 4, "-".into()).unwrap();
+        drop(x);
         for e in fs::read_dir(crate::versions(&r)).unwrap().flatten() {
             let to = crate::versions(&a).join(e.file_name());
             let _ = fs::copy(e.path(), to);
@@ -2494,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    fn an_admins_leave_holds_and_a_lost_forks_writes_come_back() {
+    fn an_admins_leave_holds_and_a_lost_forks_writes_are_said() {
         let l = Lab::new("leave", &["alice", "bob", "carol", "dave"]);
         for w in ["bob", "carol", "dave"] {
             l.add("alice", w);
@@ -2534,25 +2558,65 @@ mod tests {
         assert_eq!(&sd.get("@lab/s").unwrap()[..], b"s\n");
         assert!(!l.names("dave").contains(&"bob".into()));
         // Carol, with a new key, writes; alice, at once, makes a change of
-        // hers that holds: carol is told, and takes her write back.
+        // hers that holds: carol is told.
         let mut sc = l.open("carol");
         l.g(&mut sc).add_puppet(&rand::<32>(), false).unwrap();
         sc.put("@lab/c", b"c\n").unwrap();
         let mut sa = l.open("alice");
         l.g(&mut sa).puppet(&rand::<32>(), false, false).unwrap();
         l.sync("alice", "carol");
-        let mut sc = l.open("carol");
+        let sc = l.open("carol");
         assert!(
             sc.unopened.iter().any(|u| u.contains("beside the one taken")),
             "{:?}",
             sc.unopened
         );
         assert!(sc.get("@lab/c").is_err());
-        let g = l.g(&mut sc);
-        let left = g.excluded().unwrap();
-        let v = left.iter().find(|v| v.name == "c").expect("left out");
-        g.recover(&v.file).unwrap();
-        assert_eq!(&sc.get("@lab/c").unwrap()[..], b"c\n");
+    }
+
+    #[test]
+    fn junk_naming_every_link_hides_no_removal() {
+        let l = Lab::new("links", &["alice", "bob", "carol"]);
+        l.add("alice", "bob");
+        l.add("alice", "carol");
+        let mut sa = l.open("alice");
+        sa.group_remove("lab", "bob").unwrap();
+        sa.put("@lab/s", b"s\n").unwrap();
+        l.sync("alice", "carol");
+        // Bob sees every file's name, and names each in junk, many times.
+        l.sync("alice", "bob");
+        let files: Vec<String> = fs::read_dir(versions(&l.lab("bob")))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        let mut sb = l.open("bob");
+        for _ in 0..4 {
+            l.g(&mut sb).junk_naming(&files).unwrap();
+        }
+        l.sync("bob", "carol");
+        l.sync("bob", "alice");
+        for w in ["alice", "carol"] {
+            assert!(!l.names(w).contains(&"bob".into()), "{w}");
+            assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
+        }
+        // Alice's next change holds for carol, without bob.
+        let mut sa = l.open("alice");
+        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
+        l.sync("alice", "carol");
+        assert!(!l.names("carol").contains(&"bob".into()));
+    }
+
+    #[test]
+    fn a_far_off_date_outdates_no_edit() {
+        let d = dir("ahead");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        assert!(s.put_at("k", b"x", u64::MAX).is_err());
+        let mut x = s.index().unwrap();
+        s.keep(&mut x, "k", b"evil", u64::MAX, "-".into()).unwrap();
+        drop(x);
+        s.put("k", b"good").unwrap();
+        assert_eq!(&s.get("k").unwrap()[..], b"good");
     }
 
     #[test]

@@ -323,12 +323,10 @@ fn envelope(pt: &[u8]) -> Option<Envelope> {
     })
 }
 
-/// The envelope `n` is built on, from the file it links, if that file
-/// holds it (under either of `n`'s two newest keys).
-fn linked(dir: &Path, n: &Envelope) -> Option<Envelope> {
-    let ct = small(&crate::versions(dir).join(&n.link))?;
-    (name_of(&ct) == n.link).then_some(())?;
-    let pt = n.keys.iter().take(2).find_map(|k| crate::open(k, &ct))?;
+/// The envelope `n` is built on, from its link's bytes `ct`, if they hold
+/// it (under either of `n`'s own two newest keys).
+fn linked(ct: &[u8], n: &Envelope) -> Option<Envelope> {
+    let pt = n.keys.iter().take(2).find_map(|k| crate::open(k, ct))?;
     let at = pt.iter().position(|&c| c == b'\n')?;
     let v = crate::Version::parse(std::str::from_utf8(&pt[..at]).ok()?, "")?;
     let body = pt.get(at + 1..)?.get(..v.size)?;
@@ -514,24 +512,24 @@ impl Store {
         // Back to the root by links: each file read once.
         let mut all: BTreeMap<String, Envelope> = BTreeMap::new();
         let mut linked_ok: HashSet<String> = HashSet::new();
-        let mut read: HashMap<String, Option<String>> = HashMap::new();
+        // A file's bytes, not what one envelope made of them: each tries
+        // them with its own keys.
+        let mut read: HashMap<String, Option<Vec<u8>>> = HashMap::new();
         while let Some(n) = found.pop() {
             if all.contains_key(&n.hash) {
                 continue;
             }
-            let held = match read.get(&n.link) {
-                Some(h) => h.clone(),
-                None if n.link.is_empty() => None,
-                None => {
-                    let p = linked(dir, &n);
-                    let h = p.as_ref().map(|p| p.hash.clone());
-                    read.insert(n.link.clone(), h.clone());
-                    found.extend(p);
-                    h
+            if !n.link.is_empty() {
+                let ct = read.entry(n.link.clone()).or_insert_with(|| {
+                    let b = small(&crate::versions(dir).join(&n.link))?;
+                    (name_of(&b) == n.link).then_some(b)
+                });
+                if let Some(p) = ct.as_deref().and_then(|ct| linked(ct, &n)) {
+                    linked_ok.insert(n.hash.clone());
+                    if !all.contains_key(&p.hash) {
+                        found.push(p);
+                    }
                 }
-            };
-            if held.is_some_and(|h| h == n.prev) {
-                linked_ok.insert(n.hash.clone());
             }
             all.insert(n.hash.clone(), n);
         }
@@ -591,16 +589,12 @@ impl Store {
         }
         let mut s =
             Store::new(dir, at.keys.clone(), Default::default(), vec![])?;
-        // Keys of forks set aside: their versions read, as left out (pasa
-        // recover takes one back); never written under.
-        let mut lost = vec![];
-        for n in
-            all.values().filter(|n| ok(n) && !path.contains(n.hash.as_str()))
-        {
-            let k = &n.keys[0];
-            if !at.keys.contains(k) && !lost.contains(k) {
-                lost.push(k.clone());
-                s.ids.push(crate::identity(k));
+        // Keys of forks set aside: what was written with them is not read.
+        let mut lost: HashSet<&[u8]> = HashSet::new();
+        let aside = |n: &&Envelope| ok(n) && !path.contains(n.hash.as_str());
+        for n in all.values().filter(aside) {
+            if !at.keys.contains(&n.keys[0]) {
+                lost.insert(&n.keys[0]);
             }
         }
         let lost = lost.len();
@@ -647,7 +641,8 @@ impl Store {
         if lost > 0 {
             s.unopened.push(format!(
                 "{lost} key(s) made beside the one taken (a higher admin's, \
-                 or one removed): a change made with one may need making again"
+                 or one removed): what was written with one is not read here; \
+                 make it again"
             ));
         }
         if !at.list.iter().any(|m| m.id == me.1) {
@@ -938,6 +933,27 @@ impl Store {
         admin: bool,
     ) -> Result<()> {
         self.puppet(seed, admin, true)
+    }
+
+    /// Junk: an envelope by a stranger for each of `links`, sealed to
+    /// every member this device knows, naming that file as its link.
+    #[cfg(test)]
+    pub(crate) fn junk_naming(&self, links: &[String]) -> Result<()> {
+        let k = Keys::of(&rand::<32>());
+        let to: Vec<&Member> = self.g.list.iter().collect();
+        for l in links {
+            let e = (self.g.epoch + 1).to_string();
+            let fields: [&[u8]; 5] = [
+                e.as_bytes(),
+                self.g.head.as_bytes(),
+                l.as_bytes(),
+                &list_bytes(&self.g.list),
+                &rand::<32>(),
+            ];
+            let ct = seal_to(&to, &signed(b"k3", &fields, &k)?)?;
+            write(&self.v.join(name_of(&ct)), &ct)?;
+        }
+        Ok(())
     }
 
     /// Removes `who` without a new key, sealed to `to` alone.
