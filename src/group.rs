@@ -1,15 +1,13 @@
 //! Group stores: no password; each device a key of its own, made where it
-//! lives and never sent. Authority runs from the group's creator (its root)
-//! down a strict order: the root, then admins in the order they were made.
-//! Admins sign member records, removals and envelopes (the store keys
-//! sealed to every member, an age file in `v/`). A device follows the chain
-//! of keys from the root, one epoch at a time, each checked against the
-//! records under the keys before it; where two compete, the higher signer's
-//! wins. PLAN.md has the design and why.
+//! lives and never sent. An envelope (an age file in `v/`: the store keys
+//! sealed to every member) carries the member list and the hash of the one
+//! before it, signed by an admin of that one: authority runs from the
+//! group's creator (its root) down this chain alone, never from files that
+//! any key holder could write. Admins rank by age; where two extend one
+//! envelope, the higher's holds; a removal voids what its subject signed
+//! outside the removal's own past. PLAN.md has the design and why.
 
-use crate::{
-    MAX, Secret, Store, Version, frame, name_of, rand, unframe, write,
-};
+use crate::{MAX, Secret, Store, frame, name_of, rand, unframe, write};
 use age_core::format::{FileKey, Stanza};
 use anyhow::{Context, Result, anyhow, ensure};
 use data_encoding::HEXLOWER;
@@ -34,17 +32,21 @@ pub const OFF: &str = "per-device groups are not on yet: their signed \
     password works";
 
 const TAG: &str = "pasa-xwing";
-const INFO: &[u8] = b"pasa group keys 2";
+const INFO: &[u8] = b"pasa group keys 3";
 /// Every signature's context: none is taken for another protocol's.
-const CTX: &[u8] = b"pasa group 2";
+const CTX: &[u8] = b"pasa group 3";
 /// What an envelope's first stanza line starts with.
 const ENVELOPE: &[u8] = b"age-encryption.org/v1\n-> pasa-xwing ";
-pub(crate) const MEMBERS: &str = ".pasa/members/";
-pub(crate) const REMOVED: &str = ".pasa/removed/";
+/// Every envelope's signed body, named by its hash, under the store key
+/// of its epoch: a device added later reads the chain from the root.
+const CHAIN: &str = ".pasa/chain/";
+/// Names this admin paired in and has not admitted: its own, never synced.
+const INVITES: &str = "invites";
 
 /// A bundle: X-Wing, Ed25519 and ML-DSA-65 public keys.
 const XPK: usize = 1216;
 const EDPK: usize = 32;
+const BUNDLE: usize = XPK + EDPK + 1952;
 
 type Sk = <XWing as Kem>::PrivateKey;
 type Pk = <XWing as Kem>::PublicKey;
@@ -62,7 +64,7 @@ struct Keys {
 }
 
 fn part(seed: &[u8], what: &[u8]) -> [u8; 32] {
-    let h = Sha256::new().chain_update(b"pasa group 2 ").chain_update(what);
+    let h = Sha256::new().chain_update(b"pasa group 3 ").chain_update(what);
     h.chain_update(seed).finalize().into()
 }
 
@@ -92,11 +94,6 @@ impl Keys {
         let b = b.map_err(|_| anyhow!("ml-dsa"))?;
         Ok([&a[..], b.encode().as_slice()].concat())
     }
-}
-
-#[cfg(test)]
-pub(crate) fn bundle_of(seed: &[u8]) -> Vec<u8> {
-    Keys::of(seed).bundle()
 }
 
 fn id_of(bundle: &[u8]) -> String {
@@ -234,104 +231,228 @@ fn seal_to(to: &[&Member], pt: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// An envelope: the chain's keys, newest first, at `epoch`, built on `prev`
-/// (the id of the key before, "" at the root's first), signed.
-struct Envelope {
-    epoch: u64,
-    prev: String,
-    keys: Vec<Secret>,
-    to: Vec<String>,
-    signer: String,
-    bundle: Vec<u8>,
+/// A name as a pairing takes it.
+fn sane(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && !n.contains(['\n', '/', ' '])
+        && !n.chars().any(char::is_control)
 }
 
-fn key_id(k: &[u8]) -> String {
-    HEXLOWER.encode(&Sha256::digest([b"pasa key ", k].concat())[..16])
-}
-
-/// An envelope sealed to `me`, its signature holding.
-fn envelope(me: &Me, ct: &[u8]) -> Option<Envelope> {
-    let d = age::Decryptor::new_buffered(ct).ok()?;
-    let mut pt = Zeroizing::new(vec![]);
-    let r = d.decrypt(std::iter::once(me as &dyn age::Identity)).ok()?;
-    r.take(MAX as u64).read_to_end(&mut pt).ok()?;
-    let (f, signer, bundle) = opened(b"k2", &pt, 4)?;
-    let epoch = text(&f[0]).parse().ok()?;
-    let keys: Vec<Secret> =
-        f[3].chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
-    (!keys.is_empty() && f[3].len() % 32 == 0).then_some(())?;
-    let to = text(&f[2]).split(',').map(String::from).collect();
-    Some(Envelope { epoch, prev: text(&f[1]), keys, to, signer, bundle })
-}
-
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Member {
     pub id: String,
     pub name: String,
     pub admin: bool,
-    /// Its sync endpoint in this group's folder, hex, or "-".
-    pub node: String,
-    /// The admin that signed its record.
+    /// The admin that added it.
     pub by: String,
-    /// The epoch its record was signed at: an admin's rank, after the root.
+    /// The epoch it joined, or (an admin) was made admin: its rank.
     since: u64,
     bundle: Vec<u8>,
 }
 
-/// Who may do what, as the records under a chain's keys say.
+fn list_bytes(ms: &[Member]) -> Vec<u8> {
+    let mut b = vec![];
+    for m in ms {
+        let since = m.since.to_string();
+        let role: &[u8] = if m.admin { b"admin" } else { b"member" };
+        for f in [m.name.as_bytes(), role, since.as_bytes(), m.by.as_bytes()] {
+            frame(&mut b, f);
+        }
+        frame(&mut b, &m.bundle);
+    }
+    b
+}
+
+fn list_of(mut b: &[u8]) -> Option<Vec<Member>> {
+    let mut ms: Vec<Member> = vec![];
+    while !b.is_empty() {
+        let mut f = || unframe(&mut b).map(<[u8]>::to_vec);
+        let (name, role, since, by, bundle) = (f()?, f()?, f()?, f()?, f()?);
+        let name = String::from_utf8(name).ok().filter(|n| sane(n))?;
+        let admin = match &role[..] {
+            b"admin" => true,
+            b"member" => false,
+            _ => return None,
+        };
+        let since = text(&since).parse().ok()?;
+        let ok =
+            bundle.len() == BUNDLE && Pk::from_bytes(&bundle[..XPK]).is_ok();
+        let id = id_of(&bundle);
+        (ok && !ms.iter().any(|m| m.id == id)).then_some(())?;
+        ms.push(Member { id, name, admin, by: text(&by), since, bundle });
+    }
+    Some(ms)
+}
+
+/// An envelope: every key, newest first, and the members at `epoch`,
+/// built on envelope `prev` ("" at the root's first), signed.
+struct Envelope {
+    epoch: u64,
+    prev: String,
+    list: Vec<Member>,
+    keys: Vec<Secret>,
+    signer: String,
+    bundle: Vec<u8>,
+    hash: String,
+}
+
+fn envelope(pt: &[u8]) -> Option<Envelope> {
+    let (f, signer, bundle) = opened(b"k3", pt, 4)?;
+    let keys: Vec<Secret> =
+        f[3].chunks(32).map(|k| Zeroizing::new(k.to_vec())).collect();
+    (!keys.is_empty() && f[3].len() % 32 == 0).then_some(())?;
+    Some(Envelope {
+        epoch: text(&f[0]).parse().ok()?,
+        prev: text(&f[1]),
+        list: list_of(&f[2])?,
+        keys,
+        signer,
+        bundle,
+        hash: HEXLOWER.encode(&Sha256::digest(pt)),
+    })
+}
+
+/// An age file's plaintext, if sealed to `me`.
+fn unsealed(me: &Me, ct: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let d = age::Decryptor::new_buffered(ct).ok()?;
+    let mut pt = Zeroizing::new(vec![]);
+    let r = d.decrypt(std::iter::once(me as &dyn age::Identity)).ok()?;
+    r.take(MAX as u64).read_to_end(&mut pt).ok()?;
+    Some(pt)
+}
+
+/// An admin's rank in `list`: lower outranks; the root first.
+fn rank(list: &[Member], root: &str, id: &str) -> Option<(u64, String)> {
+    let m = list.iter().find(|m| m.id == id && m.admin)?;
+    Some(match id == root {
+        true => (0, String::new()),
+        false => (m.since.saturating_add(1), id.into()),
+    })
+}
+
+/// The root's first envelope: the root alone.
+fn genesis(e: &Envelope, root: &str) -> bool {
+    let only = |m: &Member| {
+        m.id == root
+            && m.admin
+            && m.since == 0
+            && m.by == root
+            && m.bundle == e.bundle
+    };
+    e.epoch == 0
+        && e.prev.is_empty()
+        && e.signer == root
+        && matches!(&e.list[..], [m] if only(m))
+}
+
+/// Whether `n` may follow `p`: signed by an admin of `p`, the keys kept,
+/// every member kept as it was but for what that admin may change: one it
+/// outranks (or itself) removed or demoted, a member made admin (ranked
+/// last), devices added (never one the chain held before, in `ever`).
+fn follows(
+    p: &Envelope,
+    n: &Envelope,
+    root: &str,
+    ever: &HashSet<String>,
+) -> bool {
+    let Some(r) = rank(&p.list, root, &n.signer) else { return false };
+    let signer =
+        p.list.iter().any(|m| m.id == n.signer && m.bundle == n.bundle);
+    let keys = n.keys == p.keys || n.keys.get(1..) == Some(&p.keys[..]);
+    let may_drop = |m: &Member| {
+        m.id == n.signer || rank(&p.list, root, &m.id).is_none_or(|o| r < o)
+    };
+    let kept =
+        p.list.iter().all(|m| match n.list.iter().find(|x| x.id == m.id) {
+            None => may_drop(m),
+            Some(x) => {
+                x.name == m.name && x.by == m.by && x.bundle == m.bundle && {
+                    match (m.admin, x.admin) {
+                        (false, true) => x.since == n.epoch,
+                        (true, false) => x.since == m.since && may_drop(m),
+                        _ => x.since == m.since,
+                    }
+                }
+            }
+        });
+    let new = |x: &&Member| !p.list.iter().any(|m| m.id == x.id);
+    let added = n.list.iter().filter(new).all(|x| {
+        x.by == n.signer && x.since == n.epoch && !ever.contains(&x.id)
+    });
+    p.epoch.checked_add(1) == Some(n.epoch)
+        && n.prev == p.hash
+        && signer
+        && keys
+        && kept
+        && added
+        && n.list.iter().any(|m| m.admin)
+}
+
+/// Envelope `h` and those it is built on.
+fn past<'a>(
+    all: &'a BTreeMap<String, Envelope>,
+    mut h: &'a str,
+) -> HashSet<&'a str> {
+    let mut s = HashSet::new();
+    while let Some(e) = all.get(h) {
+        s.insert(e.hash.as_str());
+        h = &e.prev;
+    }
+    s
+}
+
+/// Those `n` removed from `p`, or demoted.
+fn dropped(p: &Envelope, n: &Envelope) -> Vec<String> {
+    let gone = |m: &&Member| match n.list.iter().find(|x| x.id == m.id) {
+        None => true,
+        Some(x) => m.admin && !x.admin,
+    };
+    p.list.iter().filter(gone).map(|m| m.id.clone()).collect()
+}
+
+/// A group store's view, from its chain.
 #[derive(Default)]
-struct Auth {
-    root: String,
-    /// Valid records, removed or not.
-    all: HashMap<String, Member>,
-    /// Removals: the epoch from which each one's signatures count for nothing.
-    removed: HashMap<String, u64>,
-}
-
-impl Auth {
-    /// An admin's rank: lower outranks. None: no admin (now, at `epoch`).
-    fn rank(&self, id: &str, epoch: u64) -> Option<(u64, String)> {
-        let m = self.all.get(id)?;
-        if self.removed.get(id).is_some_and(|&e| e <= epoch) {
-            return None;
-        }
-        match (id == self.root, m.admin) {
-            (true, _) => Some((0, String::new())),
-            (false, true) => Some((m.since + 1, id.into())),
-            _ => None,
-        }
-    }
-
-    fn members(&self) -> Vec<Member> {
-        let live = |m: &&Member| !self.removed.contains_key(&m.id);
-        self.all.values().filter(live).cloned().collect()
-    }
-}
-
-/// This device's sync endpoint for the store in `dir`, hex.
-fn own_node(dir: &Path) -> String {
-    #[cfg(feature = "sync")]
-    if let Ok(n) = crate::sync::node(dir) {
-        return n;
-    }
-    let _ = dir;
-    "-".into()
+pub(crate) struct State {
+    epoch: u64,
+    /// The newest envelope's hash.
+    head: String,
+    list: Vec<Member>,
+    /// Who has held the newest key: every member of an envelope with it.
+    known: HashSet<String>,
+    /// Every device the chain has held.
+    ever: HashSet<String>,
+    /// Members removed along the chain.
+    #[cfg_attr(not(feature = "sync"), allow(dead_code))]
+    gone: Vec<Member>,
+    /// Removed or demoted in any valid envelope: no admin, wherever listed.
+    voided: HashSet<String>,
+    /// Members asking to leave.
+    leaves: Vec<String>,
 }
 
 impl Store {
     /// A new group store in `dir`, this device its root, `name`.
     pub fn create_group(dir: &Path, name: &str) -> Result<Store> {
         ensure!(ON, OFF);
+        ensure!(sane(name), "{name}: a bad name");
         let fresh = !["key", "member"].iter().any(|f| dir.join(f).exists());
         ensure!(fresh, "{} holds a store", dir.display());
         let keys = vec![Zeroizing::new(rand::<32>().to_vec())];
         let mut s = Store::new(dir, keys, Default::default(), vec![])?;
         let seed = Zeroizing::new(rand::<32>().to_vec());
-        s.root = Some(Keys::of(&seed).id());
-        s.member = Some(seed);
-        let me = s.keys_mine()?;
-        s.record(&me.bundle(), name, true, &own_node(dir))?;
-        s.seal_keys()?;
+        let k = Keys::of(&seed);
+        let id = k.id();
+        (s.root, s.member) = (Some(id.clone()), Some(seed));
+        let me = Member {
+            id: id.clone(),
+            name: name.into(),
+            admin: true,
+            by: id,
+            since: 0,
+            bundle: k.bundle(),
+        };
+        s.seal_envelope(0, String::new(), vec![me])?;
         Ok(s)
     }
 
@@ -350,9 +471,9 @@ impl Store {
     }
 
     /// The group store in `dir`, by this device's seed and the root it
-    /// joined: the chain of keys from the root's first, each envelope signed
-    /// by an admin of the records under the keys before it; at each epoch
-    /// the highest signer's.
+    /// joined: every envelope sealed to it, checked from the root's first;
+    /// removals applied, highest remover first; then the chain followed,
+    /// the highest admin's at each step.
     pub(crate) fn open_member(
         dir: &Path,
         seed: &[u8],
@@ -360,377 +481,376 @@ impl Store {
     ) -> Result<Store> {
         let k = Keys::of(seed);
         let me = Me(&k.x.0, k.id());
-        let mut all: Vec<Envelope> = vec![];
+        let mut all: BTreeMap<String, Envelope> = BTreeMap::new();
+        let mut asks = vec![];
         for e in fs::read_dir(crate::versions(dir))?.flatten() {
-            let Ok(b) = fs::read(e.path()) else { continue };
+            let Ok(f) = fs::File::open(e.path()) else { continue };
+            let mut b = vec![];
+            let _ = f.take(MAX as u64).read_to_end(&mut b);
             // Its own name, as every version: none in another's place.
             if e.file_name().to_str() != Some(&name_of(&b)) || !is_envelope(&b)
             {
                 continue;
             }
-            all.extend(envelope(&me, &b));
+            let Some(pt) = unsealed(&me, &b) else { continue };
+            if let Some(n) = envelope(&pt) {
+                all.insert(n.hash.clone(), n);
+            } else if let Some((f, id, bundle)) = opened(b"l3", &pt, 1) {
+                (f[0] == root.as_bytes()).then(|| asks.push((id, bundle)));
+            }
         }
-        let first = |e: &&Envelope| {
-            e.epoch == 0 && e.prev.is_empty() && e.signer == root
-        };
-        let mut at = all
-            .iter()
-            .filter(first)
-            .min_by(|a, b| a.keys[0][..].cmp(&b.keys[0][..]));
-        ensure!(
-            at.is_some(),
-            "no keys here for this device yet: sync, once an admin has added it"
-        );
+        // The bodies under any key these hold: all of the chain, for a
+        // device added since; every version, each one its name's hash.
         let mut keys: Vec<Secret> = vec![];
-        let mut s = None;
-        let mut lost = 0;
-        while let Some(e) = at {
-            keys.insert(0, e.keys[0].clone());
-            let mut st =
-                Store::new(dir, keys.clone(), Default::default(), vec![])?;
-            (st.member, st.root, st.epoch) = (
-                Some(Zeroizing::new(seed.to_vec())),
-                Some(root.into()),
-                e.epoch,
-            );
-            let auth = st.auth()?;
-            let ours =
-                |c: &&Envelope| c.keys[0] == e.keys[0] && c.epoch == e.epoch;
-            st.sealed_to =
-                all.iter().filter(ours).flat_map(|c| c.to.clone()).collect();
-            // The next: built on this key, by an admin of these records,
-            // the highest; the lowest key between equals.
-            let prev = key_id(&e.keys[0]);
-            let next: Vec<&Envelope> = all
-                .iter()
-                .filter(|c| c.epoch == e.epoch + 1 && c.prev == prev)
-                .collect();
-            let them: HashSet<&[u8]> =
-                next.iter().map(|c| &c.keys[0][..]).collect();
-            lost += them.len().saturating_sub(1);
-            let ranked: Vec<(&Envelope, (u64, String))> = next
-                .into_iter()
-                .filter_map(|c| Some((c, auth.rank(&c.signer, c.epoch)?)))
-                .filter(|(c, _)| {
-                    auth.all
-                        .get(&c.signer)
-                        .is_some_and(|m| m.bundle == c.bundle)
-                })
-                .collect();
-            at = ranked
-                .into_iter()
-                .min_by(|a, b| {
-                    a.1.cmp(&b.1).then(a.0.keys[0][..].cmp(&b.0.keys[0][..]))
-                })
-                .map(|r| r.0);
-            s = Some(st);
+        for k in all.values().flat_map(|e| &e.keys) {
+            if !keys.contains(k) {
+                keys.push(k.clone());
+            }
         }
-        let mut s = s.context("no keys")?;
+        if !keys.is_empty() {
+            let s = Store::new(dir, keys, Default::default(), vec![])?;
+            for v in s.versions_here()? {
+                let Some(h) = v.name.strip_prefix(CHAIN) else { continue };
+                let Ok(b) = s.body(&v) else { continue };
+                if HEXLOWER.encode(&Sha256::digest(&b)) == h {
+                    envelope(&b).map(|n| all.insert(n.hash.clone(), n));
+                }
+            }
+        }
+        // Valid: the root's first, then each by an admin of the one before.
+        let mut order: Vec<&Envelope> = all.values().collect();
+        order.sort_by_key(|e| e.epoch);
+        let mut ever: HashMap<&str, HashSet<String>> = HashMap::new();
+        for n in order {
+            let p = all.get(&n.prev);
+            let ok = match p.and_then(|p| Some((p, ever.get(p.hash.as_str())?)))
+            {
+                Some((p, ev)) => follows(p, n, root, ev),
+                None => genesis(n, root),
+            };
+            if ok {
+                let mut ev = p
+                    .and_then(|p| ever.get(p.hash.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                ev.extend(n.list.iter().map(|m| m.id.clone()));
+                ever.insert(&n.hash, ev);
+            }
+        }
+        // Removals, the highest remover's first: what a removed device
+        // signed outside the removal's past counts for nothing (a fork it
+        // made, before or after); a removal so voided, nothing either.
+        let mut cuts: Vec<((u64, String), &str, Vec<String>)> = ever
+            .keys()
+            .filter_map(|h| {
+                let n = &all[*h];
+                let p = all.get(&n.prev)?;
+                Some((rank(&p.list, root, &n.signer)?, *h, dropped(p, n)))
+            })
+            .filter(|c| !c.2.is_empty())
+            .collect();
+        cuts.sort();
+        let mut void: HashSet<&str> = HashSet::new();
+        let mut voided = HashSet::new();
+        for (_, h, out) in &cuts {
+            let mine = past(&all, h);
+            if mine.iter().any(|a| void.contains(a)) {
+                continue;
+            }
+            for x in ever.keys() {
+                if out.contains(&all[*x].signer) && !mine.contains(x) {
+                    void.insert(x);
+                }
+            }
+            voided.extend(out.iter().cloned());
+        }
+        let alive = |h: &str| ever.contains_key(h) && !void.contains(h);
+        let mut at = all
+            .values()
+            .filter(|e| e.epoch == 0 && alive(&e.hash))
+            .min_by(|a, b| a.hash.cmp(&b.hash))
+            .context(
+                "no keys here for this device yet: sync, once an admin has \
+                 added it",
+            )?;
+        let (mut lost, mut held) = (0, vec![]);
+        loop {
+            held.extend(at.list.iter().cloned());
+            let kids: Vec<&Envelope> = all
+                .values()
+                .filter(|n| n.prev == at.hash && ever.contains_key(&*n.hash))
+                .collect();
+            let best = kids
+                .iter()
+                .filter(|n| alive(&n.hash))
+                .min_by_key(|n| (rank(&at.list, root, &n.signer), &n.hash));
+            let Some(&n) = best else { break };
+            lost += kids.iter().filter(|c| c.keys[0] != n.keys[0]).count();
+            at = n;
+        }
+        let mut s =
+            Store::new(dir, at.keys.clone(), Default::default(), vec![])?;
+        (s.member, s.root) =
+            (Some(Zeroizing::new(seed.to_vec())), Some(root.into()));
+        let ids = |e: &Envelope| {
+            e.list.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+        };
+        let has = |e: &&Envelope| e.keys.iter().any(|x| *x == at.keys[0]);
+        let mut gone: Vec<Member> = vec![];
+        for m in held {
+            if !at.list.iter().any(|x| x.id == m.id) && !gone.contains(&m) {
+                gone.push(m);
+            }
+        }
+        let member =
+            |id: &String| at.list.iter().any(|m| m.id == *id && !m.admin);
+        s.g = State {
+            epoch: at.epoch,
+            head: at.hash.clone(),
+            list: at.list.clone(),
+            known: all.values().filter(has).flat_map(ids).collect(),
+            ever: ever[at.hash.as_str()].clone(),
+            gone,
+            voided,
+            leaves: asks
+                .into_iter()
+                .filter(|(id, b)| {
+                    member(id) && at.list.iter().any(|m| m.bundle == *b)
+                })
+                .map(|a| a.0)
+                .collect(),
+        };
         if lost > 0 {
             s.unopened.push(format!(
                 "{lost} key(s) made beside the one taken (a higher admin's, \
                  or one removed): a change made with one may need making again"
             ));
         }
+        if !at.list.iter().any(|m| m.id == me.1) {
+            s.unopened.push("this device is no member of it now".into());
+        }
         Ok(s)
     }
 
-    /// Records under this store's keys (its own and its frozen history),
-    /// the newest of each, held to the order from the root.
-    fn auth(&self) -> Result<Auth> {
-        let root = self.root.clone().context("not a group store")?;
-        let mut newest: BTreeMap<String, Version> = BTreeMap::new();
-        for v in self.versions_here()? {
-            if (v.name.starts_with(MEMBERS) || v.name.starts_with(REMOVED))
-                && v.size > 0
-            {
-                newest.insert(v.name.clone(), v);
-            }
-        }
-        let mut members = vec![];
-        let mut removals = vec![];
-        for (n, v) in &newest {
-            let Ok(b) = self.body(v) else { continue };
-            if let Some(id) = n.strip_prefix(MEMBERS) {
-                let Some((f, signer, sb)) = opened(b"m2", &b, 5) else {
-                    continue;
-                };
-                let m = Member {
-                    id: id.into(),
-                    name: text(&f[0]),
-                    admin: f[1] == b"admin",
-                    since: text(&f[2]).parse().unwrap_or(u64::MAX),
-                    node: text(&f[3]),
-                    by: signer,
-                    bundle: f[4].clone(),
-                };
-                if id_of(&m.bundle) == id
-                    && Pk::from_bytes(&m.bundle[..XPK.min(m.bundle.len())])
-                        .is_ok()
-                {
-                    members.push((m, sb));
-                }
-            } else if let Some(id) = n.strip_prefix(REMOVED) {
-                let Some((f, signer, sb)) = opened(b"r2", &b, 1) else {
-                    continue;
-                };
-                let Ok(e) = text(&f[0]).parse::<u64>() else { continue };
-                removals.push((id.to_string(), e, signer, sb));
-            }
-        }
-        // To a fixed point: records valid by valid admins; removals by those
-        // who outrank their subject (or by it, leaving); repeat as removals
-        // void the signatures of those removed.
-        let mut a = Auth { root: root.clone(), ..Default::default() };
-        for _ in 0..16 {
-            let mut all: HashMap<String, Member> = HashMap::new();
-            let self_signed = members
-                .iter()
-                .find(|(m, _)| m.id == root && m.by == root && m.admin);
-            if let Some((m, _)) = self_signed {
-                all.insert(root.clone(), m.clone());
-            }
-            loop {
-                let before = all.len();
-                for (m, sb) in &members {
-                    if all.contains_key(&m.id) {
-                        continue;
-                    }
-                    let a2 = Auth {
-                        root: root.clone(),
-                        all: all.clone(),
-                        removed: a.removed.clone(),
-                    };
-                    let by = a2.rank(&m.by, m.since).and(all.get(&m.by));
-                    if by.is_some_and(|s| s.bundle == *sb) {
-                        all.insert(m.id.clone(), m.clone());
-                    }
-                }
-                if all.len() == before {
-                    break;
-                }
-            }
-            let a2 = Auth {
-                root: root.clone(),
-                all: all.clone(),
-                removed: a.removed.clone(),
-            };
-            let mut removed = HashMap::new();
-            for (id, e, signer, sb) in &removals {
-                let Some(s) = all.get(signer).filter(|s| s.bundle == *sb)
-                else {
-                    continue;
-                };
-                let outranks = match (a2.rank(signer, *e), a2.rank(id, *e)) {
-                    (Some(r), Some(o)) => r < o,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if (outranks || signer == id)
-                    && all.contains_key(id)
-                    && s.id == *signer
-                {
-                    let at = removed.entry(id.clone()).or_insert(*e);
-                    *at = (*at).min(*e);
-                }
-            }
-            let done = removed == a.removed && all.len() == a.all.len();
-            (a.all, a.removed) = (all, removed);
-            if done {
-                break;
-            }
-        }
-        Ok(a)
+    /// Members, the root and admins by rank first.
+    pub fn members(&self) -> Result<Vec<Member>> {
+        let mut m = self.g.list.clone();
+        m.sort_by(|a, b| {
+            (!a.admin, a.since, &a.name).cmp(&(!b.admin, b.since, &b.name))
+        });
+        Ok(m)
     }
 
-    /// Members, valid and not removed.
-    pub fn members(&self) -> Result<Vec<Member>> {
-        let mut m = self.auth()?.members();
-        m.sort_by(|a, b| (a.since, &a.name).cmp(&(b.since, &b.name)));
-        Ok(m)
+    fn rank_of(&self, id: &str) -> Option<(u64, String)> {
+        let root = self.root.as_deref()?;
+        rank(&self.g.list, root, id).filter(|_| !self.g.voided.contains(id))
     }
 
     /// Whether this device may change membership.
     pub fn is_admin(&self) -> bool {
-        let (Some(me), Ok(a)) = (self.member_id(), self.auth()) else {
-            return false;
-        };
-        a.rank(&me, self.epoch).is_some()
+        self.member_id().is_some_and(|me| self.rank_of(&me).is_some())
     }
 
-    pub(crate) fn record(
-        &self,
-        bundle: &[u8],
-        name: &str,
-        admin: bool,
-        node: &str,
+    /// Whether this device may remove or demote `id`.
+    fn outranks(&self, id: &str) -> bool {
+        let me = self.member_id().and_then(|me| self.rank_of(&me));
+        me.is_some_and(|r| self.rank_of(id).is_none_or(|o| r < o))
+    }
+
+    /// The next envelope, with `list`: under a new key if a device not in
+    /// it held the newest (unless this one leaves: then the next admin's).
+    fn extend(&mut self, list: Vec<Member>, rotate: bool) -> Result<()> {
+        let ids: HashSet<&String> = list.iter().map(|m| &m.id).collect();
+        if rotate && self.g.known.iter().any(|i| !ids.contains(i)) {
+            self.rotate()?;
+            self.g.known.clear();
+        }
+        let epoch = self.g.epoch.checked_add(1).context("no epoch after")?;
+        self.seal_envelope(epoch, self.g.head.clone(), list)
+    }
+
+    fn seal_envelope(
+        &mut self,
+        epoch: u64,
+        prev: String,
+        list: Vec<Member>,
     ) -> Result<()> {
-        let bad = [name, node].iter().any(|f| f.chars().any(char::is_control));
-        ensure!(!bad && !name.trim().is_empty(), "a bad name");
-        let role: &[u8] = if admin { b"admin" } else { b"member" };
-        let epoch = self.epoch.to_string();
-        let b = signed(
-            b"m2",
-            &[name.as_bytes(), role, epoch.as_bytes(), node.as_bytes(), bundle],
-            &self.keys_mine()?,
-        )?;
-        self.put(&format!("{MEMBERS}{}", id_of(bundle)), &b)
-    }
-
-    /// An envelope of every key to every member, signed by this admin.
-    fn seal_keys(&mut self) -> Result<()> {
-        let ms = self.members()?;
-        let to: Vec<&Member> = ms.iter().collect();
-        let ids: Vec<String> = ms.iter().map(|m| m.id.clone()).collect();
-        let prev = self.keys.get(1).map(|k| key_id(k)).unwrap_or_default();
-        let keys: Vec<u8> = self.keys.iter().flat_map(|k| k.to_vec()).collect();
-        let epoch = self.epoch.to_string();
+        let keys: Zeroizing<Vec<u8>> = Zeroizing::new(
+            self.keys.iter().flat_map(|k| k.iter().copied()).collect(),
+        );
+        let e = epoch.to_string();
         let pt = Zeroizing::new(signed(
-            b"k2",
-            &[
-                epoch.as_bytes(),
-                prev.as_bytes(),
-                ids.join(",").as_bytes(),
-                &keys,
-            ],
+            b"k3",
+            &[e.as_bytes(), prev.as_bytes(), &list_bytes(&list), &keys],
             &self.keys_mine()?,
         )?);
-        let ct = seal_to(&to, &pt)?;
+        let ct = seal_to(&list.iter().collect::<Vec<_>>(), &pt)?;
         write(&self.v.join(name_of(&ct)), &ct)?;
-        self.sealed_to = ids;
+        let h = HEXLOWER.encode(&Sha256::digest(&pt));
+        self.put(&format!("{CHAIN}{h}"), &pt)?;
+        let ids = list.iter().map(|m| m.id.clone());
+        self.g.ever.extend(ids.clone());
+        self.g.known.extend(ids);
+        (self.g.epoch, self.g.head, self.g.list) = (epoch, h, list);
         Ok(())
     }
 
-    /// Admits the device whose request pairing secret `psk` opens, named
-    /// `name`, if not removed. Its id.
-    fn admit(
-        &mut self,
-        name: &str,
-        bundle: &[u8],
-        node: &str,
-    ) -> Result<String> {
-        let id = id_of(bundle);
-        let a = self.auth()?;
-        ensure!(
-            !a.removed.contains_key(&id),
-            "{name}: removed from this group"
-        );
-        if !a.all.contains_key(&id) {
-            self.record(bundle, name, false, node)?;
-        }
-        Ok(id)
-    }
-
-    /// For pairing a device in: the group's root, if this device is an admin
-    /// (an admin signs the record of the device it pairs, once it asks).
-    pub fn invite(&self) -> Result<String> {
+    /// For pairing device `name` in: the group's root. Its request is
+    /// admitted once, at this admin's next open.
+    pub fn invite(&self, name: &str) -> Result<String> {
         ensure!(ON, OFF);
         ensure!(self.is_admin(), "only an admin adds devices");
+        ensure!(sane(name), "{name}: a bad name");
+        let mut i = self.invites();
+        i.retain(|n| n != name);
+        i.push(name.into());
+        write(&self.dir.join(INVITES), i.join("\n").as_bytes())?;
         Ok(self.root().context("not a group store")?.into())
     }
 
-    /// Makes member `who` an admin, ranked after this one.
+    fn invites(&self) -> Vec<String> {
+        let f = fs::read_to_string(self.dir.join(INVITES)).unwrap_or_default();
+        f.lines().filter(|l| !l.is_empty()).map(String::from).collect()
+    }
+
+    /// Makes member `who` an admin, ranked after every admin now.
     pub fn promote(&mut self, who: &str) -> Result<()> {
-        let m = self.one(who)?;
         ensure!(ON, OFF);
         ensure!(self.is_admin(), "only an admin makes admins");
-        self.record(&m.bundle, &m.name, true, &m.node)
+        let m = self.one(who)?;
+        ensure!(!m.admin, "{}: an admin already", m.name);
+        let next = self.g.epoch + 1;
+        let mut list = self.g.list.clone();
+        list.iter_mut().filter(|x| x.id == m.id).for_each(|x| {
+            (x.admin, x.since) = (true, next);
+        });
+        self.extend(list, true)
     }
 
     fn one(&self, who: &str) -> Result<Member> {
-        let ms = self.members()?;
-        let m: Vec<&Member> =
-            ms.iter().filter(|m| m.id == who || m.name == who).collect();
+        let m: Vec<&Member> = self
+            .g
+            .list
+            .iter()
+            .filter(|m| m.id == who || m.name == who)
+            .collect();
         ensure!(m.len() == 1, "{who}: no such member, or several");
         Ok(m[0].clone())
     }
 
-    /// Removes member `who` (its id, or its name) and rotates: the new key
-    /// is sealed to the rest alone. Its id.
+    /// Removes member `who` (its id, or its name): a new key, sealed to
+    /// the rest alone. Its id.
     pub fn remove_member(&mut self, who: &str) -> Result<String> {
         let m = self.one(who)?;
         let me = self.member_id().context("not a group store")?;
         ensure!(m.id != me, "this device: leave by unlinking");
-        let a = self.auth()?;
-        let next = self.epoch + 1;
-        let outranks = match (a.rank(&me, next), a.rank(&m.id, next)) {
-            (Some(r), Some(o)) => r < o,
-            (Some(_), None) => true,
-            _ => false,
-        };
-        ensure!(outranks, "{}: only an admin above it removes it", m.name);
-        self.removal(&m.id, next)?;
-        self.rotate_members()?;
-        self.forget_removed()?;
+        ensure!(
+            self.outranks(&m.id),
+            "{}: only an admin above it removes it",
+            m.name
+        );
+        let list =
+            self.g.list.iter().filter(|x| x.id != m.id).cloned().collect();
+        self.extend(list, true)?;
         Ok(m.id)
     }
 
-    fn removal(&self, id: &str, epoch: u64) -> Result<()> {
-        let e = epoch.to_string();
-        let b = signed(b"r2", &[e.as_bytes()], &self.keys_mine()?)?;
-        self.put(&format!("{REMOVED}{id}"), &b)
-    }
-
-    /// This device leaves: its removal, signed by itself; an admin's next
-    /// open rotates the key past it.
-    pub(crate) fn leave(&self) -> Result<()> {
+    /// This device leaves. An admin: an envelope without it, the key kept
+    /// (another admin's next open makes a new one); a member: its signed
+    /// request, sealed to the admins.
+    pub(crate) fn leave(&mut self) -> Result<()> {
         let me = self.member_id().context("not a group store")?;
-        let a = self.auth()?;
-        let others = a
-            .members()
-            .iter()
-            .any(|m| m.id != me && a.rank(&m.id, self.epoch + 1).is_some());
-        ensure!(
-            self.root() != Some(&me) || others,
-            "the group's root leaves once another member is an admin"
-        );
-        self.removal(&me, self.epoch + 1)
-    }
-
-    /// A new key at the next epoch, sealed to the members.
-    pub(crate) fn rotate_members(&mut self) -> Result<()> {
-        self.rotate()?;
-        self.epoch += 1;
-        self.seal_keys()
-    }
-
-    /// An admin's work after a sync: requests admitted, a member removed
-    /// while the newest key is sealed to it rotated past, members since
-    /// sealed to. Nothing on a device no admin, or removed.
-    pub(crate) fn settle(&mut self) -> Result<()> {
-        if self.retired() || !self.is_admin() {
-            return self.forget_removed();
+        if self.is_admin() {
+            let others = self
+                .g
+                .list
+                .iter()
+                .any(|m| m.id != me && self.rank_of(&m.id).is_some());
+            ensure!(others, "the last admin leaves once another is one");
+            let list =
+                self.g.list.iter().filter(|m| m.id != me).cloned().collect();
+            return self.extend(list, false);
         }
-        let mut added = false;
-        for (name, bundle, node) in self.requests()? {
-            if let Ok(id) = self.admit(&name, &bundle, &node) {
-                added |= !self.sealed_to.contains(&id);
+        let root = self.root().context("not a group store")?;
+        let pt = Zeroizing::new(signed(
+            b"l3",
+            &[root.as_bytes()],
+            &self.keys_mine()?,
+        )?);
+        let admins: Vec<&Member> =
+            self.g.list.iter().filter(|m| m.admin).collect();
+        let ct = seal_to(&admins, &pt)?;
+        write(&self.v.join(name_of(&ct)), &ct)
+    }
+
+    /// An admin's work after a sync: requests admitted, leaving members
+    /// and voided ones it outranks removed, a key held by one not a member
+    /// replaced. Nothing on a device no admin.
+    pub(crate) fn settle(&mut self) -> Result<()> {
+        if !self.is_admin() {
+            return Ok(());
+        }
+        let me = self.member_id().context("not a group store")?;
+        let mut list: Vec<Member> = self.g.list.clone();
+        list.retain(|m| {
+            let leaves = self.g.leaves.contains(&m.id) && !m.admin;
+            let voided = self.g.voided.contains(&m.id) && self.outranks(&m.id);
+            m.id == me || !(leaves || voided)
+        });
+        for (name, bundle) in self.requests()? {
+            let id = id_of(&bundle);
+            if !self.g.ever.contains(&id)
+                && !list.iter().any(|m| m.name == name)
+            {
+                let since = self.g.epoch + 1;
+                let by = me.clone();
+                list.push(Member { id, name, admin: false, by, since, bundle });
             }
         }
-        let ids: HashSet<String> =
-            self.members()?.into_iter().map(|m| m.id).collect();
-        if self.sealed_to.iter().any(|i| !ids.contains(i)) {
-            self.rotate_members()?;
-        } else if added || ids.iter().any(|i| !self.sealed_to.contains(i)) {
-            self.seal_keys()?;
+        let ids: HashSet<&String> = list.iter().map(|m| &m.id).collect();
+        if list != self.g.list || self.g.known.iter().any(|i| !ids.contains(i))
+        {
+            self.extend(list, true)?;
         }
-        self.forget_removed()
+        // Invitations taken, and pairings with devices gone, forgotten.
+        let mut i = self.invites();
+        let done =
+            |n: &String| self.g.list.iter().any(|m| m.by == me && m.name == *n);
+        if i.iter().any(done) {
+            i.retain(|n| !done(n));
+            write(&self.dir.join(INVITES), i.join("\n").as_bytes())?;
+        }
+        #[cfg(feature = "sync")]
+        for m in &self.g.gone {
+            let held = self.g.list.iter().any(|x| x.name == m.name);
+            if m.by == me && !held && !i.contains(&m.name) {
+                let _ = crate::sync::forget(&self.dir, &m.name);
+            }
+        }
+        Ok(())
     }
 
-    /// Requests in `v/` from devices this one paired: a bundle and a node,
-    /// sealed to the pairing's secret, which only the two hold.
-    fn requests(&self) -> Result<Vec<(String, Vec<u8>, String)>> {
+    /// Requests in `v/` from devices invited and not yet admitted, sealed
+    /// to their pairing's secret, which only the two hold: name, bundle.
+    fn requests(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        #[cfg(not(feature = "sync"))]
+        return Ok(vec![]);
         #[cfg(feature = "sync")]
         {
-            let peers = crate::sync::peers(&self.dir);
+            let mut out = vec![];
+            let invited = self.invites();
+            let peers: Vec<crate::sync::Peer> = crate::sync::peers(&self.dir)
+                .into_iter()
+                .filter(|p| invited.contains(&p.name))
+                .collect();
             if peers.is_empty() {
-                return Ok(vec![]);
+                return Ok(out);
             }
             let x = self.index()?;
             let known: HashSet<String> =
                 x.heads.keys().chain(x.old.keys()).cloned().collect();
             drop(x);
-            let mut out = vec![];
+            let root = self.root().context("not a group store")?.as_bytes();
             for e in fs::read_dir(&self.v)?.flatten() {
                 let f = e.file_name().to_string_lossy().into_owned();
                 if known.contains(&f) || !crate::is_name(&f) {
@@ -743,53 +863,51 @@ impl Store {
                 for p in &peers {
                     let Some(pt) = crate::open(&p.psk, &b) else { continue };
                     let mut at = &pt[..];
-                    let (Some(kind), Some(bundle), Some(node)) =
+                    // Padded: what follows the frames is nothing.
+                    let (Some(b"j3"), Some(r), Some(bundle)) =
                         (unframe(&mut at), unframe(&mut at), unframe(&mut at))
                     else {
                         continue;
                     };
-                    if kind == b"j2" {
-                        out.push((p.name.clone(), bundle.to_vec(), text(node)));
+                    let ok = bundle.len() == BUNDLE
+                        && Pk::from_bytes(&bundle[..XPK]).is_ok();
+                    if r == root && ok {
+                        out.push((p.name.clone(), bundle.to_vec()));
                     }
                 }
             }
-            return Ok(out);
+            Ok(out)
         }
-        #[allow(unreachable_code)]
-        Ok(vec![])
     }
 
-    /// No pairing here with a removed member's device: it fetched sealed
-    /// files and could fill the disk; it now reaches nobody of the group.
-    fn forget_removed(&self) -> Result<()> {
-        #[cfg(feature = "sync")]
-        {
-            let a = self.auth()?;
-            let held: HashSet<String> =
-                a.members().into_iter().map(|m| m.node).collect();
-            let mine = own_node(&self.dir);
-            for id in a.removed.keys() {
-                let Some(m) = a.all.get(id) else { continue };
-                if m.node != "-" && m.node != mine && !held.contains(&m.node) {
-                    crate::sync::forget_node(&self.dir, &m.node)?;
-                }
-            }
-        }
-        Ok(())
+    #[cfg(test)]
+    pub(crate) fn add_puppet(
+        &mut self,
+        seed: &[u8],
+        admin: bool,
+    ) -> Result<()> {
+        let k = Keys::of(seed);
+        self.rotate()?;
+        self.g.known.clear();
+        let mut list = self.g.list.clone();
+        list.push(Member {
+            id: k.id(),
+            name: format!("puppet{}", list.len()),
+            admin,
+            by: self.member_id().context("no member")?,
+            since: self.g.epoch + 1,
+            bundle: k.bundle(),
+        });
+        self.extend(list, true)
     }
 }
 
-/// A device's request to join, sealed to the pairing secret `psk`: its
-/// bundle and node, for the admin that paired it to sign.
-pub(crate) fn request(seed: &[u8], psk: &[u8], node: &str) -> Result<Vec<u8>> {
+/// A device's request to join group `root`, sealed to the pairing secret
+/// `psk`: its public keys, for the admin that paired it to admit.
+pub(crate) fn request(seed: &[u8], psk: &[u8], root: &str) -> Result<Vec<u8>> {
     let mut b = vec![];
-    frame(&mut b, b"j2");
+    frame(&mut b, b"j3");
+    frame(&mut b, root.as_bytes());
     frame(&mut b, &Keys::of(seed).bundle());
-    frame(&mut b, node.as_bytes());
     crate::seal(psk, &b)
-}
-
-/// The device's node, for a request.
-pub(crate) fn node_of(dir: &Path) -> String {
-    own_node(dir)
 }

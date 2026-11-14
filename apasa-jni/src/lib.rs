@@ -872,7 +872,7 @@ pub extern "system" fn Java_com_apasa_Native_groupAdd<'l>(
                 .get_mut(&h)
                 .context("locked")?
                 .group(&label.to_string())?;
-            let root = g.invite()?;
+            let root = g.invite(&device)?;
             sync::offer_group(&g.dir, &device, &root)?
         };
         let code = match pw {

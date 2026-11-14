@@ -2517,7 +2517,7 @@ impl App {
         qr: bool,
     ) -> Result<()> {
         let g = v.s.group(label)?;
-        let root = g.invite()?;
+        let root = g.invite(name)?;
         let (dir, got) =
             (g.dir.clone(), sync::offer_group(&g.dir, name, &root)?);
         let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));

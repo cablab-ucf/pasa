@@ -1304,7 +1304,7 @@ async fn sync(a: &[&str]) -> Result<()> {
         ["group", "add", l, name, ..] => {
             let mut s = open()?;
             let g = s.group(l)?;
-            let root = g.invite()?;
+            let root = g.invite(name)?;
             let (d, got) =
                 (g.dir.clone(), sync::offer_group(&g.dir, name, &root)?);
             drop(s);
