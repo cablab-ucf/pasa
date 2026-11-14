@@ -19,18 +19,32 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
 
 ## Groups, before they are on
 
-3. **Admin-signed membership**, the fix for the removed-member fork and
-   the invitations it made (review 2026-11-14, open, critical):
-   - Each member: X-Wing key (to read) and a signing key, Ed25519 with
-     ML-DSA-65 (`ml-dsa`, RustCrypto), both must verify.
-   - Admins: the creator, and members it makes admin. Member records and
-     envelopes count only signed by an admin current in the signer's
-     chain; a removed admin's signature, or one on a key not built on the
-     receiver's, counts for nothing.
-   - Removing a member removes those it added and has not seen claimed.
-   - A key fork between admins is said, never merged on its own.
-   - Then: an adversarial review again (the fork race, puppets, invite
-     cascade, replay of old envelopes), tests for each, and `ON = true`.
+3. **Admin-signed membership** (review 2026-11-14, open, critical: a
+   removed member races a key fork back in; invitations it made outlive
+   it). Design:
+   - **Keys**: each device, per group, one seed it makes itself, never
+     sent: X-Wing (to open envelopes), Ed25519 and ML-DSA-65 (to sign;
+     both must verify). Its id: SHA-256 of the three public keys.
+   - **Root**: the creator. The group's id is the root's id; joining pins
+     it (sealed in `member`). Authority runs from it alone.
+   - **Records** (`.pasa/members/ID`, `.pasa/removed/ID`): signed by an
+     admin; an admin is the root, or one an admin's record names admin.
+     Every record and envelope carries an epoch (the envelope count). A
+     removal at epoch e voids its subject's signatures at e and after; a
+     member may remove itself (leave).
+   - **Envelopes**: the keys, sealed to each member (X-Wing), with epoch,
+     the key before, and an admin's signature over all of it. A device
+     takes a new key only from a valid admin's envelope built on a key it
+     holds. Non-admins never make keys.
+   - **Joining**: no key is handed. The joiner makes its seed, then puts
+     its public keys in `v/`, sealed with the pairing secret (scrypt
+     passphrase), which only it and the admin that paired it hold; that
+     admin signs its record and seals the keys to it.
+   - **Forks**: two valid admins at once merge to what neither removed. A
+     removed admin's race is bounded to the time before a member hears of
+     the removal; a removed non-admin has nothing to race with.
+   - Then: an adversarial review again (fork races, puppet records,
+     replayed envelopes, epochs, joins), a test for each, then `ON = true`.
 4. **Two removals at once**: said today; with admins, resolved by one
    admin removing again.
 
