@@ -184,6 +184,8 @@ pasa group ls lab               # members
 pasa group rm lab bob           # bob gets nothing written since
 ```
 
+The window and the phone do the same in Devices, Group stores.
+
 A device takes a new key only if it holds the one before: a removed
 member, who never had it, cannot make one others take. Removals are never
 undone, so two at once merge to what neither removed. What a removed

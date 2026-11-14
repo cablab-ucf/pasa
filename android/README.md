@@ -6,6 +6,10 @@ same Rust (`apasa-jni`).
 
 - Several stores side by side, one per person or purpose: Store, on the
   lock screen.
+- Group stores open with the store, one unlock: @NAME/... beside its
+  entries. Devices, Group stores: make one, join one (a code or a QR
+  code), add a device, remove one (a new key for the rest). They sit in
+  `groups/` beside the stores, and sync and serve with the store.
 - Unlock by password (and a YubiKey's slot 2 held to the phone or
   plugged in), or by quick unlock: a tap of the key and a PIN. Locks when
   the app leaves the screen.
