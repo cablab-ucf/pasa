@@ -39,7 +39,11 @@ pasa.nixosModules.default
 It installs the window, turns on `pcscd` (NFC readers), and daily runs
 `nixos-rebuild switch --update-input pasa` on `/etc/nixos` (Nix's
 `system.autoUpgrade`; `update = false` leaves it off). Only `pasa`
-moves; the rest stays as `flake.lock` pins it. While the repository is
+moves; the rest stays as `flake.lock` pins it. Updating from a branch
+trusts whoever can push to it with root on this machine (the module runs
+as part of the system) and with the store's password (the program): pin
+`inputs.pasa.url` to a release tag and set `update = false` to update by
+hand instead. While the repository is
 private, Nix needs a token that reads it, outside the store: in
 `/etc/nix/nix.conf` (`nix.extraOptions`), `!include /etc/nix/github.conf`,
 a root-only file holding `access-tokens = github.com=TOKEN`.
@@ -135,11 +139,12 @@ Only ciphertext crosses the network, and received files must be
 versions that match their names. On a computer the network side is a
 child process that sees `store/v/` and `net/` alone (Landlock on Linux,
 `sandbox-exec` on macOS); on Linux it also signals no other process and
-opens no unix socket (Landlock scopes, seccomp), but `listen`'s to
-pushir. Where that cannot be had, it says so and syncs still. The
-process with the open store opens no socket, and no pasa process dumps
-core or lets another of yours read its memory. On Android it is one
-process.
+opens no unix socket (Landlock scopes on 6.12+, seccomp on x86-64,
+aarch64 and riscv64), but `listen`'s to pushir's socket alone. What a
+kernel lacks is said, and sync goes on. The process with the open store
+opens no socket, and no pasa process dumps core; on Linux none lets
+another of yours read its memory (tools it runs, a clipboard's, are their
+own). On Android it is one process.
 
 | Layer | Holds if the others fall |
 |---|---|

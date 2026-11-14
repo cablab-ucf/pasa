@@ -772,6 +772,7 @@ impl App {
                         Zeroizing::new(crate::B64.decode(l.as_bytes())?)
                     }
                 };
+                self.v.as_ref().context("locked")?.s.joinable(&d)?;
                 let seed = sync::take_group(&d, &peer, &got)?;
                 let v = self.v.as_mut().context("locked")?;
                 v.s.join_group(&d, &seed)?;
@@ -1743,7 +1744,8 @@ impl App {
             return;
         }
         if self.health.is_none() {
-            self.health = v.s.health().ok();
+            // Once a showing: a damaged version is not read every frame.
+            self.health = Some(v.s.health().unwrap_or_default());
         }
         let h = self.health.clone().unwrap_or_default();
         let (weak, reused, expired, exposed) =
@@ -2326,13 +2328,15 @@ impl App {
         }
         if let Some(g) = gone {
             v.note = match v.s.unlink(&g) {
-                Ok(()) => format!("@{g}: unlinked; it opens on its own"),
+                Ok(()) => {
+                    format!("@{g}: unlinked (a group: this device left it)")
+                }
                 Err(e) => format!("{e:#}"),
             };
             v.load();
         }
         if let Some((label, dir, id, name)) = remove {
-            let r = v.s.group(&label).and_then(|g| g.remove_member(&id));
+            let r = v.s.group_remove(&label, &id);
             v.note = match r {
                 Ok(_) => {
                     // Its pairing here, if this device paired it.

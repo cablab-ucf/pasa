@@ -23,14 +23,53 @@ pub fn command(dir: &Path, exe: &Path, args: &[&str]) -> Command {
     c
 }
 
-/// Call before any socket. False on a kernel without Landlock. No signals,
-/// abstract sockets or (ABI 9) unix sockets by path but under `unix`; on
-/// Linux without `unix`, seccomp refuses new unix sockets on any kernel.
+/// How far [`confine`] went.
+#[derive(PartialEq, Debug)]
+pub enum Confined {
+    Fully,
+    /// What this kernel lacks.
+    Partly(String),
+    No,
+}
+
+/// Call before any socket. No signals, abstract sockets or (ABI 9) unix
+/// sockets by path but `unix` itself; on Linux without `unix`, seccomp
+/// refuses new unix sockets on any kernel, whatever Landlock managed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub fn confine(dir: &Path, unix: Option<&Path>) -> anyhow::Result<bool> {
+pub fn confine(dir: &Path, unix: Option<&Path>) -> anyhow::Result<Confined> {
+    #[cfg(target_os = "linux")]
+    let seccomp = unix.is_none().then(no_unix_sockets).and_then(Result::err);
+    #[cfg(not(target_os = "linux"))]
+    let seccomp: Option<anyhow::Error> = None;
+    let lock = landlock(dir, unix);
+    let lacks = |what: String| match &seccomp {
+        Some(e) => format!("{what}; unix sockets stay open ({e:#})"),
+        None => what,
+    };
+    Ok(match lock? {
+        landlock::RulesetStatus::FullyEnforced if seccomp.is_none() => {
+            Confined::Fully
+        }
+        landlock::RulesetStatus::FullyEnforced => {
+            Confined::Partly(lacks(String::new()))
+        }
+        landlock::RulesetStatus::PartiallyEnforced => Confined::Partly(lacks(
+            "this kernel's Landlock lacks some rules (signals, abstract or \
+             path sockets)"
+                .into(),
+        )),
+        landlock::RulesetStatus::NotEnforced => Confined::No,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn landlock(
+    dir: &Path,
+    unix: Option<&Path>,
+) -> anyhow::Result<landlock::RulesetStatus> {
     use landlock::{
-        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr,
-        RulesetStatus, Scope, path_beneath_rules,
+        ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
+        path_beneath_rules,
     };
     let abi = ABI::V9;
     let own = [crate::versions(dir), dir.join("net")];
@@ -45,6 +84,8 @@ pub fn confine(dir: &Path, unix: Option<&Path>) -> anyhow::Result<bool> {
         "/system",
         "/apex",
         "/vendor",
+        // systemd-resolved's resolv.conf: else DNS asks public resolvers.
+        "/run/systemd/resolve",
     ];
     let s = Ruleset::default()
         .handle_access(AccessFs::from_all(abi))?
@@ -55,12 +96,7 @@ pub fn confine(dir: &Path, unix: Option<&Path>) -> anyhow::Result<bool> {
         .add_rules(path_beneath_rules(certs(), AccessFs::from_read(abi)))?
         .add_rules(path_beneath_rules(unix, AccessFs::ResolveUnix))?
         .restrict_self()?;
-    #[cfg(target_os = "linux")]
-    if let Some(e) = unix.is_none().then(no_unix_sockets).and_then(Result::err)
-    {
-        eprintln!("pasa: unix sockets stay open to the network side: {e:#}");
-    }
-    Ok(s.ruleset != RulesetStatus::NotEnforced)
+    Ok(s.ruleset)
 }
 
 /// seccomp: `socket(AF_UNIX)` and io_uring (which makes sockets past it)
@@ -95,8 +131,11 @@ fn no_unix_sockets() -> anyhow::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-pub fn confine(_: &Path, _: Option<&Path>) -> anyhow::Result<bool> {
-    Ok(std::env::var_os("PASA_SANDBOX").is_some())
+pub fn confine(_: &Path, _: Option<&Path>) -> anyhow::Result<Confined> {
+    Ok(match std::env::var_os("PASA_SANDBOX") {
+        Some(_) => Confined::Fully,
+        None => Confined::No,
+    })
 }
 
 /// Denies user file areas but `v/`, `net/`, the exe and certs; allows the rest.
@@ -133,7 +172,7 @@ mod tests {
 
     /// Runs in the confined child: confinement cannot be undone.
     fn probe(dir: &Path) {
-        assert!(confine(dir, None).unwrap(), "not confined");
+        assert_ne!(confine(dir, None).unwrap(), Confined::No, "not confined");
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::net::UnixDatagram;
@@ -192,7 +231,11 @@ mod tests {
             // `listen`: pushir's socket, by path.
             let s = Path::new(&s);
             let d = s.parent().unwrap().join("store");
-            assert!(confine(&d, s.parent()).unwrap(), "not confined");
+            assert_ne!(
+                confine(&d, Some(s)).unwrap(),
+                Confined::No,
+                "not confined"
+            );
             assert!(std::os::unix::net::UnixStream::connect(s).is_ok());
             return;
         }

@@ -125,6 +125,21 @@ fn groups_at(dir: &Path) -> std::path::PathBuf {
     dir.parent().unwrap_or(dir).join("groups")
 }
 
+/// A group's folder name: one plain component.
+fn group_name(name: &str) -> anyhow::Result<&str> {
+    let n = name.trim();
+    let bad = n.is_empty()
+        || n == "."
+        || n == ".."
+        || n.contains(['/', '\\'])
+        || n.chars().any(char::is_control);
+    anyhow::ensure!(
+        !bad,
+        "{n:?}: a group's name is one word or phrase, no slashes"
+    );
+    Ok(n)
+}
+
 fn groups(dir: &Path) -> Vec<std::path::PathBuf> {
     let all = std::fs::read_dir(groups_at(dir)).into_iter().flatten();
     all.flatten().map(|e| e.path()).collect()
@@ -143,12 +158,16 @@ fn reach(dir: &str) -> Vec<std::path::PathBuf> {
 fn sync_all(dir: &str, news: bool) -> anyhow::Result<String> {
     let mut said = vec![];
     for d in reach(dir) {
-        if d.as_path() != Path::new(dir)
-            && !sync::net(&d).join("peers").exists()
-        {
+        let own = d.as_path() == Path::new(dir);
+        if !own && !(sync::on(&d) && sync::net(&d).join("peers").exists()) {
             continue;
         }
-        said.push(report(RT.block_on(sync::sync(&d, news))?));
+        // One store failing stops none of the others.
+        match RT.block_on(sync::sync(&d, news)) {
+            Ok(r) => said.push(report(r)),
+            Err(e) if own => return Err(e),
+            Err(e) => said.push(format!("{}: {e:#}", d.display())),
+        }
     }
     Ok(said
         .into_iter()
@@ -817,9 +836,8 @@ pub extern "system" fn Java_com_apasa_Native_groupNew<'l>(
         let mut stores = stores();
         let s = stores.get_mut(&h).context("locked")?;
         let name = name.to_string();
-        pasa::path_safe(&name)?;
         let g = Store::create_group(
-            &groups_at(&s.dir).join(name.trim()),
+            &groups_at(&s.dir).join(group_name(&name)?),
             &me.to_string(),
         )?;
         Ok(e.new_string(s.link(g)?)?)
@@ -875,7 +893,12 @@ pub extern "system" fn Java_com_apasa_Native_groupJoin<'l>(
             code.to_string(),
             pw.to_string(),
         );
-        pasa::path_safe(&name)?;
+        let name = group_name(&name)?.to_string();
+        {
+            let stores = stores();
+            let s = stores.get(&h).context("locked")?;
+            s.joinable(&groups_at(&s.dir).join(&name))?;
+        }
         let got = match code.trim().starts_with("PAIRIR1:") {
             true => RT.block_on(sync::unqr_in(&code, &pw, true))?,
             false => RT.block_on(sync::fetch_in(&code, true))?,
@@ -883,7 +906,7 @@ pub extern "system" fn Java_com_apasa_Native_groupJoin<'l>(
         let dir = {
             let mut stores = stores();
             let s = stores.get_mut(&h).context("locked")?;
-            let dir = groups_at(&s.dir).join(name.trim());
+            let dir = groups_at(&s.dir).join(&name);
             let seed = sync::take_group(&dir, &peer, &got)?;
             s.join_group(&dir, &seed)?;
             dir
@@ -908,18 +931,12 @@ pub extern "system" fn Java_com_apasa_Native_groupRemove<'l>(
 ) {
     run(&mut env, |_| {
         let mut stores = stores();
-        let g =
-            stores.get_mut(&h).context("locked")?.group(&label.to_string())?;
-        let name = g
-            .members()?
-            .into_iter()
-            .find(|m| m.id == id.to_string())
-            .map(|m| m.name);
-        g.remove_member(&id.to_string())?;
+        let s = stores.get_mut(&h).context("locked")?;
+        let label = label.to_string();
+        let dir = s.group(&label)?.dir.clone();
+        let (_, name) = s.group_remove(&label, &id.to_string())?;
         // Its pairing here, if this device paired it.
-        if let Some(n) = name {
-            let _ = sync::forget(&g.dir, &n);
-        }
+        let _ = sync::forget(&dir, &name);
         Ok(())
     })
 }

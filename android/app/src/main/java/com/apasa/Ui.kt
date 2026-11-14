@@ -1261,6 +1261,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
 private fun GroupStores(host: Host, tick: Int, go: (suspend () -> String) -> Unit, show: (String, String) -> Unit) {
     val groups by produceState(Groups(), tick) { value = host.groups() }
     var adding by remember { mutableStateOf<String?>(null) }
+    var removing by remember { mutableStateOf<Pair<String, Member>?>(null) }
     var device by remember { mutableStateOf("") }
     var made by remember { mutableStateOf("") }
     var me by remember { mutableStateOf("") }
@@ -1278,13 +1279,24 @@ private fun GroupStores(host: Host, tick: Int, go: (suspend () -> String) -> Uni
     for ((label, members) in groups.groups) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("@$label", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
-            TextButton({ go { host.unlink(label); "@$label: unlinked; it opens with yours no more" } }) { Text("Unlink") }
+            TextButton({ go { host.unlink(label); "@$label: left; this device's key for it is gone" } }) { Text("Leave") }
         }
         for (m in members) Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(m.name + if (m.me) "  (this device)" else "", Modifier.weight(1f).padding(start = 12.dp), style = MaterialTheme.typography.bodyLarge)
-            if (!m.me) TextButton({
-                go { host.groupRemove(label, m.id); "${m.name}: removed from @$label; a new key for the rest. What it read it keeps: Health lists those passwords." }
-            }) { Text("Remove") }
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(m.name + if (m.me) "  (this device)" else "", style = MaterialTheme.typography.bodyLarge)
+                Text(m.id.take(8), style = MaterialTheme.typography.bodySmall, color = muted, fontFamily = mono)
+            }
+            if (!m.me) TextButton({ removing = label to m }) { Text("Remove") }
+        }
+        removing?.takeIf { it.first == label }?.let { (_, m) ->
+            Text("Remove ${m.name} (${m.id.take(8)}) for good? It gets nothing written from now on.", style = MaterialTheme.typography.bodySmall)
+            Row {
+                TextButton({
+                    removing = null
+                    go { host.groupRemove(label, m.id); "${m.name}: removed from @$label; a new key for the rest. What it read it keeps: Health lists those passwords." }
+                }) { Text("Remove") }
+                TextButton({ removing = null }) { Text("Keep") }
+            }
         }
         if (members.isNotEmpty()) TextButton({ adding = label; device = "" }) { Text("Add a device to @$label") }
     }

@@ -1084,11 +1084,16 @@ fn net_side(a: &[&str]) -> Result<()> {
     let dir = home();
     // `listen` reaches pushir's daemon; nothing else reaches a unix socket.
     let sock = pushir::local::sock();
-    let unix = (a == ["listen"]).then(|| sock.parent()).flatten();
-    // Never at sync's cost: unconfined, it is said and syncs still.
+    // Its socket alone, not the folder (XDG_RUNTIME_DIR holds D-Bus too).
+    let unix = (a == ["listen"] && sock.exists()).then_some(sock.as_path());
+    // Never at sync's cost: what cannot be had is said, and sync goes on.
+    use pasa::confine::Confined;
     match pasa::confine::confine(&dir, unix) {
-        Ok(true) => {}
-        Ok(false) => eprintln!(
+        Ok(Confined::Fully) => {}
+        Ok(Confined::Partly(why)) => {
+            eprintln!("pasa: the network side is partly confined: {why}")
+        }
+        Ok(Confined::No) => eprintln!(
             "pasa: the network side is not confined: no Landlock here"
         ),
         Err(e) => eprintln!("pasa: the network side is not confined: {e:#}"),
@@ -1201,9 +1206,13 @@ async fn hand(
                 Some("taken") => eprintln!("{name} took it"),
                 Some("spent") => bail!(
                     "the code was used by someone who did not prove it: \
-                     pasa forget {name}, then pair again"
+                     pasa forget {name} (a group's: pasa group rm LABEL \
+                     {name}), then pair again"
                 ),
-                _ => bail!("nobody came: pair again"),
+                _ => bail!(
+                    "nobody came: pair again (a group's: pasa group rm LABEL \
+                     {name} first)"
+                ),
             }
         }
     }
@@ -1283,6 +1292,7 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["group", "join", d, name, code] => {
             let (mut s, d) = (open()?, pasa::path(d));
+            s.joinable(&d)?;
             let got = fetched(code, true).await?;
             let seed = sync::take_group(&d, name, &got)?;
             s.join_group(&d, &seed)?;
@@ -1305,17 +1315,10 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["group", "rm", l, who] => {
             let mut s = open()?;
-            let g = s.group(l)?;
-            let name = g
-                .members()?
-                .into_iter()
-                .find(|m| m.id == *who || m.name == *who);
-            let id = g.remove_member(who)?;
-            let d = g.dir.clone();
+            let d = s.group(l)?.dir.clone();
+            let (id, name) = s.group_remove(l, who)?;
             // Its pairing here, if this device paired it.
-            if let Some(m) = name {
-                let _ = sync::forget(&d, &m.name);
-            }
+            let _ = sync::forget(&d, &name);
             record_in(&d);
             if sync::on(&d) {
                 net_run_in(&d, &["sync", "--news"])?;

@@ -71,7 +71,7 @@
               input `pasa` alone is updated.
             '';
           };
-          serve = lib.mkEnableOption "`pasa serve` as each user's service, seeing only ~/.pasa/store/v and ~/.pasa/net";
+          serve = lib.mkEnableOption "`pasa serve` as each user's service, seeing only ~/.pasa/store and ~/.pasa/net";
         };
         config = lib.mkIf cfg.enable (lib.mkMerge [
           {
@@ -80,7 +80,7 @@
           }
           (lib.mkIf cfg.update {
             system.autoUpgrade = {
-              enable = true;
+              enable = lib.mkDefault true;
               flake = lib.mkDefault "/etc/nixos";
               flags = [ "--update-input" "pasa" ];
               dates = lib.mkDefault "daily";
@@ -99,7 +99,8 @@
                 PrivateTmp = true;
                 ProtectSystem = "strict";
                 ProtectHome = "tmpfs";
-                BindPaths = [ "%h/.pasa/store/v" "%h/.pasa/net" ];
+                # store/: v/ and git (synced versions committed); never the keys.
+                BindPaths = [ "-%h/.pasa/store" "-%h/.pasa/net" ];
               };
             };
           })

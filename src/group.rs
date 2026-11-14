@@ -279,7 +279,9 @@ impl Store {
             let Some((name, by, node, pk)) = parse(&self.get(&n)?) else {
                 continue;
             };
-            if id_of(&pk) == id {
+            // A key that does not parse is no member: one bad record must
+            // not stop every device sealing.
+            if id_of(&pk) == id && Pk::from_bytes(&pk).is_ok() {
                 out.push(Member { id: id.into(), name, by, node, pk });
             }
         }
@@ -293,8 +295,9 @@ impl Store {
         by: &str,
         node: &str,
     ) -> Result<()> {
-        let bad = [name, by, node].iter().any(|f| f.contains('\n'));
-        ensure!(!bad, "a bad name");
+        let bad =
+            [name, by, node].iter().any(|f| f.chars().any(char::is_control));
+        ensure!(!bad && !name.trim().is_empty(), "a bad name");
         let body = [format!("{name}\n{by}\n{node}\n").as_bytes(), pk].concat();
         self.put(&format!("{MEMBERS}{}", id_of(pk)), &body)
     }
@@ -414,15 +417,22 @@ impl Store {
                 .filter(|v| v.size == 0)
                 .filter_map(|v| v.name.strip_prefix(MEMBERS))
                 .collect();
+            // A device removed and added again, or a node named falsely by
+            // a member's record, stays: only nodes no member holds go.
+            let held: HashSet<String> =
+                self.members()?.into_iter().map(|m| m.node).collect();
             let mine = own_node(&self.dir);
             for v in vs.iter().filter(rec).filter(|v| v.size > 0) {
                 let id = v.name.strip_prefix(MEMBERS).unwrap_or_default();
-                let Some((_, _, node, _)) =
+                let Some((_, _, node, pk)) =
                     self.body(v).ok().and_then(|b| parse(&b))
                 else {
                     continue;
                 };
-                if removed.contains(id) && node != "-" && node != mine {
+                let real = id_of(&pk) == id;
+                let gone =
+                    real && removed.contains(id) && !held.contains(&node);
+                if gone && node != "-" && node != mine {
                     crate::sync::forget_node(&self.dir, &node)?;
                 }
             }
