@@ -2374,7 +2374,12 @@ impl App {
                     );
                 });
             }
-            if ui.small_button(format!("Add a device to @{label}")).clicked() {
+            let can = pasa::group::ON;
+            if can
+                && ui
+                    .small_button(format!("Add a device to @{label}"))
+                    .clicked()
+            {
                 add = Some(label.clone());
             }
         }
@@ -2426,44 +2431,60 @@ impl App {
                 self.gform.adding = None;
             }
         }
-        egui::CollapsingHeader::new("New group").show(ui, |ui| {
-            field(ui, "Its folder", &mut self.gform.dir, false);
-            field(ui, "This device's name in it", &mut self.gform.me, false);
-            let g = &self.gform;
-            let ok = !g.dir.trim().is_empty() && !g.me.trim().is_empty();
-            if ui.add_enabled(ok, Button::new("Make it")).clicked() {
-                let d = pasa::path(&self.gform.dir);
-                let made = pasa::Store::create_group(&d, self.gform.me.trim())
-                    .and_then(|g| Ok((pasa::remember(&d)?, v.s.link(g)?).1));
-                v.note = match made {
-                    Ok(label) => {
-                        self.gform = Default::default();
-                        format!("@{label}: made; add its devices here")
-                    }
-                    Err(e) => format!("{e:#}"),
-                };
-                v.load();
-            }
-        });
-        egui::CollapsingHeader::new("Join a group").show(ui, |ui| {
-            field(ui, "A folder for it here", &mut self.gform.dir, false);
-            field(
-                ui,
-                "The name of the device showing the code",
-                &mut self.gform.peer,
-                false,
-            );
-            field(ui, "Code", &mut self.gform.code, false);
-            if self.gform.code.trim().starts_with("PAIRIR1:") {
-                field(ui, "The QR code's password", &mut self.gform.pw, true);
-            }
-            let g = &self.gform;
-            let ok =
-                [&g.dir, &g.peer, &g.code].iter().all(|f| !f.trim().is_empty());
-            if ui.add_enabled(ok, Button::new("Join")).clicked() {
-                self.begin(ui, Job::JoinGroup, "Joining");
-            }
-        });
+        if pasa::group::ON {
+            egui::CollapsingHeader::new("New group").show(ui, |ui| {
+                field(ui, "Its folder", &mut self.gform.dir, false);
+                field(
+                    ui,
+                    "This device's name in it",
+                    &mut self.gform.me,
+                    false,
+                );
+                let g = &self.gform;
+                let ok = !g.dir.trim().is_empty() && !g.me.trim().is_empty();
+                if ui.add_enabled(ok, Button::new("Make it")).clicked() {
+                    let d = pasa::path(&self.gform.dir);
+                    let made =
+                        pasa::Store::create_group(&d, self.gform.me.trim())
+                            .and_then(|g| {
+                                Ok((pasa::remember(&d)?, v.s.link(g)?).1)
+                            });
+                    v.note = match made {
+                        Ok(label) => {
+                            self.gform = Default::default();
+                            format!("@{label}: made; add its devices here")
+                        }
+                        Err(e) => format!("{e:#}"),
+                    };
+                    v.load();
+                }
+            });
+            egui::CollapsingHeader::new("Join a group").show(ui, |ui| {
+                field(ui, "A folder for it here", &mut self.gform.dir, false);
+                field(
+                    ui,
+                    "The name of the device showing the code",
+                    &mut self.gform.peer,
+                    false,
+                );
+                field(ui, "Code", &mut self.gform.code, false);
+                if self.gform.code.trim().starts_with("PAIRIR1:") {
+                    field(
+                        ui,
+                        "The QR code's password",
+                        &mut self.gform.pw,
+                        true,
+                    );
+                }
+                let g = &self.gform;
+                let ok = [&g.dir, &g.peer, &g.code]
+                    .iter()
+                    .all(|f| !f.trim().is_empty());
+                if ui.add_enabled(ok, Button::new("Join")).clicked() {
+                    self.begin(ui, Job::JoinGroup, "Joining");
+                }
+            });
+        }
         egui::CollapsingHeader::new("Link a store with a password").show(
             ui,
             |ui| {

@@ -108,7 +108,7 @@ data class Health(
 data class Member(val id: String, val name: String, val me: Boolean)
 
 /** Linked group stores by label, with their members; notes on any that did not open. */
-data class Groups(val groups: Map<String, List<Member>> = mapOf(), val notes: List<String> = listOf())
+data class Groups(val groups: Map<String, List<Member>> = mapOf(), val notes: List<String> = listOf(), val on: Boolean = false)
 
 /** Quick: a tap (and PIN) opens the store beside the password; Both: a second factor with it. */
 enum class Key { None, Quick, Both }
@@ -1298,7 +1298,7 @@ private fun GroupStores(host: Host, tick: Int, go: (suspend () -> String) -> Uni
                 TextButton({ removing = null }) { Text("Keep") }
             }
         }
-        if (members.isNotEmpty()) TextButton({ adding = label; device = "" }) { Text("Add a device to @$label") }
+        if (groups.on && members.isNotEmpty()) TextButton({ adding = label; device = "" }) { Text("Add a device to @$label") }
     }
     adding?.let { label ->
         Field(device, { device = it }, "A name for the device joining @$label")
@@ -1307,6 +1307,7 @@ private fun GroupStores(host: Host, tick: Int, go: (suspend () -> String) -> Uni
             go { show(n, host.groupAdd(label, n, null)); adding = null; "" }
         }, enabled = device.isNotBlank()) { Text("Show a code to type") }
     }
+    if (!groups.on) return
     Label("NEW GROUP")
     Field(made, { made = it }, "Its name")
     Field(me, { me = it }, "This device's name in it")

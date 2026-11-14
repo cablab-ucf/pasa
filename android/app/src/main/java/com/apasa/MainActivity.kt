@@ -402,6 +402,7 @@ class MainActivity : ComponentActivity(), Host {
                 g[1] to rows.filter { it[0] == "m" && it[1] == g[1] }.map { Member(it[2], it[3], it[4] == "1") }
             },
             rows.filter { it[0] == "!" }.map { it[1] },
+            Native.groupsOn(),
         )
     }
     /** A group's change: synced, and its folder served and watched. */

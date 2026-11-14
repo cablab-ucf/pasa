@@ -978,3 +978,12 @@ pub extern "system" fn Java_com_apasa_Native_dirs<'l>(
         Ok(e.new_string(lines.join("\n"))?)
     })
 }
+
+/// Whether per-device groups may be made, joined or added to yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_groupsOn<'l>(
+    _: EnvUnowned<'l>,
+    _: JClass<'l>,
+) -> bool {
+    pasa::group::ON
+}

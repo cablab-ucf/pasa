@@ -18,6 +18,13 @@ use std::io::Read;
 use std::path::Path;
 use zeroize::Zeroizing;
 
+/// Off until membership is signed by admins (PLAN.md): a removed member
+/// can race a key fork back in, and invitations it made outlive it. A
+/// group already held keeps opening; none is made, joined or added to.
+pub const ON: bool = cfg!(test);
+pub const OFF: &str = "per-device groups are not on yet: their signed \
+    design comes first (PLAN.md); a store linked with its password works";
+
 const TAG: &str = "pasa-xwing";
 const INFO: &[u8] = b"pasa group keys 1";
 const HEAD: &[u8] = b"pasa keys\n";
@@ -167,6 +174,7 @@ impl Store {
     /// A new group store in `dir`, its first member this device, `name`.
     /// No password: its members open it, each with a key of its own.
     pub fn create_group(dir: &Path, name: &str) -> Result<Store> {
+        ensure!(ON, OFF);
         let fresh = !dir.join("key").exists() && !dir.join("member").exists();
         ensure!(fresh, "{} holds a store", dir.display());
         let keys = vec![Zeroizing::new(rand::<32>().to_vec())];
@@ -319,6 +327,7 @@ impl Store {
     /// A member key for a device named `name`, which pairing hands it; it
     /// makes one of its own once it opens the store.
     pub fn add_member(&mut self, name: &str) -> Result<Secret> {
+        ensure!(ON, OFF);
         let me = self.member_id().context("not a group store")?;
         let seed = Zeroizing::new(rand::<32>().to_vec());
         self.record(&public(&seed), name, &me, "-")?;

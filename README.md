@@ -176,7 +176,8 @@ was; only the open view unites them, in memory, and each write goes to
 its own store, which syncs, serves and commits as before. Your password,
 changed, seals the links anew; the group's, changed, asks for a new link.
 
-A group made by pasa has no password: a key per device (X-Wing), and the
+Not on yet (PLAN.md: membership signed by admins first; a group already
+held keeps opening). A group made by pasa has no password: a key per device (X-Wing), and the
 store keys sealed to every member's in an age file in `v/`, which syncs as
 any version. Adding a device hands it a member key through pairing; it
 makes its own at once. Removing one is a new store key sealed to the rest

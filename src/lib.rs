@@ -626,6 +626,7 @@ impl Store {
     /// Joins the group store in `dir` with the member key pairing handed:
     /// it opens with this store once a sync brings its keys.
     pub fn join_group(&mut self, dir: &Path, seed: &[u8]) -> Result<()> {
+        ensure!(group::ON, group::OFF);
         ensure!(
             !["key", "member", "link"].iter().any(|f| dir.join(f).exists()),
             "{} holds a store",

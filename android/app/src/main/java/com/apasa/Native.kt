@@ -51,6 +51,7 @@ object Native {
     /** The folders a sync of [dir] covers: it, and its open store's linked ones. */
     external fun dirs(dir: String): String
     external fun groups(h: Long): String
+    external fun groupsOn(): Boolean
     external fun groupNew(h: Long, name: String, me: String): String
     external fun groupAdd(h: Long, label: String, device: String, qrPw: String?): String
     external fun groupJoin(h: Long, name: String, peer: String, code: String, pw: String): String
