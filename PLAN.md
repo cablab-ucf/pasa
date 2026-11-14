@@ -34,10 +34,13 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
    - **Rules** (`follows`): the keys kept or one new; members unchanged
      but for those the signer outranks (or itself) removed or demoted, a
      member made admin at this epoch (ranked last), devices added by the
-     signer at this epoch, never one the chain held before.
-   - **Forks**: the higher admin's holds. A removal or demotion voids
-     what its subject signed outside the removal's own past (forks before
-     or after it); removals by the highest first.
+     signer at this epoch.
+   - **Forks**: the one a higher admin signed in (anywhere in it) holds:
+     a removed admin's fork, from before its removal or after, loses to
+     the branch holding the removal; a losing fork changes nothing in the
+     other (a second review found that voiding by removals did). An admin
+     can still undo its own changes and those of admins below it, made
+     since its fork, while no higher admin has signed after them.
    - **Joining**: an admin's one-time invitation (local); the joiner's
      public keys and the root, sealed with that pairing's secret; admitted
      once. **Leaving**: an admin, an envelope without it (the next admin
@@ -45,9 +48,11 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
    - **Retire notices** do not count in groups (any member could write
      one); the envelope chain says which key is newest.
    - Tests: signed add/remove; a non-admin's envelope; a removed admin's
-     race and puppet; its fork from long ago; two admins at once; a
-     stranger's and a member's requests; junk and a member's retire
-     notice; a new password; leaving.
+     race and puppet; its fork from long ago; a losing fork's removal; an
+     old self-removal; a member's junk keys and envelopes (no rotation
+     forced, a device added after opens); two admins at once; a
+     stranger's and a member's requests; a member's retire notice; a new
+     password; leaving.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

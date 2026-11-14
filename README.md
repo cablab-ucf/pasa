@@ -200,11 +200,11 @@ pasa group rm lab bob           # bob gets nothing written since
 The window and the phone do the same in Devices, Group stores.
 
 Admins rank by age, the root first; an admin removes or demotes only
-those below it. Where two admins extend one envelope, the higher's holds,
-and a device says when a key it may have written with was set aside. A
-removal voids everything its subject signed outside the removal's own
-past, a fork from long ago included; removed or demoted is for good. What
-a removed device read it keeps (`pasa health` lists those passwords).
+those below it. Of two forks, the one a higher admin signed in holds, and
+a device says when a key it may have written with was set aside: a
+removed admin's fork, made before its removal or after, loses to the
+branch holding the removal; a losing fork changes nothing in the other.
+What a removed device read it keeps (`pasa health` lists those passwords).
 
 ## Revocation
 

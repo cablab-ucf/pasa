@@ -3,9 +3,8 @@
 //! sealed to every member) carries the member list and the hash of the one
 //! before it, signed by an admin of that one: authority runs from the
 //! group's creator (its root) down this chain alone, never from files that
-//! any key holder could write. Admins rank by age; where two extend one
-//! envelope, the higher's holds; a removal voids what its subject signed
-//! outside the removal's own past. PLAN.md has the design and why.
+//! any key holder could write. Admins rank by age; of two forks, the one a
+//! higher admin signed in holds. PLAN.md has the design and why.
 
 use crate::{MAX, Secret, Store, frame, name_of, rand, unframe, write};
 use age_core::format::{FileKey, Stanza};
@@ -279,7 +278,8 @@ fn list_of(mut b: &[u8]) -> Option<Vec<Member>> {
         let ok =
             bundle.len() == BUNDLE && Pk::from_bytes(&bundle[..XPK]).is_ok();
         let id = id_of(&bundle);
-        (ok && !ms.iter().any(|m| m.id == id)).then_some(())?;
+        (ok && !ms.iter().any(|m| m.id == id || m.name == name))
+            .then_some(())?;
         ms.push(Member { id, name, admin, by: text(&by), since, bundle });
     }
     Some(ms)
@@ -349,13 +349,8 @@ fn genesis(e: &Envelope, root: &str) -> bool {
 /// Whether `n` may follow `p`: signed by an admin of `p`, the keys kept,
 /// every member kept as it was but for what that admin may change: one it
 /// outranks (or itself) removed or demoted, a member made admin (ranked
-/// last), devices added (never one the chain held before, in `ever`).
-fn follows(
-    p: &Envelope,
-    n: &Envelope,
-    root: &str,
-    ever: &HashSet<String>,
-) -> bool {
+/// last), devices added by it.
+fn follows(p: &Envelope, n: &Envelope, root: &str) -> bool {
     let Some(r) = rank(&p.list, root, &n.signer) else { return false };
     let signer =
         p.list.iter().any(|m| m.id == n.signer && m.bundle == n.bundle);
@@ -377,9 +372,11 @@ fn follows(
             }
         });
     let new = |x: &&Member| !p.list.iter().any(|m| m.id == x.id);
-    let added = n.list.iter().filter(new).all(|x| {
-        x.by == n.signer && x.since == n.epoch && !ever.contains(&x.id)
-    });
+    let added = n
+        .list
+        .iter()
+        .filter(new)
+        .all(|x| x.by == n.signer && x.since == n.epoch);
     p.epoch.checked_add(1) == Some(n.epoch)
         && n.prev == p.hash
         && signer
@@ -387,28 +384,6 @@ fn follows(
         && kept
         && added
         && n.list.iter().any(|m| m.admin)
-}
-
-/// Envelope `h` and those it is built on.
-fn past<'a>(
-    all: &'a BTreeMap<String, Envelope>,
-    mut h: &'a str,
-) -> HashSet<&'a str> {
-    let mut s = HashSet::new();
-    while let Some(e) = all.get(h) {
-        s.insert(e.hash.as_str());
-        h = &e.prev;
-    }
-    s
-}
-
-/// Those `n` removed from `p`, or demoted.
-fn dropped(p: &Envelope, n: &Envelope) -> Vec<String> {
-    let gone = |m: &&Member| match n.list.iter().find(|x| x.id == m.id) {
-        None => true,
-        Some(x) => m.admin && !x.admin,
-    };
-    p.list.iter().filter(gone).map(|m| m.id.clone()).collect()
 }
 
 /// A group store's view, from its chain.
@@ -425,8 +400,6 @@ pub(crate) struct State {
     /// Members removed along the chain.
     #[cfg_attr(not(feature = "sync"), allow(dead_code))]
     gone: Vec<Member>,
-    /// Removed or demoted in any valid envelope: no admin, wherever listed.
-    voided: HashSet<String>,
     /// Members asking to leave.
     leaves: Vec<String>,
 }
@@ -499,7 +472,7 @@ impl Store {
                 (f[0] == root.as_bytes()).then(|| asks.push((id, bundle)));
             }
         }
-        // The bodies under any key these hold: all of the chain, for a
+        // The bodies under each key these hold: all of the chain, for a
         // device added since; every version, each one its name's hash.
         let mut keys: Vec<Secret> = vec![];
         for k in all.values().flat_map(|e| &e.keys) {
@@ -507,8 +480,8 @@ impl Store {
                 keys.push(k.clone());
             }
         }
-        if !keys.is_empty() {
-            let s = Store::new(dir, keys, Default::default(), vec![])?;
+        for k in keys {
+            let s = Store::new(dir, vec![k], Default::default(), vec![])?;
             for v in s.versions_here()? {
                 let Some(h) = v.name.strip_prefix(CHAIN) else { continue };
                 let Ok(b) = s.body(&v) else { continue };
@@ -517,58 +490,45 @@ impl Store {
                 }
             }
         }
-        // Valid: the root's first, then each by an admin of the one before.
+        // Valid: the root's first, then each by an admin of the one before;
+        // with its signer's rank there.
         let mut order: Vec<&Envelope> = all.values().collect();
         order.sort_by_key(|e| e.epoch);
-        let mut ever: HashMap<&str, HashSet<String>> = HashMap::new();
-        for n in order {
-            let p = all.get(&n.prev);
-            let ok = match p.and_then(|p| Some((p, ever.get(p.hash.as_str())?)))
-            {
-                Some((p, ev)) => follows(p, n, root, ev),
-                None => genesis(n, root),
-            };
-            if ok {
-                let mut ev = p
-                    .and_then(|p| ever.get(p.hash.as_str()))
-                    .cloned()
-                    .unwrap_or_default();
-                ev.extend(n.list.iter().map(|m| m.id.clone()));
-                ever.insert(&n.hash, ev);
-            }
-        }
-        // Removals, the highest remover's first: what a removed device
-        // signed outside the removal's past counts for nothing (a fork it
-        // made, before or after); a removal so voided, nothing either.
-        let mut cuts: Vec<((u64, String), &str, Vec<String>)> = ever
-            .keys()
-            .filter_map(|h| {
-                let n = &all[*h];
-                let p = all.get(&n.prev)?;
-                Some((rank(&p.list, root, &n.signer)?, *h, dropped(p, n)))
-            })
-            .filter(|c| !c.2.is_empty())
-            .collect();
-        cuts.sort();
-        let mut void: HashSet<&str> = HashSet::new();
-        let mut voided = HashSet::new();
-        for (_, h, out) in &cuts {
-            let mine = past(&all, h);
-            if mine.iter().any(|a| void.contains(a)) {
-                continue;
-            }
-            for x in ever.keys() {
-                if out.contains(&all[*x].signer) && !mine.contains(x) {
-                    void.insert(x);
+        let mut valid: HashMap<&str, (u64, String)> = HashMap::new();
+        for n in &order {
+            let r = match all.get(&n.prev) {
+                Some(p) if valid.contains_key(p.hash.as_str()) => {
+                    rank(&p.list, root, &n.signer)
+                        .filter(|_| follows(p, n, root))
                 }
+                None if genesis(n, root) => Some((0, String::new())),
+                _ => None,
+            };
+            if let Some(r) = r {
+                valid.insert(&n.hash, r);
             }
-            voided.extend(out.iter().cloned());
         }
-        let alive = |h: &str| ever.contains_key(h) && !void.contains(h);
+        // Each one's best: the highest signer in it and all built on it. Of
+        // two forks, the one a higher admin signed in holds: a removed
+        // admin's fork, made before its removal or after, loses to the
+        // branch holding the removal; a losing fork changes nothing in the
+        // other.
+        let mut best = valid.clone();
+        for n in order.iter().rev() {
+            let Some(b) = best.get(n.hash.as_str()).cloned() else { continue };
+            if let Some(p) = best.get_mut(n.prev.as_str()) {
+                *p = p.clone().min(b);
+            }
+        }
+        let key = |e: &&Envelope| {
+            let h = e.hash.as_str();
+            (best[h].clone(), valid[h].clone(), e.hash.clone())
+        };
+        let ok = |e: &&Envelope| valid.contains_key(e.hash.as_str());
         let mut at = all
             .values()
-            .filter(|e| e.epoch == 0 && alive(&e.hash))
-            .min_by(|a, b| a.hash.cmp(&b.hash))
+            .filter(|e| e.epoch == 0 && ok(e))
+            .min_by_key(key)
             .context(
                 "no keys here for this device yet: sync, once an admin has \
                  added it",
@@ -576,15 +536,9 @@ impl Store {
         let (mut lost, mut held) = (0, vec![]);
         loop {
             held.extend(at.list.iter().cloned());
-            let kids: Vec<&Envelope> = all
-                .values()
-                .filter(|n| n.prev == at.hash && ever.contains_key(&*n.hash))
-                .collect();
-            let best = kids
-                .iter()
-                .filter(|n| alive(&n.hash))
-                .min_by_key(|n| (rank(&at.list, root, &n.signer), &n.hash));
-            let Some(&n) = best else { break };
+            let kids: Vec<&Envelope> =
+                all.values().filter(|n| n.prev == at.hash && ok(n)).collect();
+            let Some(&n) = kids.iter().min_by_key(|n| key(n)) else { break };
             lost += kids.iter().filter(|c| c.keys[0] != n.keys[0]).count();
             at = n;
         }
@@ -597,7 +551,7 @@ impl Store {
         };
         let has = |e: &&Envelope| e.keys.iter().any(|x| *x == at.keys[0]);
         let mut gone: Vec<Member> = vec![];
-        for m in held {
+        for m in held.clone() {
             if !at.list.iter().any(|x| x.id == m.id) && !gone.contains(&m) {
                 gone.push(m);
             }
@@ -608,10 +562,9 @@ impl Store {
             epoch: at.epoch,
             head: at.hash.clone(),
             list: at.list.clone(),
-            known: all.values().filter(has).flat_map(ids).collect(),
-            ever: ever[at.hash.as_str()].clone(),
+            known: all.values().filter(ok).filter(has).flat_map(ids).collect(),
+            ever: held.iter().map(|m| m.id.clone()).collect(),
             gone,
-            voided,
             leaves: asks
                 .into_iter()
                 .filter(|(id, b)| {
@@ -643,7 +596,7 @@ impl Store {
 
     fn rank_of(&self, id: &str) -> Option<(u64, String)> {
         let root = self.root.as_deref()?;
-        rank(&self.g.list, root, id).filter(|_| !self.g.voided.contains(id))
+        rank(&self.g.list, root, id)
     }
 
     /// Whether this device may change membership.
@@ -784,19 +737,14 @@ impl Store {
     }
 
     /// An admin's work after a sync: requests admitted, leaving members
-    /// and voided ones it outranks removed, a key held by one not a member
-    /// replaced. Nothing on a device no admin.
+    /// removed, a key held by one not a member replaced. Nothing on a device no admin.
     pub(crate) fn settle(&mut self) -> Result<()> {
         if !self.is_admin() {
             return Ok(());
         }
         let me = self.member_id().context("not a group store")?;
         let mut list: Vec<Member> = self.g.list.clone();
-        list.retain(|m| {
-            let leaves = self.g.leaves.contains(&m.id) && !m.admin;
-            let voided = self.g.voided.contains(&m.id) && self.outranks(&m.id);
-            m.id == me || !(leaves || voided)
-        });
+        list.retain(|m| m.admin || !self.g.leaves.contains(&m.id));
         for (name, bundle) in self.requests()? {
             let id = id_of(&bundle);
             if !self.g.ever.contains(&id)
@@ -886,9 +834,23 @@ impl Store {
         seed: &[u8],
         admin: bool,
     ) -> Result<()> {
+        self.puppet(seed, admin, true)
+    }
+
+    /// A device of this one's making in the next envelope (`key`: under a
+    /// new key), whether this one may add it or not.
+    #[cfg(test)]
+    pub(crate) fn puppet(
+        &mut self,
+        seed: &[u8],
+        admin: bool,
+        key: bool,
+    ) -> Result<()> {
         let k = Keys::of(seed);
-        self.rotate()?;
-        self.g.known.clear();
+        if key {
+            self.rotate()?;
+            self.g.known.clear();
+        }
         let mut list = self.g.list.clone();
         list.push(Member {
             id: k.id(),
@@ -898,7 +860,7 @@ impl Store {
             since: self.g.epoch + 1,
             bundle: k.bundle(),
         });
-        self.extend(list, true)
+        self.extend(list, false)
     }
 }
 

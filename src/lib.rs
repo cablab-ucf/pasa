@@ -2265,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_admins_race_and_its_puppet_are_voided() {
+    fn a_removed_admins_race_and_its_puppet_lose() {
         let l = Lab::new("race", &["alice", "bob", "carol"]);
         l.add("alice", "bob");
         l.add("alice", "carol");
@@ -2338,6 +2338,105 @@ mod tests {
         let sc = l.open("carol");
         assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"after\n");
         assert!(!l.names("carol").contains(&"bob".to_string()));
+    }
+
+    #[test]
+    fn a_losing_forks_removal_changes_nothing_in_the_chain_that_holds() {
+        let l = Lab::new("losing", &["alice", "bob", "carol", "dave", "erin"]);
+        for w in ["bob", "carol", "dave", "erin"] {
+            l.add("alice", w);
+        }
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.g(&mut sa).promote("carol").unwrap();
+        for w in ["bob", "carol", "dave", "erin"] {
+            l.sync("alice", w);
+        }
+        // Bob removes carol; alice, at once, extends the same envelope.
+        let mut sb = l.open("bob");
+        sb.group_remove("lab", "carol").unwrap();
+        let mut sa = l.open("alice");
+        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
+        l.sync("alice", "carol");
+        // Carol, an admin on alice's, adds; alice removes dave and writes.
+        let mut sc = l.open("carol");
+        l.g(&mut sc).add_puppet(&rand::<32>(), false).unwrap();
+        l.sync("carol", "alice");
+        let mut sa = l.open("alice");
+        sa.group_remove("lab", "dave").unwrap();
+        sa.put("@lab/s", b"s\n").unwrap();
+        l.sync("alice", "erin");
+        // Bob's losing removal comes late: nothing goes back.
+        l.sync("bob", "erin");
+        l.sync("bob", "alice");
+        for w in ["erin", "alice"] {
+            let s = l.open(w);
+            assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n", "{w}");
+            let n = l.names(w);
+            assert!(
+                n.contains(&"carol".into()) && !n.contains(&"dave".into()),
+                "{w} {n:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_old_self_removal_and_a_members_junk_change_nothing() {
+        let l = Lab::new("junk", &["alice", "bob", "carol", "dave", "dave2"]);
+        for w in ["bob", "carol", "dave"] {
+            l.add("alice", w);
+        }
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        for w in ["bob", "carol", "dave"] {
+            l.sync("alice", w);
+        }
+        let old = l.0.join("bob").join("old");
+        copy_v(&l.lab("bob"), &old);
+        fs::copy(l.lab("bob").join("member"), old.join("member")).unwrap();
+        // Bob extends; alice removes dave and writes.
+        let mut sb = l.open("bob");
+        l.g(&mut sb).add_puppet(&rand::<32>(), false).unwrap();
+        l.sync("bob", "alice");
+        let mut sa = l.open("alice");
+        sa.group_remove("lab", "dave").unwrap();
+        sa.put("@lab/s", b"s\n").unwrap();
+        l.sync("alice", "carol");
+        // Bob leaves on his old copy: his own later envelopes stand.
+        let own = l.0.join("bob").join("own");
+        let mut sb = Store::open(&own, b"bob", None)
+            .unwrap()
+            .links_in(vec![old.clone()]);
+        sb.unlink("old").unwrap();
+        copy_v(&old, &l.lab("carol"));
+        // Carol, a member, seals junk keys to everyone, and an envelope of
+        // the current key naming a stranger: no new key at alice's.
+        let mut sc = l.open("carol");
+        for _ in 0..3 {
+            l.g(&mut sc).puppet(&rand::<32>(), true, true).unwrap();
+        }
+        let mut sc = l.open("carol");
+        l.g(&mut sc).puppet(&rand::<32>(), false, false).unwrap();
+        l.sync("carol", "alice");
+        let mut sa = l.open("alice");
+        let n = l.g(&mut sa).keys().len();
+        drop(sa);
+        let mut sa = l.open("alice");
+        assert_eq!(l.g(&mut sa).keys().len(), n, "no rotation forced");
+        for w in ["alice", "carol"] {
+            let s = l.open(w);
+            assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n", "{w}");
+            assert!(!l.names(w).contains(&"dave".into()), "{w}");
+        }
+        // A device added after the junk opens the group.
+        l.add("alice", "dave2");
+        let s = l.open("dave2");
+        assert!(
+            s.unopened.iter().all(|u| !u.contains("no keys")),
+            "{:?}",
+            s.unopened
+        );
+        assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n");
     }
 
     #[test]
