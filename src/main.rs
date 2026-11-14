@@ -57,6 +57,8 @@ pasa health [--pwned]        weak, reused, expired, and exposed: read by a revok
                              haveibeenpwned.com by 5 hex digits of each SHA-1
 pasa stats                   the store in numbers
 pasa rm NAME | mv OLD NEW
+pasa link DIR | unlink LABEL the store in DIR (a group's) opens with this one after its
+                             password once: its entries show as @LABEL/NAME
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
@@ -817,6 +819,17 @@ fn main() -> Result<()> {
             s.remove(n)?
         }
         ["mv", from, to] => open()?.rename(from, to)?,
+        ["link", d] => {
+            let (mut s, d) = (open()?, pasa::path(d));
+            let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+            let pw = ask(&format!("{}'s password: ", d.display()))?;
+            let yk = challenge(&k).map(yubikey).transpose()?;
+            let g = Store::open(&d, &pw, yk.as_deref().map(|v| &v[..]))?;
+            pasa::remember(&d)?;
+            let l = s.link(g)?;
+            eprintln!("{}: opens with this store, as @{l}/NAME", d.display());
+        }
+        ["unlink", l] => open()?.unlink(l)?,
         ["health", ..] => {
             let s = open()?;
             let h = s.health()?;
@@ -960,24 +973,34 @@ fn reopen(dir: &Path, cmd: &str) -> Result<Command> {
 /// `pasa sync` beside a view, unseen: what it brings shows as `v/` changes.
 #[cfg(any(feature = "tui", feature = "gui"))]
 fn aside(news: bool) {
+    aside_in(&home(), news)
+}
+
+/// [`aside`] for the store in `dir`.
+#[cfg(any(feature = "tui", feature = "gui"))]
+fn aside_in(dir: &Path, news: bool) {
     #[cfg(feature = "sync")]
-    if pasa::sync::net(&home()).join("peers").exists()
-        && pasa::sync::on(&home())
-    {
+    if pasa::sync::net(dir).join("peers").exists() && pasa::sync::on(dir) {
         let c = std::env::current_exe().map(Command::new);
         let _ = c.map(|mut c| {
             c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
-            c.env("PASA_DIR", home());
+            c.env("PASA_DIR", dir);
             c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         });
     }
-    let _ = news;
+    let _ = (dir, news);
 }
 
 #[cfg(feature = "sync")]
 fn report(who: &str, r: Result<usize>) {
+    report_in(&home(), who, r)
+}
+
+/// [`report`] for the store in `dir`.
+#[cfg(feature = "sync")]
+fn report_in(dir: &Path, who: &str, r: Result<usize>) {
     if matches!(r, Ok(1..)) {
-        record();
+        record_in(dir);
     }
     match r {
         Ok(n) => eprintln!("{who}: {n} new"),
@@ -988,7 +1011,13 @@ fn report(who: &str, r: Result<usize>) {
 /// The confined network side ([`net_side`]); it exits when its stdin closes.
 #[cfg(feature = "sync")]
 fn net(args: &[&str]) -> Result<std::process::Child> {
-    let dir = home();
+    net_in(&home(), args)
+}
+
+/// [`net`] for the store in `dir`.
+#[cfg(feature = "sync")]
+fn net_in(dir: &Path, args: &[&str]) -> Result<std::process::Child> {
+    let dir = dir.to_path_buf();
     // Migrate layouts here: the confined child cannot.
     pasa::sync::net(&dir);
     pasa::versions(&dir);

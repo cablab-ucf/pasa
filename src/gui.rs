@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 use pasa::{Form, Store, home, sync};
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -405,7 +406,11 @@ struct App {
     pairing: Option<Pairing>,
     scanning: Option<Scanning>,
     synced: Arc<Mutex<Option<String>>>,
-    serving: bool,
+    /// A store to link: its folder and password.
+    link_dir: String,
+    link_pw: Zeroizing<String>,
+    /// Stores served from here: this one and its linked ones.
+    serving: std::collections::HashSet<PathBuf>,
     rt: Option<tokio::runtime::Runtime>,
 }
 
@@ -610,7 +615,7 @@ impl eframe::App for App {
             self.lock();
         }
         ui.ctx().request_repaint_after(idle);
-        self.serve(&ui.ctx().clone());
+        self.serve(&ui.ctx().clone(), self.dirs());
         if let Some(job) = self.job.take() {
             let was = (self.v.is_some(), self.joined);
             self.said = self
@@ -620,7 +625,7 @@ impl eframe::App for App {
                 .unwrap_or_default();
             // Joined or opened: sync. Joined, the store precedes its password.
             if was != (self.v.is_some(), self.joined) {
-                self.sync_now(ui.ctx(), false);
+                self.sync_now(ui.ctx(), false, self.dirs());
             }
             ui.ctx().request_repaint();
         }
@@ -651,7 +656,7 @@ impl App {
         *self = App {
             prefs: self.prefs.clone(),
             synced: self.synced.clone(),
-            serving: self.serving,
+            serving: self.serving.clone(),
             peer: "home".into(),
             quick: true,
             ..App::default()
@@ -2113,7 +2118,11 @@ impl App {
                 Err(e) => format!("{e:#}"),
             };
             if on {
-                self.sync_now(ui.ctx(), false);
+                self.sync_now(
+                    ui.ctx(),
+                    false,
+                    v.s.dirs().map(Into::into).collect(),
+                );
             }
         }
         let about = "Devices that hold this store sync with each other directly, \
@@ -2168,8 +2177,9 @@ impl App {
         }
         if on && !peers.is_empty() && ui.button("Sync now").clicked() {
             v.note = "Syncing".into();
-            self.sync_now(ui.ctx(), true);
+            self.sync_now(ui.ctx(), true, v.s.dirs().map(Into::into).collect());
         }
+        self.groups(ui, v);
         ui.separator();
         ui.label(RichText::new("Add a device").strong());
         field(ui, "A name for it", &mut self.device, false);
@@ -2188,16 +2198,97 @@ impl App {
         }
     }
 
-    /// In a process of its own: the window opens no socket.
-    fn sync_now(&self, ctx: &Context, news: bool) {
-        if !sync::net(&home()).join("peers").exists() || !sync::on(&home()) {
-            return;
+    /// Linked stores: listed, unlinked, linked.
+    fn groups(&mut self, ui: &mut Ui, v: &mut View) {
+        let l = look(ui);
+        ui.separator();
+        ui.label(RichText::new("Group stores").strong());
+        let about = "A store kept with others (a folder of its own, paired as \
+                     any store) opens with this one after its password once: \
+                     its entries show as @NAME/..., each kept in its own \
+                     store, on disk as before. Unlinked, it opens on its own.";
+        ui.label(RichText::new(about).small().color(l.muted));
+        let mut gone = None;
+        for (label, dir) in v.s.links() {
+            ui.horizontal(|ui| {
+                ui.label(format!("@{label}"));
+                let h = std::env::home_dir().unwrap_or_default();
+                let at = dir
+                    .strip_prefix(&h)
+                    .map_or(dir.display().to_string(), |r| {
+                        format!("~/{}", r.display())
+                    });
+                let at = RichText::new(at);
+                ui.label(at.small().color(l.muted));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Unlink").clicked() {
+                        gone = Some(label.to_string());
+                    }
+                });
+            });
         }
+        for u in &v.s.unopened {
+            let say =
+                format!("@{u}: its password changed there: link it again");
+            ui.label(RichText::new(say).small().color(l.bad));
+        }
+        if let Some(g) = gone {
+            v.note = match v.s.unlink(&g) {
+                Ok(()) => format!("@{g}: unlinked; it opens on its own"),
+                Err(e) => format!("{e:#}"),
+            };
+            v.load();
+        }
+        field(ui, "A store's folder", &mut self.link_dir, false);
+        let typed = field(ui, "Its password", &mut self.link_pw, true);
+        let ok = !self.link_dir.trim().is_empty() && !self.link_pw.is_empty();
+        let go = ui.add_enabled(ok, Button::new("Link")).clicked();
+        if go || (ok && entered(ui, &typed)) {
+            v.note = match self.link(v) {
+                Ok(g) => format!("@{g}: opens with this store from now on"),
+                Err(e) => format!("{e:#}"),
+            };
+            v.load();
+        }
+    }
+
+    fn link(&mut self, v: &mut View) -> Result<String> {
+        let d = pasa::path(&self.link_dir);
+        let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+        anyhow::ensure!(
+            pasa::challenge(&k).is_none(),
+            "it asks for its YubiKey too: pasa link {} in a terminal",
+            d.display()
+        );
+        let g = pasa::Store::open(&d, self.link_pw.as_bytes(), None)?;
+        pasa::remember(&d)?;
+        let label = v.s.link(g)?;
+        (self.link_dir, self.link_pw) = Default::default();
+        Ok(label)
+    }
+
+    /// This store's folder, and its linked stores' once open.
+    fn dirs(&self) -> Vec<PathBuf> {
+        let open =
+            self.v.as_ref().map(|v| v.s.dirs().map(Into::into).collect());
+        open.unwrap_or_else(|| vec![home()])
+    }
+
+    /// In a process of its own, a store each: the window opens no socket.
+    fn sync_now(&self, ctx: &Context, news: bool, dirs: Vec<PathBuf>) {
+        for dir in dirs {
+            if sync::net(&dir).join("peers").exists() && sync::on(&dir) {
+                self.sync_in(ctx, news, dir);
+            }
+        }
+    }
+
+    fn sync_in(&self, ctx: &Context, news: bool, dir: PathBuf) {
         let (out, ctx) = (self.synced.clone(), ctx.clone());
         std::thread::spawn(move || {
             let run = std::env::current_exe().and_then(|p| {
                 std::process::Command::new(p)
-                    .env("PASA_DIR", home())
+                    .env("PASA_DIR", &dir)
                     .arg("sync")
                     .args(news.then_some("--news"))
                     .stdin(std::process::Stdio::null())
@@ -2214,27 +2305,30 @@ impl App {
         });
     }
 
-    /// Started once: the serving process itself follows sync off and on.
-    fn serve(&mut self, ctx: &Context) {
-        let paired = sync::net(&home()).join("peers").exists();
-        if self.serving || !paired || !sync::on(&home()) {
-            return;
-        }
-        self.serving = true;
-        let (out, ctx) = (self.synced.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            // Another process may serve this store: then it does.
-            let Ok(mut c) = crate::net(&["serve"]) else { return };
-            for (who, r) in crate::results(&mut c) {
-                if let Ok(n @ 1..) = r {
-                    *out.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(format!("{who}: {n} new"));
-                }
-                crate::report(&who, r);
-                ctx.request_repaint();
+    /// Started once a store: the serving process itself follows sync off
+    /// and on.
+    fn serve(&mut self, ctx: &Context, dirs: Vec<PathBuf>) {
+        for dir in dirs {
+            let paired = sync::net(&dir).join("peers").exists();
+            if self.serving.contains(&dir) || !paired || !sync::on(&dir) {
+                continue;
             }
-            let _ = c.wait();
-        });
+            self.serving.insert(dir.clone());
+            let (out, ctx) = (self.synced.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                // Another process may serve this store: then it does.
+                let Ok(mut c) = crate::net_in(&dir, &["serve"]) else { return };
+                for (who, r) in crate::results(&mut c) {
+                    if let Ok(n @ 1..) = r {
+                        *out.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(format!("{who}: {n} new"));
+                    }
+                    crate::report_in(&dir, &who, r);
+                    ctx.request_repaint();
+                }
+                let _ = c.wait();
+            });
+        }
     }
 
     /// Some(true): the QR code; Some(false): the code to type.
@@ -2268,7 +2362,7 @@ impl App {
             repaint.request_repaint();
         });
         p.state = "Waiting for it".into();
-        self.serve(ctx);
+        self.serve(ctx, vec![home()]);
         Ok(())
     }
 
@@ -2320,7 +2414,7 @@ impl App {
             let p = self.pairing.as_mut().context("no pairing")?;
             (p.img, p.code) = (Some(qr_image(&ctx, &qr)?), qr);
             p.state = "Waiting for it to sync".into();
-            self.serve(&ctx);
+            self.serve(&ctx, vec![home()]);
         }
         Ok(())
     }

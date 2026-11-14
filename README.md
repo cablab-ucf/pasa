@@ -151,6 +151,26 @@ Relays see addresses, endpoint ids, when and how much. A wake is an
 empty message sealed by [pushir](https://github.com/cablab-ucf/pushir):
 lost or forged, it costs a sync.
 
+## Group stores
+
+A group's shared passwords are a store of their own, in a folder of their
+own, paired among the group's devices as any store is. Linked, it opens
+with yours, one unlock for both:
+
+```sh
+pasa --dir ~/lab init           # once, by one member; the others join it
+pasa link ~/lab                 # its password, once; Devices, Group stores
+pasa ls                         # yours, and @lab/NAME
+pasa set @lab/github            # kept in ~/lab, not in yours
+pasa unlink lab
+```
+
+`~/lab/link` holds the group store's KEK sealed to yours: never in `v/`,
+so never synced, and pairing hands none. Each store stays on disk as it
+was; only the open view unites them, in memory, and each write goes to
+its own store, which syncs, serves and commits as before. Your password,
+changed, seals the links anew; the group's, changed, asks for a new link.
+
 ## Revocation
 
 `pasa revoke NAME` forgets the device and rotates the store key: entries

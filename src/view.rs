@@ -1,6 +1,6 @@
 //! State shared by the terminal and the window.
 
-use crate::{aside, clip, record, text};
+use crate::{aside_in, clip, record_in, text};
 use anyhow::{Context, Result, ensure};
 use pasa::{Secret, Store, field};
 use std::time::Duration;
@@ -36,6 +36,9 @@ impl View {
         v.load();
         if v.s.retired() {
             v.note = pasa::RETIRED_SAY.into();
+        }
+        for u in &v.s.unopened {
+            v.note = format!("@{u}: its password changed there: link it again");
         }
         v
     }
@@ -85,7 +88,7 @@ impl View {
     pub fn put(&mut self, name: &str, body: &[u8]) {
         self.act(|v| {
             v.s.put(name, body)?;
-            news();
+            news(&v.s);
             let did = if body.is_empty() { "deleted" } else { "saved" };
             Ok(format!("{name}: {did}; pasa log {name} has every version"))
         })
@@ -95,7 +98,7 @@ impl View {
         self.act(|v| {
             ensure!(!name.trim().is_empty(), "type a name first");
             let pw = crate::generate(&v.s, name.trim(), pw)?;
-            news();
+            news(&v.s);
             clip(&pw)?;
             Ok(format!("{name}: new password copied, cleared in 45 s"))
         })
@@ -104,14 +107,17 @@ impl View {
     pub fn change(&mut self, f: impl FnOnce(&pasa::Store) -> Result<String>) {
         self.act(|v| {
             let said = f(&v.s)?;
-            news();
+            news(&v.s);
             Ok(said)
         })
     }
 }
 
-/// Commit the change (git, if any) and sync it to the peers.
-fn news() {
-    record();
-    aside(true);
+/// Commit the change (git, if any) and sync it to the peers, in each
+/// store: the one written to, linked or not.
+fn news(s: &Store) {
+    for d in s.dirs() {
+        record_in(d);
+        aside_in(d, true);
+    }
 }
