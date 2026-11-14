@@ -42,8 +42,8 @@ const CHAIN: &str = ".pasa/chain/";
 /// Names this admin paired in and has not admitted: its own, never synced.
 const INVITES: &str = "invites";
 
-/// The most an envelope, a link or a request may take: a list of ~300
-/// members; junk costs no more than this to read.
+/// The most an envelope, a link or a request may take: a list of about
+/// 200 devices; junk costs no more than this to read.
 const MOST: u64 = 1 << 20;
 
 /// A bundle: X-Wing, Ed25519 and ML-DSA-65 public keys.
@@ -439,6 +439,12 @@ pub(crate) struct State {
     redo: Vec<String>,
 }
 
+impl State {
+    pub(crate) fn head(&self) -> &str {
+        &self.head
+    }
+}
+
 impl Store {
     /// A new group store in `dir`, this device its root, `name`.
     pub fn create_group(dir: &Path, name: &str) -> Result<Store> {
@@ -733,6 +739,11 @@ impl Store {
             .filter(|m| to.is_none_or(|t| t.contains(&m.id)))
             .collect();
         let ct = seal_to(&to, &pt)?;
+        // Its copy, a padded version, stays within the bound too.
+        ensure!(
+            ct.len() as u64 + (64 << 10) <= MOST,
+            "a group of about 200 devices at most"
+        );
         write(&self.v.join(name_of(&ct)), &ct)?;
         let h = HEXLOWER.encode(&Sha256::digest(&pt));
         self.g.body = pt;
@@ -832,6 +843,9 @@ impl Store {
             return Ok(());
         }
         let me = self.member_id().context("not a group store")?;
+        // Admitted: in the chain as this open found it; one admitted now
+        // keeps its invitation until a later open finds that it held.
+        let found = self.g.list.clone();
         let mut list: Vec<Member> = self.g.list.clone();
         list.retain(|m| {
             !self.g.leaves.contains(&m.id) || !self.outranks(&m.id)
@@ -861,7 +875,7 @@ impl Store {
         // Invitations taken, and pairings with devices gone, forgotten.
         let mut i = self.invites();
         let done =
-            |n: &String| self.g.list.iter().any(|m| m.by == me && m.name == *n);
+            |n: &String| found.iter().any(|m| m.by == me && m.name == *n);
         if i.iter().any(done) {
             i.retain(|n| !done(n));
             write(&self.dir.join(INVITES), i.join("\n").as_bytes())?;

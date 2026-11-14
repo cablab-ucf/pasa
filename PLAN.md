@@ -74,6 +74,14 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      outdated every edit after (any store: a version dated over a day
      ahead still syncs, but is never the newest); recovery missed linked
      stores.
+   - Sixth review (fixed): one damaged version stopped every rotation,
+     so every removal (any store); a window open across a removal wrote
+     under the key the removed device holds (now: writes check the chain
+     again as envelopes come, and refuse once it moved: unlock again); an
+     admission set aside lost its invitation; over ~200 devices, sealed
+     and then ignored (now refused). Known: a version dated just under a
+     day ahead dates later edits that far (a rotation clears it); a device
+     with a clock over a day fast has its edits held back until then.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

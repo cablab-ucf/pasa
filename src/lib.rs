@@ -294,6 +294,9 @@ struct Index {
     mtime: Option<SystemTime>,
     tips: HashMap<String, (u64, String)>,
     last: u64,
+    /// A group's envelope files, and those its chain was last checked at.
+    envelopes: HashSet<String>,
+    checked: Option<HashSet<String>>,
 }
 
 /// A day from now, in ms.
@@ -857,9 +860,19 @@ impl Store {
 
     /// Writes history and entries under `new`, not yet a key of the store.
     pub(crate) fn stage(&mut self, new: &[u8]) -> Result<()> {
-        let e = self.entries_here()?.into_values();
-        let e = e.map(|v| Ok((self.body(&v)?, v)));
-        let e = e.collect::<Result<Vec<_>>>()?;
+        // A damaged version (any key holder can write one) stops no
+        // rotation, and so no removal: left behind, and said.
+        let all: Vec<Version> = self.entries_here()?.into_values().collect();
+        let n = all.len();
+        let e: Vec<_> = all
+            .into_iter()
+            .filter_map(|v| Some((self.body(&v).ok()?, v)))
+            .collect();
+        if e.len() < n {
+            let d = n - e.len();
+            self.unopened
+                .push(format!("{d} damaged version(s) left at the old key"));
+        }
         let x = self.index()?;
         let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
         let now: Vec<String> = x.heads.keys().cloned().collect();
@@ -994,6 +1007,7 @@ impl Store {
         let names: HashSet<String> = names.filter(|n| is_name(n)).collect();
         x.heads.retain(|f, _| names.contains(f));
         x.old.retain(|f, _| names.contains(f));
+        x.envelopes.retain(|f| names.contains(f));
         let mut bad = 0;
         let known =
             |n: &&String| x.heads.contains_key(*n) || x.old.contains_key(*n);
@@ -1003,7 +1017,7 @@ impl Store {
                 Some((h, None)) => drop(x.heads.insert(n.clone(), h)),
                 Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
                 // A group's envelope: its keys, not a version.
-                None if self.envelope(n) => {}
+                None if self.envelope(n) => drop(x.envelopes.insert(n.clone())),
                 None => bad += 1,
             }
         }
@@ -1178,11 +1192,12 @@ impl Store {
     fn forms(&self) -> Result<Vec<(String, Form)>> {
         let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
         let names = self.entries()?.into_keys().filter(shown);
+        // A damaged version is passed over, not a stop to every check.
         let form = |n: String| {
-            let f = Form::parse(&String::from_utf8_lossy(&self.get(&n)?));
-            Ok((n, f))
+            let f = Form::parse(&String::from_utf8_lossy(&self.get(&n).ok()?));
+            Some((n, f))
         };
-        names.map(form).collect()
+        Ok(names.filter_map(form).collect())
     }
 
     pub fn stats(&self) -> Result<Vec<(&'static str, String)>> {
@@ -1340,6 +1355,19 @@ impl Store {
              password or a pairing): unlock again"
         );
         drop(loaded);
+        // A group's: written only on the chain this unlock read (a device
+        // removed since must not read it), checked again as envelopes come.
+        if let (Some(seed), Some(root)) = (&self.member, &self.root)
+            && x.checked.as_ref() != Some(&x.envelopes)
+        {
+            let now = Store::open_member(&self.dir, seed, root)?;
+            ensure!(
+                now.g.head() == self.g.head(),
+                "the group changed since this unlock (a device added or \
+                 removed): unlock again"
+            );
+            x.checked = Some(x.envelopes.clone());
+        }
         let newest = self.staged.as_ref().or(self.keys.first());
         let newest = newest.context("no store key")?;
         ensure!(
@@ -2266,7 +2294,10 @@ mod tests {
         // Bob's own envelope (a puppet, a key), and his writes: none counts.
         let mut sb = l.open("bob");
         l.g(&mut sb).add_puppet(&rand::<32>(), true).unwrap();
-        sb.put("@lab/evil", b"x\n").unwrap();
+        // Honest code writes on no chain but the valid one; an attacker's,
+        // under its own key: neither counts.
+        assert!(sb.put("@lab/evil", b"x\n").is_err());
+        l.open("bob").put("@lab/evil", b"x\n").unwrap();
         for (f, t) in [
             ("bob", "carol"),
             ("alice", "carol"),
@@ -2436,8 +2467,8 @@ mod tests {
         copy_v(&old, &l.lab("carol"));
         // Carol, a member, seals junk keys to everyone, and an envelope of
         // the current key naming a stranger: no new key at alice's.
-        let mut sc = l.open("carol");
         for _ in 0..3 {
+            let mut sc = l.open("carol");
             l.g(&mut sc).puppet(&rand::<32>(), true, true).unwrap();
         }
         let mut sc = l.open("carol");
@@ -2617,6 +2648,66 @@ mod tests {
         drop(x);
         s.put("k", b"good").unwrap();
         assert_eq!(&s.get("k").unwrap()[..], b"good");
+    }
+
+    #[test]
+    fn a_damaged_version_and_a_stale_window_leak_nothing() {
+        let l = Lab::new("stale", &["alice", "bob", "carol"]);
+        l.add("alice", "bob");
+        l.add("alice", "carol");
+        // Bob plants a version saying it is longer than it is.
+        let mut sb = l.open("bob");
+        let k = l.g(&mut sb).keys()[0].clone();
+        let ms = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis();
+        let pt = format!("{ms} - 999999 zzz\n12345");
+        let ct = encrypt(&recipient(&k), pt.as_bytes()).unwrap();
+        fs::write(versions(&l.lab("bob")).join(name_of(&ct)), &ct).unwrap();
+        l.sync("bob", "alice");
+        l.sync("alice", "carol");
+        // Carol's window is open; alice removes bob all the same.
+        let mut sc = l.open("carol");
+        let mut sa = l.open("alice");
+        sa.group_remove("lab", "bob").unwrap();
+        sa.health().unwrap();
+        l.sync("alice", "carol");
+        // Carol's window, opened before: it writes nothing under the old key.
+        assert!(sc.put("@lab/after", b"secret\n").is_err());
+        assert!(l.g(&mut sc).put("after", b"secret\n").is_err());
+        let sc = l.open("carol");
+        sc.put("@lab/after", b"secret\n").unwrap();
+        l.sync("carol", "bob");
+        assert!(l.open("bob").get("@lab/after").is_err());
+    }
+
+    #[test]
+    fn an_admission_set_aside_is_made_again() {
+        let l = Lab::new("admit", &["alice", "bob", "dave"]);
+        l.add("alice", "bob");
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.sync("alice", "bob");
+        // Bob pairs dave in; alice, at once, makes a change of hers.
+        let mut sb = l.open("bob");
+        let root = l.g(&mut sb).invite("dave").unwrap();
+        let got =
+            crate::sync::offer_group(&l.lab("bob"), "dave", &root).unwrap();
+        let (root, psk) =
+            crate::sync::take_group(&l.lab("dave"), "bob", &got).unwrap();
+        l.open("dave").join_group(&l.lab("dave"), &root, &psk).unwrap();
+        l.sync("dave", "bob");
+        drop(l.open("bob")); // admits dave
+        let mut sa = l.open("alice");
+        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
+        l.sync("alice", "bob");
+        l.sync("bob", "alice");
+        assert!(!l.names("alice").contains(&"dave".into()), "alice's holds");
+        drop(l.open("bob")); // admits dave again, on alice's
+        l.sync("bob", "alice");
+        l.sync("bob", "dave");
+        assert!(l.names("alice").contains(&"dave".into()));
+        l.open("alice").put("@lab/s", b"s\n").unwrap();
+        l.sync("alice", "dave");
+        assert_eq!(&l.open("dave").get("@lab/s").unwrap()[..], b"s\n");
     }
 
     #[test]
