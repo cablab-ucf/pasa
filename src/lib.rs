@@ -1991,6 +1991,18 @@ mod tests {
             .unwrap();
         sync(&a, &c);
         assert!(open(&c, "carol").get("@lab/wifi").is_ok());
+        // Carol paired with bob's device too.
+        let node = crate::sync::node(&lab(&b)).unwrap();
+        let id = HEXLOWER.decode(node.as_bytes()).unwrap();
+        let id = iroh::PublicKey::from_bytes(&id.try_into().unwrap()).unwrap();
+        let peer = |name: &str| crate::sync::Peer {
+            name: name.into(),
+            psk: [1; 32],
+            id: Some(id),
+            lane: None,
+            seen: None,
+        };
+        crate::sync::add(&lab(&c), peer("bobby")).unwrap();
         // Bob leaves: a new key, sealed to alice and carol alone.
         sa.linked[0].1.remove_member(&bob).unwrap();
         sa.put("@lab/wifi", b"w2\n").unwrap();
@@ -2006,6 +2018,7 @@ mod tests {
         );
         let sc = open(&c, "carol");
         assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"w2\n");
+        assert!(crate::sync::peers(&lab(&c)).is_empty(), "bob's pairing gone");
         assert_eq!(
             sc.history("@lab/wifi").unwrap().len(),
             3,

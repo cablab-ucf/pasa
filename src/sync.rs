@@ -109,12 +109,25 @@ fn named(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn add(dir: &Path, p: Peer) -> Result<()> {
+pub(crate) fn add(dir: &Path, p: Peer) -> Result<()> {
     named(&p.name)?;
     let mut ps = peers(dir);
     ps.retain(|q| q.name != p.name);
     ps.push(p);
     save(dir, &ps)
+}
+
+/// This device's sync endpoint for the store in `dir`, hex.
+pub fn node(dir: &Path) -> Result<String> {
+    Ok(HEXLOWER.encode(key(dir, "node")?.public().as_bytes()))
+}
+
+/// Forgets the peer at endpoint `hex`, if any.
+pub fn forget_node(dir: &Path, hex: &str) -> Result<()> {
+    let at = peers(dir)
+        .into_iter()
+        .find(|p| p.id.is_some_and(|i| HEXLOWER.encode(i.as_bytes()) == hex));
+    at.map_or(Ok(()), |p| forget(dir, &p.name))
 }
 
 pub fn forget(dir: &Path, name: &str) -> Result<()> {

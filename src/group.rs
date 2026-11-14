@@ -23,7 +23,8 @@ const INFO: &[u8] = b"pasa group keys 1";
 const HEAD: &[u8] = b"pasa keys\n";
 /// What an envelope's first stanza line starts with.
 const ENVELOPE: &[u8] = b"age-encryption.org/v1\n-> pasa-xwing ";
-/// `MEMBERS` + id: name, line; who added it (an id, or -), line; public key.
+/// `MEMBERS` + id, lines: name; who added it (an id, ~ the id it replaces,
+/// or -); its sync endpoint here (hex, or - until it says); then its key.
 pub(crate) const MEMBERS: &str = ".pasa/members/";
 
 type Sk = <XWing as Kem>::PrivateKey;
@@ -137,9 +138,29 @@ fn open(me: &Me, ct: &[u8]) -> Option<(Vec<Secret>, Vec<String>)> {
 pub struct Member {
     pub id: String,
     pub name: String,
-    /// The id of the member that added it, or "-".
+    /// The id of the member that added it, ~ the one it replaces, or "-".
     pub by: String,
+    /// Its sync endpoint in this group's folder, hex, or "-".
+    pub node: String,
     pk: Vec<u8>,
+}
+
+/// A member record's name, by, node and public key.
+fn parse(b: &[u8]) -> Option<(String, String, String, Vec<u8>)> {
+    let mut l = b.splitn(4, |&c| c == b'\n');
+    let mut s = || l.next().map(|b| String::from_utf8_lossy(b).into_owned());
+    let (name, by, node) = (s()?, s()?, s()?);
+    Some((name, by, node, l.next()?.to_vec()))
+}
+
+/// This device's sync endpoint for the store in `dir`, hex.
+fn own_node(dir: &Path) -> String {
+    #[cfg(feature = "sync")]
+    if let Ok(n) = crate::sync::node(dir) {
+        return n;
+    }
+    let _ = dir;
+    "-".into()
 }
 
 impl Store {
@@ -151,7 +172,7 @@ impl Store {
         let keys = vec![Zeroizing::new(rand::<32>().to_vec())];
         let mut s = Store::new(dir, keys, Default::default(), vec![])?;
         s.member = Some(Zeroizing::new(rand::<32>().to_vec()));
-        s.record(&s.my_key()?, name, "-")?;
+        s.record(&s.my_key()?, name, "-", &own_node(dir))?;
         s.seal_keys()?;
         Ok(s)
     }
@@ -255,27 +276,26 @@ impl Store {
             if gone.contains(id) {
                 continue;
             }
-            let b = self.get(&n)?;
-            let mut l = b.splitn(3, |&c| c == b'\n');
-            let (name, by) =
-                (l.next().unwrap_or_default(), l.next().unwrap_or_default());
-            let pk = l.next().unwrap_or_default().to_vec();
+            let Some((name, by, node, pk)) = parse(&self.get(&n)?) else {
+                continue;
+            };
             if id_of(&pk) == id {
-                let s = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
-                out.push(Member {
-                    id: id.into(),
-                    name: s(name),
-                    by: s(by),
-                    pk,
-                });
+                out.push(Member { id: id.into(), name, by, node, pk });
             }
         }
         Ok(out)
     }
 
-    fn record(&self, pk: &[u8], name: &str, by: &str) -> Result<()> {
-        ensure!(!name.contains('\n') && !by.contains('\n'), "a bad name");
-        let body = [format!("{name}\n{by}\n").as_bytes(), pk].concat();
+    fn record(
+        &self,
+        pk: &[u8],
+        name: &str,
+        by: &str,
+        node: &str,
+    ) -> Result<()> {
+        let bad = [name, by, node].iter().any(|f| f.contains('\n'));
+        ensure!(!bad, "a bad name");
+        let body = [format!("{name}\n{by}\n{node}\n").as_bytes(), pk].concat();
         self.put(&format!("{MEMBERS}{}", id_of(pk)), &body)
     }
 
@@ -294,7 +314,7 @@ impl Store {
     pub fn add_member(&mut self, name: &str) -> Result<Secret> {
         let me = self.member_id().context("not a group store")?;
         let seed = Zeroizing::new(rand::<32>().to_vec());
-        self.record(&public(&seed), name, &me)?;
+        self.record(&public(&seed), name, &me, "-")?;
         self.seal_keys()?;
         Ok(seed)
     }
@@ -315,6 +335,7 @@ impl Store {
         self.rotate_members(
             &ms.iter().filter(|m| m.id != gone).collect::<Vec<_>>(),
         )?;
+        self.forget_removed()?;
         Ok(gone)
     }
 
@@ -323,7 +344,7 @@ impl Store {
         self.rotate()?;
         self.current = 1;
         for m in keep {
-            self.record(&m.pk, &m.name, &m.by)?;
+            self.record(&m.pk, &m.name, &m.by, &m.node)?;
         }
         self.seal_keys()
     }
@@ -343,7 +364,8 @@ impl Store {
 
     /// This device's key recorded in place of `old` (`by`: ~old), and sealed.
     fn claim(&mut self, name: &str, old: &str) -> Result<()> {
-        self.record(&self.my_key()?, name, &format!("~{old}"))?;
+        let node = own_node(&self.dir);
+        self.record(&self.my_key()?, name, &format!("~{old}"), &node)?;
         self.put(&format!("{MEMBERS}{old}"), b"")?;
         self.seal_keys()
     }
@@ -377,6 +399,33 @@ impl Store {
         }
         if ids.iter().any(|i| !self.sealed_to.contains(i)) {
             self.seal_keys()?;
+        }
+        self.forget_removed()
+    }
+
+    /// No pairing here with a removed member's device: it fetched sealed
+    /// files and could fill the disk; it now reaches nobody of the group.
+    fn forget_removed(&self) -> Result<()> {
+        #[cfg(feature = "sync")]
+        {
+            let vs = self.versions_here()?;
+            let rec = |v: &&crate::Version| v.name.starts_with(MEMBERS);
+            let removed: HashSet<&str> = (vs.iter().filter(rec))
+                .filter(|v| v.size == 0)
+                .filter_map(|v| v.name.strip_prefix(MEMBERS))
+                .collect();
+            let mine = own_node(&self.dir);
+            for v in vs.iter().filter(rec).filter(|v| v.size > 0) {
+                let id = v.name.strip_prefix(MEMBERS).unwrap_or_default();
+                let Some((_, _, node, _)) =
+                    self.body(v).ok().and_then(|b| parse(&b))
+                else {
+                    continue;
+                };
+                if removed.contains(id) && node != "-" && node != mine {
+                    crate::sync::forget_node(&self.dir, &node)?;
+                }
+            }
         }
         Ok(())
     }
