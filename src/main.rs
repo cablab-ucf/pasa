@@ -51,11 +51,20 @@ pasa gen NAME [N] -w [-d] [-s CHARS] [-l]
                              CHARS between them, -l: some letters as 1337)
 pasa attach NAME FILE        keep a file with an entry
 pasa files NAME [FILE]       those files, or one, to stdout
-pasa health [--pwned]        weak, reused and expired passwords; --pwned: breached ones,
+pasa health [--pwned]        weak, reused, expired, and exposed: read by a revoked device;
+                             --pwned: breached ones,
                              from the list $PASA_PWNED names, else asking
                              haveibeenpwned.com by 5 hex digits of each SHA-1
 pasa stats                   the store in numbers
 pasa rm NAME | mv OLD NEW
+pasa link DIR | unlink LABEL the store in DIR (a group's) opens with this one after its
+                             password once: its entries show as @LABEL/NAME
+pasa group new DIR NAME      a group store in DIR: no password, a key per device (this
+                             one's, NAME); it opens with this store, as @DIR's-name/
+pasa group add LABEL NAME [--qr]   a code for device NAME to join @LABEL
+pasa group join DIR NAME CODE|--scan   join the group NAME's code is for, into DIR
+pasa group ls LABEL | rm LABEL MEMBER   its members; one removed: a new key, the
+                             rest's alone (nobody pairs again)
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
@@ -425,6 +434,7 @@ fn open() -> Result<Store> {
     if s.retired() {
         eprintln!("{}", pasa::RETIRED_SAY);
     }
+    s.unopened.iter().for_each(|u| eprintln!("{u}"));
     Ok(s)
 }
 
@@ -668,6 +678,7 @@ fn record_in(dir: &Path) {
 }
 
 fn main() -> Result<()> {
+    pasa::harden();
     let mut a: Vec<String> = std::env::args().skip(1).collect();
     if a.first().is_some_and(|f| f == "--dir") {
         ensure!(a.len() > 1, "{USAGE}");
@@ -815,6 +826,17 @@ fn main() -> Result<()> {
             s.remove(n)?
         }
         ["mv", from, to] => open()?.rename(from, to)?,
+        ["link", d] => {
+            let (mut s, d) = (open()?, pasa::path(d));
+            let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+            let pw = ask(&format!("{}'s password: ", d.display()))?;
+            let yk = challenge(&k).map(yubikey).transpose()?;
+            let g = Store::open(&d, &pw, yk.as_deref().map(|v| &v[..]))?;
+            pasa::remember(&d)?;
+            let l = s.link(g)?;
+            eprintln!("{}: opens with this store, as @{l}/NAME", d.display());
+        }
+        ["unlink", l] => open()?.unlink(l)?,
         ["health", ..] => {
             let s = open()?;
             let h = s.health()?;
@@ -823,6 +845,7 @@ fn main() -> Result<()> {
                 .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
             h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
             h.expired.iter().for_each(|n| println!("expired {n}"));
+            h.exposed.iter().for_each(|n| println!("exposed {n}"));
             // Passwords alone: not what is attached, nor an empty one.
             let asked = |n: &String| {
                 flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
@@ -918,7 +941,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "sync")]
         [
             "pair" | "join" | "sync" | "serve" | "listen" | "peers" | "forget"
-            | "revoke",
+            | "revoke" | "group",
             ..,
         ] => return sync(&a),
         ["show", n] | [n] => {
@@ -957,24 +980,29 @@ fn reopen(dir: &Path, cmd: &str) -> Result<Command> {
 /// `pasa sync` beside a view, unseen: what it brings shows as `v/` changes.
 #[cfg(any(feature = "tui", feature = "gui"))]
 fn aside(news: bool) {
+    aside_in(&home(), news)
+}
+
+/// [`aside`] for the store in `dir`.
+#[cfg(any(feature = "tui", feature = "gui"))]
+fn aside_in(dir: &Path, news: bool) {
     #[cfg(feature = "sync")]
-    if pasa::sync::net(&home()).join("peers").exists()
-        && pasa::sync::on(&home())
-    {
+    if pasa::sync::net(dir).join("peers").exists() && pasa::sync::on(dir) {
         let c = std::env::current_exe().map(Command::new);
         let _ = c.map(|mut c| {
             c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
-            c.env("PASA_DIR", home());
+            c.env("PASA_DIR", dir);
             c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         });
     }
-    let _ = news;
+    let _ = (dir, news);
 }
 
+/// What a sync brought `dir`: committed, and said.
 #[cfg(feature = "sync")]
-fn report(who: &str, r: Result<usize>) {
+fn report_in(dir: &Path, who: &str, r: Result<usize>) {
     if matches!(r, Ok(1..)) {
-        record();
+        record_in(dir);
     }
     match r {
         Ok(n) => eprintln!("{who}: {n} new"),
@@ -985,7 +1013,13 @@ fn report(who: &str, r: Result<usize>) {
 /// The confined network side ([`net_side`]); it exits when its stdin closes.
 #[cfg(feature = "sync")]
 fn net(args: &[&str]) -> Result<std::process::Child> {
-    let dir = home();
+    net_in(&home(), args)
+}
+
+/// [`net`] for the store in `dir`.
+#[cfg(feature = "sync")]
+fn net_in(dir: &Path, args: &[&str]) -> Result<std::process::Child> {
+    let dir = dir.to_path_buf();
     // Migrate layouts here: the confined child cannot.
     pasa::sync::net(&dir);
     pasa::versions(&dir);
@@ -1019,19 +1053,24 @@ fn results(
 
 #[cfg(feature = "sync")]
 fn net_run(args: &[&str]) -> Result<()> {
-    let mut c = net(args)?;
-    results(&mut c).for_each(|(w, r)| report(&w, r));
+    net_run_in(&home(), args)
+}
+
+#[cfg(feature = "sync")]
+fn net_run_in(dir: &Path, args: &[&str]) -> Result<()> {
+    let mut c = net_in(dir, args)?;
+    results(&mut c).for_each(|(w, r)| report_in(dir, &w, r));
     ensure!(c.wait()?.success(), "the network side failed");
     Ok(())
 }
 
 #[cfg(feature = "sync")]
-fn serve_until(name: &str) -> Result<()> {
+fn serve_until_in(dir: &Path, name: &str) -> Result<()> {
     eprintln!("waiting for {name} to sync (Ctrl-C: later, by pasa serve)");
-    let mut c = net(&["serve"])?;
+    let mut c = net_in(dir, &["serve"])?;
     for (w, r) in results(&mut c) {
         let done = w == name && r.is_ok();
-        report(&w, r);
+        report_in(dir, &w, r);
         if done {
             return Ok(());
         }
@@ -1043,8 +1082,16 @@ fn serve_until(name: &str) -> Result<()> {
 #[cfg(feature = "sync")]
 fn net_side(a: &[&str]) -> Result<()> {
     let dir = home();
-    if !pasa::confine::confine(&dir)? {
-        eprintln!("pasa: the network side is not confined: no Landlock here");
+    // `listen` reaches pushir's daemon; nothing else reaches a unix socket.
+    let sock = pushir::local::sock();
+    let unix = (a == ["listen"]).then(|| sock.parent()).flatten();
+    // Never at sync's cost: unconfined, it is said and syncs still.
+    match pasa::confine::confine(&dir, unix) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "pasa: the network side is not confined: no Landlock here"
+        ),
+        Err(e) => eprintln!("pasa: the network side is not confined: {e:#}"),
     }
     let mut got = String::new();
     if a == ["give"] {
@@ -1110,9 +1157,83 @@ async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
             );
         }
         ["take", code] => println!("{}", B64.encode(&sync::fetch(code).await?)),
+        ["take-group", code] => {
+            println!("{}", B64.encode(&sync::fetch_in(code, true).await?))
+        }
         _ => bail!("{USAGE}"),
     }
     Ok(())
+}
+
+/// Shows device `name` the pairing `got` for the store in `dir` (a QR code,
+/// or a code through pairir), then serves until it has synced.
+#[cfg(feature = "sync")]
+async fn hand(
+    dir: &Path,
+    name: &str,
+    got: &[u8],
+    qr: bool,
+    there: &str,
+) -> Result<()> {
+    match qr {
+        true => {
+            let pw = qr_password(name)?;
+            let qr = pasa::sync::qr(got, text(&pw)?).await?;
+            // The password off the screen, scrollback too.
+            if std::io::stderr().is_terminal() {
+                eprint!("\x1b[H\x1b[2J\x1b[3J");
+            }
+            let c = qrcode::QrCode::new(&qr)?;
+            println!(
+                "{}",
+                c.render::<qrcode::render::unicode::Dense1x2>().build()
+            );
+            println!("there: scan it, or {there} {qr}");
+        }
+        false => {
+            let mut c = net_in(dir, &["give"])?;
+            let mut i = c.stdin.take().context("stdin")?;
+            writeln!(i, "{}", B64.encode(got))?;
+            let mut l = lines(&mut c);
+            let code = l.next().context("no code: no relay?")?;
+            println!("{code}\nthere: {there} {code}");
+            match l.next().as_deref() {
+                Some("taken") => eprintln!("{name} took it"),
+                Some("spent") => bail!(
+                    "the code was used by someone who did not prove it: \
+                     pasa forget {name}, then pair again"
+                ),
+                _ => bail!("nobody came: pair again"),
+            }
+        }
+    }
+    serve_until_in(dir, name)
+}
+
+/// A pairing's payload from a code, a QR code's text, or `--scan`.
+#[cfg(feature = "sync")]
+async fn fetched(code: &str, group: bool) -> Result<Secret> {
+    let scanned = match code {
+        #[cfg(feature = "scan")]
+        "--scan" => {
+            eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
+            crate::scan::scan()?
+        }
+        c => c.to_string(),
+    };
+    let code = scanned.trim();
+    Ok(match code.starts_with("PAIRIR1:") {
+        true => {
+            let pw = ask("QR code password: ")?;
+            pasa::sync::unqr_in(code, text(&pw)?, group).await?
+        }
+        false => {
+            let take = if group { "take-group" } else { "take" };
+            let mut c = net(&[take, code])?;
+            let l = lines(&mut c).next().context("no answer")?;
+            Zeroizing::new(B64.decode(l.as_bytes())?)
+        }
+    })
 }
 
 #[cfg(feature = "sync")]
@@ -1135,63 +1256,82 @@ async fn sync(a: &[&str]) -> Result<()> {
     use pasa::sync;
     let dir = home();
     match a {
+        ["group", "new", d, name] => {
+            let (mut s, d) = (open()?, pasa::path(d));
+            let g = pasa::Store::create_group(&d, name)?;
+            pasa::remember(&d)?;
+            let l = s.link(g)?;
+            eprintln!(
+                "@{l}: a group store, opening with yours; pasa group add {l} NAME"
+            );
+        }
+        ["group", "add", l, name, ..] => {
+            let mut s = open()?;
+            let g = s.group(l)?;
+            let seed = g.add_member(name)?;
+            let (d, got) =
+                (g.dir.clone(), sync::offer_group(&g.dir, name, &seed)?);
+            drop(s);
+            hand(
+                &d,
+                name,
+                &got,
+                a.contains(&"--qr"),
+                "pasa group join DIR NAME",
+            )
+            .await?;
+        }
+        ["group", "join", d, name, code] => {
+            let (mut s, d) = (open()?, pasa::path(d));
+            let got = fetched(code, true).await?;
+            let seed = sync::take_group(&d, name, &got)?;
+            s.join_group(&d, &seed)?;
+            pasa::remember(&d)?;
+            net_run_in(&d, &["sync"])?;
+            eprintln!("@{}: joined; it opens with your store", s.label_of(&d));
+        }
+        ["group", "ls", l] => {
+            let mut s = open()?;
+            let g = s.group(l)?;
+            let me = g.member_id();
+            for m in g.members()? {
+                let here = if Some(&m.id) == me.as_ref() {
+                    "  (this device)"
+                } else {
+                    ""
+                };
+                println!("{}  {}{here}", m.id, m.name);
+            }
+        }
+        ["group", "rm", l, who] => {
+            let mut s = open()?;
+            let g = s.group(l)?;
+            let name = g
+                .members()?
+                .into_iter()
+                .find(|m| m.id == *who || m.name == *who);
+            let id = g.remove_member(who)?;
+            let d = g.dir.clone();
+            // Its pairing here, if this device paired it.
+            if let Some(m) = name {
+                let _ = sync::forget(&d, &m.name);
+            }
+            record_in(&d);
+            if sync::on(&d) {
+                net_run_in(&d, &["sync", "--news"])?;
+            }
+            eprintln!(
+                "{id}: removed; a new key for the rest. What it read it keeps: \
+                 pasa health lists the passwords to change"
+            );
+        }
         ["pair", name, ..] => {
             let got = sync::offer(&dir, name)?;
-            match a.contains(&"--qr") {
-                true => {
-                    let pw = qr_password(name)?;
-                    let qr = sync::qr(&got, text(&pw)?).await?;
-                    // The password off the screen, scrollback too.
-                    if std::io::stderr().is_terminal() {
-                        eprint!("\x1b[H\x1b[2J\x1b[3J");
-                    }
-                    let c = qrcode::QrCode::new(&qr)?;
-                    println!(
-                        "{}",
-                        c.render::<qrcode::render::unicode::Dense1x2>().build()
-                    );
-                    println!("there: scan it, or pasa join NAME {qr}");
-                }
-                false => {
-                    let mut c = net(&["give"])?;
-                    let mut i = c.stdin.take().context("stdin")?;
-                    writeln!(i, "{}", B64.encode(&got))?;
-                    let mut l = lines(&mut c);
-                    let code = l.next().context("no code: no relay?")?;
-                    println!("{code}\nthere: pasa join NAME {code}");
-                    match l.next().as_deref() {
-                        Some("taken") => eprintln!("{name} took it"),
-                        Some("spent") => bail!(
-                            "the code was used by someone who did not prove it: \
-                             pasa forget {name}, then pair again"
-                        ),
-                        _ => bail!("nobody came: pair again"),
-                    }
-                }
-            }
-            serve_until(name)?;
+            hand(&dir, name, &got, a.contains(&"--qr"), "pasa join NAME")
+                .await?;
         }
         ["join", name, code] => {
-            let scanned = match *code {
-                #[cfg(feature = "scan")]
-                "--scan" => {
-                    eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
-                    crate::scan::scan()?
-                }
-                c => c.to_string(),
-            };
-            let code = scanned.trim();
-            let got = match code.starts_with("PAIRIR1:") {
-                true => {
-                    let pw = ask("QR code password: ")?;
-                    sync::unqr(code, text(&pw)?).await?
-                }
-                false => {
-                    let mut c = net(&["take", code])?;
-                    let l = lines(&mut c).next().context("no answer")?;
-                    Zeroizing::new(B64.decode(l.as_bytes())?)
-                }
-            };
+            let got = fetched(code, false).await?;
             sync::take(&dir, name, &got)?;
             net_run(&["sync"])?;
             eprintln!("The store is here: its password opens it (pasa ls)");
@@ -1223,16 +1363,18 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["forget", name] => sync::forget(&dir, name)?,
         ["revoke", name] => {
-            sync::revoke(&mut open()?, name)?;
+            let mut s = open()?;
+            sync::revoke(&mut s, name)?;
             if sync::on(&dir) {
                 net_run(&["sync", "--news"])?;
             }
             eprintln!(
                 "A new store key: pair the other devices again (pasa pair \
                  NAME here, join there), and forget {name} on each. What \
-                 {name} knew it still knows: change those passwords at \
-                 their services"
+                 {name} knew it still knows: change these passwords at \
+                 their services (pasa health lists those left):"
             );
+            s.health()?.exposed.iter().for_each(|n| println!("{n}"));
         }
         _ => bail!("{USAGE}"),
     }

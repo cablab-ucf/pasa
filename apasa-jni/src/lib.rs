@@ -113,10 +113,48 @@ pub extern "system" fn Java_com_apasa_Native_open<'l>(
     })
 }
 
-fn opened(st: Store) -> Result<jlong> {
+fn opened(mut st: Store) -> Result<jlong> {
+    st.add_links(groups(&st.dir));
     let h = jlong::from_be_bytes(pasa::rand());
     stores().insert(h, st);
     Ok(h)
+}
+
+/// Group stores sit in `groups/` beside the stores, out of the store list.
+fn groups_at(dir: &Path) -> std::path::PathBuf {
+    dir.parent().unwrap_or(dir).join("groups")
+}
+
+fn groups(dir: &Path) -> Vec<std::path::PathBuf> {
+    let all = std::fs::read_dir(groups_at(dir)).into_iter().flatten();
+    all.flatten().map(|e| e.path()).collect()
+}
+
+/// `dir`, and the folders of the stores linked to the one open from it:
+/// what a sync, serve or wake of `dir` covers.
+fn reach(dir: &str) -> Vec<std::path::PathBuf> {
+    let at = Path::new(dir);
+    let st = stores();
+    let open = st.values().find(|s| s.dir == at);
+    open.map_or_else(|| vec![at.into()], |s| s.dirs().map(Into::into).collect())
+}
+
+/// [`sync::sync`] of each folder [`reach`]ed, its peers' results said.
+fn sync_all(dir: &str, news: bool) -> anyhow::Result<String> {
+    let mut said = vec![];
+    for d in reach(dir) {
+        if d.as_path() != Path::new(dir)
+            && !sync::net(&d).join("peers").exists()
+        {
+            continue;
+        }
+        said.push(report(RT.block_on(sync::sync(&d, news))?));
+    }
+    Ok(said
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// The 32-byte challenge, then 1 if a PIN goes with it; null if off.
@@ -369,7 +407,9 @@ pub extern "system" fn Java_com_apasa_Native_health<'l>(
         let reused =
             h.reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
         let expired = h.expired.iter().map(|n| format!("expired\t{n}"));
-        let all: Vec<String> = weak.chain(reused).chain(expired).collect();
+        let exposed = h.exposed.iter().map(|n| format!("exposed\t{n}"));
+        let all: Vec<String> =
+            weak.chain(reused).chain(expired).chain(exposed).collect();
         Ok(e.new_string(all.join("\n"))?)
     })
 }
@@ -637,19 +677,24 @@ pub extern "system" fn Java_com_apasa_Native_serve<'l>(
     dir: JString<'l>,
     on: bool,
 ) {
-    static SERVING: Mutex<Option<tokio::task::JoinHandle<()>>> =
-        Mutex::new(None);
+    static SERVING: Mutex<Vec<tokio::task::JoinHandle<()>>> =
+        Mutex::new(Vec::new());
     run(&mut env, |_| {
         let mut s = SERVING.lock().unwrap_or_else(|p| p.into_inner());
-        // Await the old server so its endpoint and key lock are free.
-        if let Some(h) = s.take() {
+        // Await the old servers so their endpoints and key locks are free.
+        for h in s.drain(..) {
             h.abort();
             let _ = RT.block_on(h);
         }
-        let dir = std::path::PathBuf::from(dir.to_string());
         if on {
-            let go = async move { drop(sync::serve(&dir, |_, _| {}).await) };
-            *s = Some(RT.spawn(go));
+            // This store, and each linked one with a device to serve.
+            for d in reach(&dir.to_string()) {
+                if !sync::net(&d).join("peers").exists() {
+                    continue;
+                }
+                let go = async move { drop(sync::serve(&d, |_, _| {}).await) };
+                s.push(RT.spawn(go));
+            }
         }
         Ok(())
     })
@@ -684,10 +729,7 @@ pub extern "system" fn Java_com_apasa_Native_sync<'l>(
     dir: JString<'l>,
     news: bool,
 ) -> JString<'l> {
-    run(&mut env, |e| {
-        let r = RT.block_on(sync::sync(Path::new(&dir.to_string()), news))?;
-        Ok(e.new_string(report(r))?)
-    })
+    run(&mut env, |e| Ok(e.new_string(sync_all(&dir.to_string(), news)?)?))
 }
 
 #[unsafe(no_mangle)]
@@ -731,7 +773,183 @@ pub extern "system" fn Java_com_apasa_Native_wake<'l>(
         }
         let _one = SYNC.lock().unwrap_or_else(|p| p.into_inner());
         WAITING.store(false, SeqCst);
-        let r = RT.block_on(sync::sync(Path::new(&dir.to_string()), false))?;
-        Ok(e.new_string(report(r))?)
+        Ok(e.new_string(sync_all(&dir.to_string(), false)?)?)
+    })
+}
+
+/// Linked stores, a line each: `g label`; their members `m label id name
+/// me` (me: 1 for this device); notes `! text`. Tab-separated.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_groups<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let mut stores = stores();
+        let s = stores.get_mut(&h).context("locked")?;
+        let mut out: Vec<String> =
+            s.unopened.iter().map(|u| format!("!\t{u}")).collect();
+        let labels: Vec<String> = s.links().map(|l| l.0.to_string()).collect();
+        for l in labels {
+            out.push(format!("g\t{l}"));
+            let g = s.group(&l)?;
+            let me = g.member_id();
+            for m in g.members().unwrap_or_default() {
+                let mine = (Some(&m.id) == me.as_ref()) as u8;
+                out.push(format!("m\t{l}\t{}\t{}\t{mine}", m.id, m.name));
+            }
+        }
+        Ok(e.new_string(out.join("\n"))?)
+    })
+}
+
+/// A group store `name` in `groups/`, this device its first member `me`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_groupNew<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+    me: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let mut stores = stores();
+        let s = stores.get_mut(&h).context("locked")?;
+        let name = name.to_string();
+        pasa::path_safe(&name)?;
+        let g = Store::create_group(
+            &groups_at(&s.dir).join(name.trim()),
+            &me.to_string(),
+        )?;
+        Ok(e.new_string(s.link(g)?)?)
+    })
+}
+
+/// A member key for `device` in group `label`: a code, or with `qr_pw`
+/// an offline QR code's text under it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_groupAdd<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    label: JString<'l>,
+    device: JString<'l>,
+    qr_pw: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let (device, pw) =
+            (device.to_string(), (!qr_pw.is_null()).then(|| qr_pw.to_string()));
+        let got = {
+            let mut stores = stores();
+            let g = stores
+                .get_mut(&h)
+                .context("locked")?
+                .group(&label.to_string())?;
+            let seed = g.add_member(&device)?;
+            sync::offer_group(&g.dir, &device, &seed)?
+        };
+        let code = match pw {
+            Some(pw) => RT.block_on(sync::qr(&got, &pw))?,
+            None => RT.block_on(sync::give(&got))?.0,
+        };
+        Ok(e.new_string(code)?)
+    })
+}
+
+/// Joins, into `groups/name`, the group whose code device `peer` shows.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_groupJoin<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    name: JString<'l>,
+    peer: JString<'l>,
+    code: JString<'l>,
+    pw: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let (name, peer, code, pw) = (
+            name.to_string(),
+            peer.to_string(),
+            code.to_string(),
+            pw.to_string(),
+        );
+        pasa::path_safe(&name)?;
+        let got = match code.trim().starts_with("PAIRIR1:") {
+            true => RT.block_on(sync::unqr_in(&code, &pw, true))?,
+            false => RT.block_on(sync::fetch_in(&code, true))?,
+        };
+        let dir = {
+            let mut stores = stores();
+            let s = stores.get_mut(&h).context("locked")?;
+            let dir = groups_at(&s.dir).join(name.trim());
+            let seed = sync::take_group(&dir, &peer, &got)?;
+            s.join_group(&dir, &seed)?;
+            dir
+        };
+        let said = report(RT.block_on(sync::sync(&dir, false))?);
+        let mut stores = stores();
+        let s = stores.get_mut(&h).context("locked")?;
+        let all = groups(&s.dir);
+        s.add_links(all);
+        Ok(e.new_string(said)?)
+    })
+}
+
+/// Removes member `id` from group `label`: a new key for the rest.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_groupRemove<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    label: JString<'l>,
+    id: JString<'l>,
+) {
+    run(&mut env, |_| {
+        let mut stores = stores();
+        let g =
+            stores.get_mut(&h).context("locked")?.group(&label.to_string())?;
+        let name = g
+            .members()?
+            .into_iter()
+            .find(|m| m.id == id.to_string())
+            .map(|m| m.name);
+        g.remove_member(&id.to_string())?;
+        // Its pairing here, if this device paired it.
+        if let Some(n) = name {
+            let _ = sync::forget(&g.dir, &n);
+        }
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_unlink<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    h: jlong,
+    label: JString<'l>,
+) {
+    run(&mut env, |_| {
+        Ok(stores()
+            .get_mut(&h)
+            .context("locked")?
+            .unlink(&label.to_string())?)
+    })
+}
+
+/// The folders a sync of `dir` covers: it, and its open store's linked ones.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_dirs<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+    dir: JString<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| {
+        let all = reach(&dir.to_string());
+        let lines: Vec<String> =
+            all.iter().map(|d| d.display().to_string()).collect();
+        Ok(e.new_string(lines.join("\n"))?)
     })
 }

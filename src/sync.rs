@@ -1,6 +1,6 @@
 //! Pairing and sync; neither ever opens the key file or a version.
 
-use crate::{MAX, Store, is_name, name_of, rand, write};
+use crate::{MAX, Secret, Store, is_name, name_of, rand, write};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use data_encoding::HEXLOWER;
 use irnet::psk::{Rx, Tx};
@@ -109,12 +109,25 @@ fn named(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn add(dir: &Path, p: Peer) -> Result<()> {
+pub(crate) fn add(dir: &Path, p: Peer) -> Result<()> {
     named(&p.name)?;
     let mut ps = peers(dir);
     ps.retain(|q| q.name != p.name);
     ps.push(p);
     save(dir, &ps)
+}
+
+/// This device's sync endpoint for the store in `dir`, hex.
+pub fn node(dir: &Path) -> Result<String> {
+    Ok(HEXLOWER.encode(key(dir, "node")?.public().as_bytes()))
+}
+
+/// Forgets the peer at endpoint `hex`, if any.
+pub fn forget_node(dir: &Path, hex: &str) -> Result<()> {
+    let at = peers(dir)
+        .into_iter()
+        .find(|p| p.id.is_some_and(|i| HEXLOWER.encode(i.as_bytes()) == hex));
+    at.map_or(Ok(()), |p| forget(dir, &p.name))
 }
 
 pub fn forget(dir: &Path, name: &str) -> Result<()> {
@@ -205,17 +218,22 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     };
     let take = async {
         let mut want: HashSet<&String> = other.difference(&mine).collect();
-        let n = want.len();
+        let mut n = 0;
         loop {
             let b = rx.recv(MAX).await?;
             if b.is_empty() {
                 break;
             }
             ensure!(want.remove(&name_of(&b)), "a file not asked for");
-            write(&v.join(name_of(&b)), &b)?;
+            // Only versions are kept; anything else is passed over, not
+            // fatal: a peer that holds one still syncs the rest.
+            if b.starts_with(b"age-encryption.org/v1\n") {
+                write(&v.join(name_of(&b)), &b)?;
+                n += 1;
+            }
         }
         rx.end().await?;
-        anyhow::Ok(n - want.len())
+        anyhow::Ok(n)
     };
     let (g, t) = tokio::join!(give, take);
     g?;
@@ -422,9 +440,64 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 const KEYS: &[u8] = b"pasakeys";
+/// A group store's pairing: then its member key for the device taking it.
+const GROUP: &[u8] = b"pasagrup";
+
+/// Hands device `name` a member key of the group store in `dir`, which
+/// it opens with its own store: no key file goes, and none exists.
+pub fn offer_group(
+    dir: &Path,
+    name: &str,
+    seed: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let psk = rand::<32>();
+    let id = key(dir, "node")?.public();
+    let peer = Peer {
+        name: name.into(),
+        psk,
+        id: None,
+        lane: None,
+        seen: Some(now()),
+    };
+    add(dir, peer)?;
+    set_on(dir, true)?;
+    Ok(Zeroizing::new([id.as_bytes(), &psk[..], GROUP, seed].concat()))
+}
+
+/// [`offer_group`]'s other end: the member key, for the caller to seal.
+pub fn take_group(dir: &Path, name: &str, got: &[u8]) -> Result<Secret> {
+    named(name)?;
+    let bad = || anyhow!("not a group's pairing");
+    let (id, rest) = got.split_at_checked(32).ok_or_else(bad)?;
+    let (psk, rest) = rest.split_at_checked(32).ok_or_else(bad)?;
+    let seed =
+        rest.strip_prefix(GROUP).filter(|s| s.len() == 32).ok_or_else(bad)?;
+    let id = Some(PublicKey::from_bytes(id.try_into()?)?);
+    let peer = Peer {
+        name: name.into(),
+        psk: psk.try_into()?,
+        id,
+        lane: None,
+        seen: Some(now()),
+    };
+    add(dir, peer)?;
+    set_on(dir, true)?;
+    Ok(Zeroizing::new(seed.to_vec()))
+}
+
+/// pairir's app: a group's codes apart, so that nothing takes one for a
+/// store's key file (an older pasa least of all).
+fn app(group: bool) -> &'static str {
+    if group { "pasa-group" } else { "pasa" }
+}
+
+fn grouped(got: &[u8]) -> bool {
+    got.get(64..72) == Some(GROUP)
+}
 
 pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     named(name)?;
+    ensure!(!grouped(got), "a group's pairing: pasa group join");
     let bad = || anyhow!("not a pasa pairing");
     let (id, rest) = got.split_at_checked(32).ok_or_else(bad)?;
     let (psk, mut f) = rest.split_at_checked(32).ok_or_else(bad)?;
@@ -471,21 +544,35 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
 }
 
 pub async fn qr(got: &[u8], pw: &str) -> Result<String> {
-    pairir::seal_qr("pasa", got, pw).await
+    pairir::seal_qr(app(grouped(got)), got, pw).await
 }
 
 pub async fn unqr(text: &str, pw: &str) -> Result<Zeroizing<Vec<u8>>> {
-    pairir::open_qr("pasa", text.trim(), pw).await
+    unqr_in(text, pw, false).await
+}
+
+/// `group`: a group's QR code.
+pub async fn unqr_in(
+    text: &str,
+    pw: &str,
+    group: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
+    pairir::open_qr(app(group), text.trim(), pw).await
 }
 
 pub async fn give(
     got: &[u8],
 ) -> Result<(String, tokio::task::JoinHandle<pairir::End>)> {
-    pairir::give(&[relay()?], "pasa", got, None).await
+    pairir::give(&[relay()?], app(grouped(got)), got, None).await
 }
 
 pub async fn fetch(code: &str) -> Result<Zeroizing<Vec<u8>>> {
-    pairir::take(&[relay()?], "pasa", code.trim(), None).await
+    fetch_in(code, false).await
+}
+
+/// `group`: a group's code.
+pub async fn fetch_in(code: &str, group: bool) -> Result<Zeroizing<Vec<u8>>> {
+    pairir::take(&[relay()?], app(group), code.trim(), None).await
 }
 
 #[cfg(test)]
@@ -562,7 +649,12 @@ mod tests {
         assert!(unqr(&qr, "ac").await.is_err());
         take(&desk, "phone", &unqr(&qr, "ab").await.unwrap()).unwrap();
         assert_eq!(fs::read(desk.join("key")).unwrap(), file);
+        // A file no version, held by a peer: passed over, the rest arrives.
+        let junk = b"not a version".as_slice();
+        fs::write(crate::versions(&phone).join(name_of(junk)), junk).unwrap();
         assert_eq!(swap_once(&desk, &phone, "phone", "desk").await, (2, 0));
+        assert!(!crate::versions(&desk).join(name_of(junk)).exists());
+        fs::remove_file(crate::versions(&phone).join(name_of(junk))).unwrap();
         let at = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
         let node = |d: &Path| key(d, "node").unwrap().public();
         assert_eq!(at(&desk, "phone").unwrap().id, Some(node(&phone)));

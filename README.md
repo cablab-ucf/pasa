@@ -24,6 +24,26 @@ ad hoc: `xattr -dr com.apple.quarantine pasa.app`). Building on Linux
 needs libudev, libclang, pcsc-lite and CMake (Debian: `libudev-dev
 libclang-dev libpcsclite-dev cmake`); the flake brings them.
 
+## NixOS
+
+In `/etc/nixos/flake.nix` (with no `inputs.pasa.inputs.nixpkgs.follows`:
+pasa builds on its own pin):
+
+```nix
+inputs.pasa.url = "github:cablab-ucf/pasa";
+# nixosSystem's modules:
+pasa.nixosModules.default
+{ programs.pasa.enable = true; }   # serve = true: `pasa serve` per user
+```
+
+It installs the window, turns on `pcscd` (NFC readers), and daily runs
+`nixos-rebuild switch --update-input pasa` on `/etc/nixos` (Nix's
+`system.autoUpgrade`; `update = false` leaves it off). Only `pasa`
+moves; the rest stays as `flake.lock` pins it. While the repository is
+private, Nix needs a token that reads it, outside the store: in
+`/etc/nix/nix.conf` (`nix.extraOptions`), `!include /etc/nix/github.conf`,
+a root-only file holding `access-tokens = github.com=TOKEN`.
+
 ## Files
 
 ```
@@ -111,11 +131,15 @@ before the code, never beside it. A short code meets once at the
 [pairir](https://github.com/cablab-ucf/pairir) relay (CPace, then
 X-Wing; one try, one minute).
 
-Only ciphertext crosses the network, and received files must match
-their names. On a computer the network side is a child process that sees
-`store/v/` and `net/` alone (Landlock on Linux, `sandbox-exec` on macOS;
-best effort, and said when missing); the process with the open store
-opens no socket. On Android it is one process.
+Only ciphertext crosses the network, and received files must be
+versions that match their names. On a computer the network side is a
+child process that sees `store/v/` and `net/` alone (Landlock on Linux,
+`sandbox-exec` on macOS); on Linux it also signals no other process and
+opens no unix socket (Landlock scopes, seccomp), but `listen`'s to
+pushir. Where that cannot be had, it says so and syncs still. The
+process with the open store opens no socket, and no pasa process dumps
+core or lets another of yours read its memory. On Android it is one
+process.
 
 | Layer | Holds if the others fall |
 |---|---|
@@ -127,6 +151,46 @@ Relays see addresses, endpoint ids, when and how much. A wake is an
 empty message sealed by [pushir](https://github.com/cablab-ucf/pushir):
 lost or forged, it costs a sync.
 
+## Group stores
+
+A group's shared passwords are a store of their own, in a folder of their
+own, paired among the group's devices as any store is. Linked, it opens
+with yours, one unlock for both:
+
+```sh
+pasa --dir ~/lab init           # once, by one member; the others join it
+pasa link ~/lab                 # its password, once; Devices, Group stores
+pasa ls                         # yours, and @lab/NAME
+pasa set @lab/github            # kept in ~/lab, not in yours
+pasa unlink lab
+```
+
+`~/lab/link` holds the group store's KEK sealed to yours: never in `v/`,
+so never synced, and pairing hands none. Each store stays on disk as it
+was; only the open view unites them, in memory, and each write goes to
+its own store, which syncs, serves and commits as before. Your password,
+changed, seals the links anew; the group's, changed, asks for a new link.
+
+A group made by pasa has no password: a key per device (X-Wing), and the
+store keys sealed to every member's in an age file in `v/`, which syncs as
+any version. Adding a device hands it a member key through pairing; it
+makes its own at once. Removing one is a new store key sealed to the rest
+alone: nobody pairs again, and no password exists to change.
+
+```sh
+pasa group new ~/lab alice      # a group, this device in it as alice
+pasa group add lab bob [--qr]   # a code; there: pasa group join ~/lab alice CODE
+pasa group ls lab               # members
+pasa group rm lab bob           # bob gets nothing written since
+```
+
+The window and the phone do the same in Devices, Group stores.
+
+A device takes a new key only if it holds the one before: a removed
+member, who never had it, cannot make one others take. Removals are never
+undone, so two at once merge to what neither removed. What a removed
+device read it keeps (`pasa health` lists those passwords).
+
 ## Revocation
 
 `pasa revoke NAME` forgets the device and rotates the store key: entries
@@ -137,7 +201,8 @@ revoked device seals under the old key is ignored. Devices still on the
 old key stop writing when they hear of it.
 
 What it already read, it keeps: change those passwords at their
-services. Any device that opens the store can revoke, a bad one too, but
+services. `pasa health` (Health in the window) lists each entry whose
+password or one-time code it read, under any name. Any device that opens the store can revoke, a bad one too, but
 that only forks the store: the others keep everything, revoke it in
 turn, and pair again from a device you trust.
 
