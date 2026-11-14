@@ -618,10 +618,19 @@ impl Store {
     }
 
     pub(crate) fn links_in(mut self, dirs: Vec<PathBuf>) -> Store {
+        self.add_links(dirs);
+        self
+    }
+
+    /// Opens the stores in `dirs` linked to this one and not open yet: a
+    /// group joined since, once a sync brought its keys.
+    pub fn add_links(&mut self, dirs: Vec<PathBuf>) {
         for dir in dirs {
             if self.dirs().any(|d| d == dir) {
                 continue;
             }
+            let was = format!("@{}:", self.label(&dir));
+            self.unopened.retain(|u| !u.starts_with(&was));
             let (group, file) = match fs::read(dir.join("member")) {
                 Ok(f) => (true, f),
                 Err(_) => match fs::read(dir.join("link")) {
@@ -650,7 +659,6 @@ impl Store {
                 Err(e) => self.unopened.push(format!("@{label}: {e:#}")),
             }
         }
-        self
     }
 
     /// This store's folder and its linked stores'.

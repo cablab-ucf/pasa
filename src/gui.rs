@@ -174,6 +174,20 @@ enum Job {
     Fido,
     AddFido,
     Join,
+    JoinGroup,
+}
+
+/// The window's group forms: a new group, one joined, a device added.
+#[derive(Default)]
+struct GroupForm {
+    dir: String,
+    me: String,
+    peer: String,
+    code: String,
+    pw: Zeroizing<String>,
+    /// The group a device is being added to, and its name.
+    adding: Option<String>,
+    name: String,
 }
 
 #[derive(Default, PartialEq)]
@@ -297,6 +311,10 @@ impl Generator {
 
 struct Pairing {
     name: String,
+    /// The store paired: this one, or a linked group's.
+    dir: PathBuf,
+    /// A group's offer, made already (with the member key it hands).
+    got: Option<Zeroizing<Vec<u8>>>,
     /// The QR code's password: never shown beside the code.
     pw: Option<Zeroizing<String>>,
     code: String,
@@ -406,6 +424,7 @@ struct App {
     pairing: Option<Pairing>,
     scanning: Option<Scanning>,
     synced: Arc<Mutex<Option<String>>>,
+    gform: GroupForm,
     /// A store to link: its folder and password.
     link_dir: String,
     link_pw: Zeroizing<String>,
@@ -732,6 +751,36 @@ impl App {
                 };
                 sync::take(&home(), &peer, &got)?;
                 self.joined = true;
+            }
+            Job::JoinGroup => {
+                let g = &self.gform;
+                let (d, peer, code, pw) = (
+                    pasa::path(&g.dir),
+                    g.peer.trim().to_string(),
+                    g.code.trim().to_string(),
+                    g.pw.clone(),
+                );
+                let got = match code.starts_with("PAIRIR1:") {
+                    true => {
+                        self.rt()?.block_on(sync::unqr_in(&code, &pw, true))?
+                    }
+                    false => {
+                        let mut c = crate::net(&["take-group", &code])?;
+                        let l = crate::lines(&mut c).next();
+                        let l =
+                            l.context("no answer: is the code still shown?")?;
+                        Zeroizing::new(crate::B64.decode(l.as_bytes())?)
+                    }
+                };
+                let seed = sync::take_group(&d, &peer, &got)?;
+                let v = self.v.as_mut().context("locked")?;
+                v.s.join_group(&d, &seed)?;
+                pasa::remember(&d)?;
+                v.note = format!(
+                    "Joined: it opens with this store once it has synced with {peer}"
+                );
+                self.gform = Default::default();
+                crate::aside_in(&d, false);
             }
         }
         (self.pw, self.pw2, self.pair_pw) = Default::default();
@@ -1064,6 +1113,11 @@ impl App {
             self.synced.lock().unwrap_or_else(|p| p.into_inner()).take()
         {
             v.note = s;
+            // A group joined opens once a sync brought its keys.
+            if !v.s.unopened.is_empty() {
+                v.s.add_links(pasa::stores());
+                v.load();
+            }
         }
         // View's filter matches names alone; this search looks further.
         let query = std::mem::take(&mut v.filter);
@@ -2052,13 +2106,17 @@ impl App {
             ctx,
             |ui| {
                 ui.set_width(420.0);
-                match self.win {
-                    Win::Generator => self.generate(ui, v),
-                    Win::History => self.history(ui, v),
-                    Win::Health => self.health(ui, v),
-                    Win::Devices => self.devices(ui, v),
-                    _ => self.settings(ui),
-                }
+                let tall = ui.ctx().content_rect().height() - 120.0;
+                ScrollArea::vertical().max_height(tall).show(
+                    ui,
+                    |ui| match self.win {
+                        Win::Generator => self.generate(ui, v),
+                        Win::History => self.history(ui, v),
+                        Win::Health => self.health(ui, v),
+                        Win::Devices => self.devices(ui, v),
+                        _ => self.settings(ui),
+                    },
+                );
                 ui.add_space(6.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     close = ui.button("Close").clicked();
@@ -2188,7 +2246,9 @@ impl App {
         if let Some(qr) = self.shows(ui, ok) {
             let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));
             let (code, img, end, state) = Default::default();
-            self.pairing = Some(Pairing { name, pw, code, img, end, state });
+            let (dir, got) = (home(), None);
+            self.pairing =
+                Some(Pairing { name, dir, got, pw, code, img, end, state });
             if !qr && let Err(e) = self.show_code(ui.ctx()) {
                 (self.pairing, v.note) = (None, format!("{e:#}"));
             }
@@ -2199,33 +2259,67 @@ impl App {
     }
 
     /// Linked stores: listed, unlinked, linked.
+    /// Linked stores: listed, their members, a device added or removed,
+    /// a group made or joined, a store with a password linked.
     fn groups(&mut self, ui: &mut Ui, v: &mut View) {
         let l = look(ui);
         ui.separator();
         ui.label(RichText::new("Group stores").strong());
-        let about = "A store kept with others (a folder of its own, paired as \
-                     any store) opens with this one after its password once: \
-                     its entries show as @NAME/..., each kept in its own \
-                     store, on disk as before. Unlinked, it opens on its own.";
+        let about = "A group's passwords, kept with others in a folder of its \
+                     own, open with yours: @NAME/..., each written to its own \
+                     store. Each device holds a key of its own: one removed \
+                     gets nothing written since, and nobody pairs again.";
         ui.label(RichText::new(about).small().color(l.muted));
-        let mut gone = None;
-        for (label, dir) in v.s.links() {
+        let links: Vec<(String, PathBuf)> =
+            v.s.links().map(|(l, d)| (l.into(), d.into())).collect();
+        let (mut gone, mut remove, mut add) = (None, None, None);
+        let h = std::env::home_dir().unwrap_or_default();
+        for (label, dir) in &links {
             ui.horizontal(|ui| {
-                ui.label(format!("@{label}"));
-                let h = std::env::home_dir().unwrap_or_default();
+                ui.label(RichText::new(format!("@{label}")).strong());
                 let at = dir
                     .strip_prefix(&h)
                     .map_or(dir.display().to_string(), |r| {
                         format!("~/{}", r.display())
                     });
-                let at = RichText::new(at);
-                ui.label(at.small().color(l.muted));
+                ui.label(RichText::new(at).small().color(l.muted));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Unlink").clicked() {
-                        gone = Some(label.to_string());
+                        gone = Some(label.clone());
                     }
                 });
             });
+            let Ok(g) = v.s.group(label) else { continue };
+            let Some(me) = g.member_id() else { continue };
+            for m in g.members().unwrap_or_default() {
+                ui.horizontal(|ui| {
+                    let mine = if m.id == me { "  (this device)" } else { "" };
+                    ui.label(format!("    {}{mine}", m.name));
+                    ui.label(RichText::new(&m.id[..8]).small().color(l.muted));
+                    ui.with_layout(
+                        Layout::right_to_left(Align::Center),
+                        |ui| {
+                            let why = "It gets nothing written from now on";
+                            if m.id != me
+                                && ui
+                                    .small_button("Remove")
+                                    .on_hover_text(why)
+                                    .clicked()
+                            {
+                                remove = Some((
+                                    label.clone(),
+                                    dir.clone(),
+                                    m.id.clone(),
+                                    m.name.clone(),
+                                ));
+                            }
+                        },
+                    );
+                });
+            }
+            if ui.small_button(format!("Add a device to @{label}")).clicked() {
+                add = Some(label.clone());
+            }
         }
         for u in &v.s.unopened {
             ui.label(RichText::new(u).small().color(l.bad));
@@ -2237,17 +2331,124 @@ impl App {
             };
             v.load();
         }
-        field(ui, "A store's folder", &mut self.link_dir, false);
-        let typed = field(ui, "Its password", &mut self.link_pw, true);
-        let ok = !self.link_dir.trim().is_empty() && !self.link_pw.is_empty();
-        let go = ui.add_enabled(ok, Button::new("Link")).clicked();
-        if go || (ok && entered(ui, &typed)) {
-            v.note = match self.link(v) {
-                Ok(g) => format!("@{g}: opens with this store from now on"),
+        if let Some((label, dir, id, name)) = remove {
+            let r = v.s.group(&label).and_then(|g| g.remove_member(&id));
+            v.note = match r {
+                Ok(_) => {
+                    // Its pairing here, if this device paired it.
+                    let _ = sync::forget(&dir, &name);
+                    crate::record_in(&dir);
+                    crate::aside_in(&dir, true);
+                    format!(
+                        "{name}: removed from @{label}; a new key for the rest. \
+                         What it read it keeps: Health lists those passwords"
+                    )
+                }
                 Err(e) => format!("{e:#}"),
             };
             v.load();
         }
+        if add.is_some() {
+            (self.gform.adding, self.gform.name) = (add, String::new());
+        }
+        if let Some(label) = self.gform.adding.clone() {
+            field(
+                ui,
+                &format!("A name for the device joining @{label}"),
+                &mut self.gform.name,
+                false,
+            );
+            let name = self.gform.name.trim().to_string();
+            if let Some(qr) = self.shows(ui, !name.is_empty()) {
+                if let Err(e) = self.offer_group(ui.ctx(), v, &label, &name, qr)
+                {
+                    (self.pairing, v.note) = (None, format!("{e:#}"));
+                }
+                self.gform.adding = None;
+            }
+        }
+        egui::CollapsingHeader::new("New group").show(ui, |ui| {
+            field(ui, "Its folder", &mut self.gform.dir, false);
+            field(ui, "This device's name in it", &mut self.gform.me, false);
+            let g = &self.gform;
+            let ok = !g.dir.trim().is_empty() && !g.me.trim().is_empty();
+            if ui.add_enabled(ok, Button::new("Make it")).clicked() {
+                let d = pasa::path(&self.gform.dir);
+                let made = pasa::Store::create_group(&d, self.gform.me.trim())
+                    .and_then(|g| Ok((pasa::remember(&d)?, v.s.link(g)?).1));
+                v.note = match made {
+                    Ok(label) => {
+                        self.gform = Default::default();
+                        format!("@{label}: made; add its devices here")
+                    }
+                    Err(e) => format!("{e:#}"),
+                };
+                v.load();
+            }
+        });
+        egui::CollapsingHeader::new("Join a group").show(ui, |ui| {
+            field(ui, "A folder for it here", &mut self.gform.dir, false);
+            field(
+                ui,
+                "The name of the device showing the code",
+                &mut self.gform.peer,
+                false,
+            );
+            field(ui, "Code", &mut self.gform.code, false);
+            if self.gform.code.trim().starts_with("PAIRIR1:") {
+                field(ui, "The QR code's password", &mut self.gform.pw, true);
+            }
+            let g = &self.gform;
+            let ok =
+                [&g.dir, &g.peer, &g.code].iter().all(|f| !f.trim().is_empty());
+            if ui.add_enabled(ok, Button::new("Join")).clicked() {
+                self.begin(ui, Job::JoinGroup, "Joining");
+            }
+        });
+        egui::CollapsingHeader::new("Link a store with a password").show(
+            ui,
+            |ui| {
+                field(ui, "Its folder", &mut self.link_dir, false);
+                let typed = field(ui, "Its password", &mut self.link_pw, true);
+                let ok = !self.link_dir.trim().is_empty()
+                    && !self.link_pw.is_empty();
+                let go = ui.add_enabled(ok, Button::new("Link")).clicked();
+                if go || (ok && entered(ui, &typed)) {
+                    v.note = match self.link(v) {
+                        Ok(g) => {
+                            format!("@{g}: opens with this store from now on")
+                        }
+                        Err(e) => format!("{e:#}"),
+                    };
+                    v.load();
+                }
+            },
+        );
+    }
+
+    /// A member key for device `name` in group `label`, shown as a code or
+    /// (`qr`) a QR code after its password.
+    fn offer_group(
+        &mut self,
+        ctx: &Context,
+        v: &mut View,
+        label: &str,
+        name: &str,
+        qr: bool,
+    ) -> Result<()> {
+        let g = v.s.group(label)?;
+        let seed = g.add_member(name)?;
+        let (dir, got) =
+            (g.dir.clone(), sync::offer_group(&g.dir, name, &seed)?);
+        let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));
+        let (code, img, end, state) = Default::default();
+        let (name, got) = (name.to_string(), Some(got));
+        self.pairing =
+            Some(Pairing { name, dir, got, pw, code, img, end, state });
+        if !qr {
+            self.show_code(ctx)?;
+        }
+        Ok(())
     }
 
     fn link(&mut self, v: &mut View) -> Result<String> {
@@ -2344,8 +2545,11 @@ impl App {
     /// The network side gets the offer sealed, and waits for its taker.
     fn show_code(&mut self, ctx: &Context) -> Result<()> {
         let p = self.pairing.as_mut().context("no pairing")?;
-        let got = sync::offer(&home(), &p.name)?;
-        let mut c = crate::net(&["give"])?;
+        let got = match &p.got {
+            Some(g) => g.clone(),
+            None => sync::offer(&p.dir, &p.name)?,
+        };
+        let mut c = crate::net_in(&p.dir, &["give"])?;
         let mut i = c.stdin.take().context("stdin")?;
         std::io::Write::write_all(&mut i, crate::B64.encode(&got).as_bytes())?;
         std::io::Write::write_all(&mut i, b"\n")?;
@@ -2360,7 +2564,8 @@ impl App {
             repaint.request_repaint();
         });
         p.state = "Waiting for it".into();
-        self.serve(ctx, vec![home()]);
+        let dir = p.dir.clone();
+        self.serve(ctx, vec![dir]);
         Ok(())
     }
 
@@ -2407,12 +2612,16 @@ impl App {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         if show {
             let pw = p.pw.take().unwrap_or_default();
-            let got = sync::offer(&home(), &p.name)?;
+            let got = match &p.got {
+                Some(g) => g.clone(),
+                None => sync::offer(&p.dir, &p.name)?,
+            };
             let qr = self.rt()?.block_on(sync::qr(&got, &pw))?;
             let p = self.pairing.as_mut().context("no pairing")?;
             (p.img, p.code) = (Some(qr_image(&ctx, &qr)?), qr);
             p.state = "Waiting for it to sync".into();
-            self.serve(&ctx, vec![home()]);
+            let dir = p.dir.clone();
+            self.serve(&ctx, vec![dir]);
         }
         Ok(())
     }

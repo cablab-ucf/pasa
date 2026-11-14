@@ -1306,8 +1306,16 @@ async fn sync(a: &[&str]) -> Result<()> {
         ["group", "rm", l, who] => {
             let mut s = open()?;
             let g = s.group(l)?;
+            let name = g
+                .members()?
+                .into_iter()
+                .find(|m| m.id == *who || m.name == *who);
             let id = g.remove_member(who)?;
             let d = g.dir.clone();
+            // Its pairing here, if this device paired it.
+            if let Some(m) = name {
+                let _ = sync::forget(&d, &m.name);
+            }
             record_in(&d);
             if sync::on(&d) {
                 net_run_in(&d, &["sync", "--news"])?;
