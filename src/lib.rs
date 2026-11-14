@@ -2494,6 +2494,68 @@ mod tests {
     }
 
     #[test]
+    fn an_admins_leave_holds_and_a_lost_forks_writes_come_back() {
+        let l = Lab::new("leave", &["alice", "bob", "carol", "dave"]);
+        for w in ["bob", "carol", "dave"] {
+            l.add("alice", w);
+        }
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.g(&mut sa).promote("carol").unwrap();
+        for w in ["bob", "carol", "dave"] {
+            l.sync("alice", w);
+        }
+        // Bob keeps a copy, leaves; carol, below him, cannot remove him;
+        // alice does, with a new key.
+        let old = l.0.join("bob").join("old");
+        copy_v(&l.lab("bob"), &old);
+        fs::copy(l.lab("bob").join("member"), old.join("member")).unwrap();
+        let mut sb = l.open("bob");
+        sb.unlink("lab").unwrap();
+        l.sync("bob", "carol");
+        l.sync("bob", "alice");
+        assert!(
+            l.names("carol").contains(&"bob".into()),
+            "carol does not outrank him"
+        );
+        l.sync("carol", "alice");
+        let sa = l.open("alice");
+        assert!(!l.names("alice").contains(&"bob".into()));
+        sa.put("@lab/s", b"s\n").unwrap();
+        // From his copy, bob extends the old chain: in vain.
+        let own = l.0.join("bob").join("own");
+        let mut sb = Store::open(&own, b"bob", None)
+            .unwrap()
+            .links_in(vec![old.clone()]);
+        sb.group("old").unwrap().add_puppet(&rand::<32>(), false).unwrap();
+        copy_v(&old, &l.lab("dave"));
+        l.sync("alice", "dave");
+        let sd = l.open("dave");
+        assert_eq!(&sd.get("@lab/s").unwrap()[..], b"s\n");
+        assert!(!l.names("dave").contains(&"bob".into()));
+        // Carol, with a new key, writes; alice, at once, makes a change of
+        // hers that holds: carol is told, and takes her write back.
+        let mut sc = l.open("carol");
+        l.g(&mut sc).add_puppet(&rand::<32>(), false).unwrap();
+        sc.put("@lab/c", b"c\n").unwrap();
+        let mut sa = l.open("alice");
+        l.g(&mut sa).puppet(&rand::<32>(), false, false).unwrap();
+        l.sync("alice", "carol");
+        let mut sc = l.open("carol");
+        assert!(
+            sc.unopened.iter().any(|u| u.contains("beside the one taken")),
+            "{:?}",
+            sc.unopened
+        );
+        assert!(sc.get("@lab/c").is_err());
+        let g = l.g(&mut sc);
+        let left = g.excluded().unwrap();
+        let v = left.iter().find(|v| v.name == "c").expect("left out");
+        g.recover(&v.file).unwrap();
+        assert_eq!(&sc.get("@lab/c").unwrap()[..], b"c\n");
+    }
+
+    #[test]
     fn two_admins_at_once_merge_to_the_higher_and_strangers_are_not_admitted() {
         let l = Lab::new("admins", &["alice", "bob", "carol"]);
         l.add("alice", "bob");

@@ -35,7 +35,7 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
    - **Rules** (`follows`): the keys kept or one new; the root kept, an
      admin (nobody outranks it, so its own leave could not be final; to
      hand a group on, make a new one); members unchanged
-     but for those the signer outranks (or itself) removed or demoted, a
+     but for those the signer outranks removed or demoted, a
      member made admin at this epoch (ranked last), devices added by the
      signer at this epoch.
    - **Forks**: the one a higher admin signed in (anywhere in it) holds:
@@ -48,8 +48,12 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      since its fork, while no higher admin has signed after them.
    - **Joining**: an admin's one-time invitation (local); the joiner's
      public keys and the root, sealed with that pairing's secret; admitted
-     once. **Leaving**: an admin, an envelope without it (the next admin
-     makes a new key); a member, a signed request sealed to the admins.
+     once. **Leaving**: a signed request sealed to the admins; one that
+     outranks the device removes it (a new key): a removal by a higher
+     admin is final, a device's own would not be.
+   - **Bounds**: envelopes, links and requests read at most 1 MiB; each
+     link file read once. A fork's keys set aside stay readable: what was
+     written with them shows as left out (`pasa recover`).
    - **Retire notices** do not count in groups (any member could write
      one); the envelope chain says which key is newest.
    - Tests: signed add/remove; a non-admin's envelope; a removed admin's
@@ -62,6 +66,8 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      trial over `v/`); a hidden envelope split the group (each signer
      stores the body before); the root's leave was never final (the root
      stays); a removal lost to an honest race (made again).
+   - Fourth review (fixed): an admin's own leave undone from an old copy;
+     links to large files stalled opens; a fork's writes lost unsaid.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until
