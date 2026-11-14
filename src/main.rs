@@ -1427,8 +1427,19 @@ mod tests {
         fs::write(&ed, script).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
         fs::set_permissions(&ed, mode).unwrap();
-        let new = super::edit_with(ed.to_str().unwrap(), b"old\n").unwrap();
-        assert_eq!(&new[..], b"new\n");
+        // No folder in memory (macOS): refused, never written to disk.
+        let ram =
+            [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
+        let ram = ram
+            .into_iter()
+            .flatten()
+            .any(|d| std::path::Path::new(&d).is_dir());
+        let new = super::edit_with(ed.to_str().unwrap(), b"old\n");
+        if !ram {
+            assert!(new.is_err() && !d.join("ed.sh.at").exists());
+            return fs::remove_dir_all(&d).unwrap();
+        }
+        assert_eq!(&new.unwrap()[..], b"new\n");
         let at = fs::read_to_string(d.join("ed.sh.at")).unwrap();
         assert!(!std::path::Path::new(at.trim()).exists(), "left behind");
         fs::remove_dir_all(&d).unwrap();
