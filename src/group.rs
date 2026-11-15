@@ -43,8 +43,9 @@ const CHAIN: &str = ".pasa/chain/";
 const INVITES: &str = "invites";
 
 /// The most keys an envelope holds: the newest, so the list never grows
-/// past what parses (a lower admin's key-only envelopes would make it).
-const KEEP: usize = 1024;
+/// past what parses, and a lower admin's key-only envelopes cost every
+/// read little (history older than 64 new keys is no longer read).
+const KEEP: usize = 64;
 
 /// The most an envelope, a link or a request may take: a list of about
 /// 200 devices; junk costs no more than this to read.
@@ -1069,6 +1070,7 @@ impl Store {
             };
             if e.1.as_ref().is_some_and(|x| *x != id)
                 || held.contains(&id)
+                || list.iter().any(|m| m.id == id)
                 || list.iter().any(|m| m.name == name)
             {
                 continue;
@@ -1142,7 +1144,10 @@ impl Store {
                 if known.contains(&f) || !crate::is_name(&f) {
                     continue;
                 }
-                let Ok(b) = self.bytes(&f) else { continue };
+                let p = self.v.join(&f);
+                let Some(b) = small(&p).filter(|b| name_of(b) == f) else {
+                    continue;
+                };
                 if is_envelope(&b) {
                     continue;
                 }

@@ -662,13 +662,24 @@ impl Store {
 
     /// A linked group store, by this device's member key: made its own if
     /// handed, and settled (a removal or a member since, sealed anew).
-    fn open_group(&self, dir: &Path, f: &[u8]) -> Result<Store> {
+    /// `was`: its keys and index before (a refresh): kept if the keys are,
+    /// so no file is tried again with them.
+    fn open_group(
+        &self,
+        dir: &Path,
+        f: &[u8],
+        was: Option<(Vec<Secret>, Index)>,
+    ) -> Result<Store> {
         let sealed = f.get(16..).context("a damaged link")?;
         let all = open(&self.kek, sealed).context("a damaged link")?;
         ensure!(all.len() == 64, "a damaged link");
         let (seed, root) = all.split_at(32);
         let root = std::str::from_utf8(root).context("a damaged link")?;
         let mut g = Store::open_member(dir, seed, root)?;
+        if let Some((_, mut x)) = was.filter(|w| w.0 == g.keys) {
+            x.checked = None;
+            *g.index.get_mut().unwrap_or_else(|p| p.into_inner()) = x;
+        }
         // An admin's work undone opens the group all the same: its sync,
         // and what it holds, go on.
         if let Err(e) = g.settle() {
@@ -686,7 +697,12 @@ impl Store {
             let Ok(f) = fs::read(dir.join("member")) else { continue };
             let was = format!("@{label}:");
             self.unopened.retain(|u| !u.starts_with(&was));
-            match self.open_group(&dir, &f) {
+            let old = &mut self.linked[i].1;
+            let x = std::mem::take(
+                old.index.get_mut().unwrap_or_else(|p| p.into_inner()),
+            );
+            let was = Some((old.keys.clone(), x));
+            match self.open_group(&dir, &f, was) {
                 Ok(mut g) => {
                     let said = g.unopened.drain(..);
                     let said: Vec<_> =
@@ -760,7 +776,7 @@ impl Store {
             }
             let label = self.label(&dir);
             let opened = match group {
-                true => self.open_group(&dir, &file),
+                true => self.open_group(&dir, &file, None),
                 false => open(&self.kek, &file[16..])
                     .context("a damaged link")
                     .and_then(|kek| Store::unsealed(&dir, kek))
@@ -933,7 +949,11 @@ impl Store {
             ));
         }
         let x = self.index()?;
-        let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
+        // Oldest first, so a cap drops the oldest.
+        let mut past: Vec<&(Version, [u8; 32])> = x.past().collect();
+        past.sort_by_key(|(v, _)| v.ms);
+        let mut frozen: Vec<u8> =
+            past.into_iter().flat_map(|(_, d)| *d).collect();
         let now: Vec<String> = x.heads.keys().cloned().collect();
         drop(x);
         for f in now {

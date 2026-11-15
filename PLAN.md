@@ -108,6 +108,12 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      rotation (the newest digests kept, said); an admission over the bound
      wrote an empty envelope at each sync. Known: a promotion set aside by
      a higher admin's envelope made at once is not made again.
+   - Tenth review: nothing high or critical. Fixed: a lower admin's
+     key-only envelopes made every read try 1,024 keys (the newest 64
+     kept now; a group's index kept across refreshes while its keys are);
+     requests read at most 1 MiB; the history cap drops the oldest by date;
+     one device asking under two invitations stopped every admission.
+     Known: a lower admin's no-op envelopes lengthen the chain (linear).
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until
