@@ -114,6 +114,13 @@ each item: [pasa-security-reviews](https://github.com/cablab-ucf/pasa-security-r
      requests read at most 1 MiB; the history cap drops the oldest by date;
      one device asking under two invitations stopped every admission.
      Known: a lower admin's no-op envelopes lengthen the chain (linear).
+   - Eleventh review: nothing high. Fixed: a removed admin's fork, racing
+     its removal and signed on by a higher admin, kept it in (removals on
+     forks set aside are made again by whoever still outranks, where the
+     fork taken lost to the remover); files no key opens were read again
+     at every change (read once now); a leave from the window or phone
+     never synced (the folder syncs until an envelope without it comes);
+     a file arriving during a write could go unseen.
    - Then: one more adversarial review of the chain, then `ON = true`.
 4. **Two changes at once** (done): the higher admin's holds; an admission
    set aside is made again at the next open (the invitation is kept until

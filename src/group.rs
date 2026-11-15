@@ -770,15 +770,37 @@ impl Store {
             }
         }
         let member = |id: &String| at.list.iter().any(|m| m.id == *id);
-        // Removals this device signed on forks set aside.
+        // Removals on forks set aside, made again: this device's own; and
+        // another's, by an admin still above its subject on the branch
+        // taken, whose fork lost to one it outranks there (a removed
+        // admin's fork, racing its removal, endorsed by a higher admin).
         let mut redo = vec![];
-        let off = |n: &&Envelope| {
-            n.signer == me.1 && ok(n) && !path.contains(n.hash.as_str())
-        };
+        let taken: HashMap<&str, &Envelope> = all
+            .values()
+            .filter(|c| path.contains(c.hash.as_str()))
+            .map(|c| (c.prev.as_str(), c))
+            .collect();
+        let off = |n: &&Envelope| ok(n) && !path.contains(n.hash.as_str());
         for n in all.values().filter(off) {
             let Some(p) = all.get(&n.prev) else { continue };
-            let out = |m: &&Member| !n.list.iter().any(|x| x.id == m.id);
-            redo.extend(p.list.iter().filter(out).map(|m| m.id.clone()));
+            let s = rank(&at.list, root, &n.signer);
+            let lost_to_lower = taken.get(p.hash.as_str()).is_some_and(|c| {
+                rank(&p.list, root, &n.signer) < rank(&p.list, root, &c.signer)
+            });
+            let mine = n.signer == me.1;
+            if !mine && !(s.is_some() && lost_to_lower) {
+                continue;
+            }
+            for m in
+                p.list.iter().filter(|m| !n.list.iter().any(|x| x.id == m.id))
+            {
+                let above = |s: &(u64, String)| {
+                    rank(&at.list, root, &m.id).is_none_or(|o| *s < o)
+                };
+                if mine || s.as_ref().is_some_and(above) {
+                    redo.push(m.id.clone());
+                }
+            }
         }
         s.g = State {
             #[cfg(test)]
@@ -1252,6 +1274,46 @@ impl Store {
         });
         self.extend(list, false)
     }
+}
+
+/// Envelope files in `dir` now, by name.
+pub(crate) fn envelope_files(dir: &Path) -> Vec<String> {
+    let Ok(rd) = fs::read_dir(crate::versions(dir)) else { return vec![] };
+    let env = |e: &fs::DirEntry| {
+        let mut head = [0; ENVELOPE.len()];
+        let f =
+            fs::File::open(e.path()).and_then(|mut f| f.read_exact(&mut head));
+        f.is_ok() && is_envelope(&head)
+    };
+    rd.flatten()
+        .filter(env)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect()
+}
+
+/// Whether an envelope in `dir`, not among `before`, is sealed to members
+/// other than `id` and not to it: by its stanzas' names, from its header.
+pub(crate) fn left_out(dir: &Path, id: &str, before: &[String]) -> bool {
+    let Ok(rd) = fs::read_dir(crate::versions(dir)) else { return false };
+    rd.flatten().any(|e| {
+        if e.file_name().to_str().is_some_and(|n| before.iter().any(|b| b == n))
+        {
+            return false;
+        }
+        let Ok(f) = fs::File::open(e.path()) else { return false };
+        let mut head = vec![];
+        let _ = f.take(64 << 10).read_to_end(&mut head);
+        if !is_envelope(&head) {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&head);
+        let ids: Vec<&str> = text
+            .lines()
+            .take_while(|l| !l.starts_with("---"))
+            .filter_map(|l| l.strip_prefix("-> pasa-xwing "))
+            .collect();
+        !ids.is_empty() && !ids.contains(&id)
+    })
 }
 
 /// A device's request to join group `root`, sealed to the pairing secret

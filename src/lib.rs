@@ -174,7 +174,8 @@ pub fn stores() -> Vec<PathBuf> {
     let t = fs::read_to_string(user(".pasa/stores")).unwrap_or_default();
     let mut all: Vec<PathBuf> = vec![];
     for p in [user(".pasa")].into_iter().chain(t.lines().map(PathBuf::from)) {
-        let held = p.join("key").exists() || p.join("member").exists();
+        let held =
+            ["key", "member", LEAVING].iter().any(|f| p.join(f).exists());
         if held && !all.contains(&p) {
             all.push(p);
         }
@@ -212,6 +213,8 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
 }
 
 const OWN: &str = ".pasa/";
+/// A group's `member` file, once this device asked to leave it.
+const LEAVING: &str = "leaving";
 
 /// Notice of a retired key, sealed to that key: `RETIRED` + [`key_id`].
 const RETIRED: &str = ".pasa/retired/";
@@ -306,6 +309,8 @@ struct Index {
     /// before they open, requests), and those its chain was last checked at.
     envelopes: HashSet<String>,
     checked: Option<HashSet<String>>,
+    /// Of those, the ones no key here opens.
+    bad: HashSet<String>,
 }
 
 /// A day from now, in ms.
@@ -513,7 +518,7 @@ impl Store {
         let mut links = vec![];
         let dirs = self.dirs().map(Into::into).chain(self.waiting.clone());
         for d in stores().into_iter().chain(dirs) {
-            for f in ["member", "link"] {
+            for f in ["member", "link", LEAVING] {
                 let Ok(b) = fs::read(d.join(f)) else { continue };
                 if b.get(..16) != Some(&self.owner()[..]) {
                     continue;
@@ -559,7 +564,13 @@ impl Store {
         if self.linked[i].1.member.is_some() {
             self.linked[i].1.leave()?;
             let (_, s) = self.linked.remove(i);
-            return Ok(fs::remove_file(s.dir.join("member"))?);
+            // Kept, and synced, until an admin removed it: its request
+            // reaches the admins; the folder holds no store for it then.
+            let seen = group::envelope_files(&s.dir).join("\n");
+            write(&s.dir.join("leaving.seen"), seen.as_bytes())?;
+            fs::rename(s.dir.join("member"), s.dir.join(LEAVING))?;
+            self.waiting.push(s.dir.clone());
+            return Ok(());
         }
         let (_, s) = self.linked.remove(i);
         Ok(fs::remove_file(s.dir.join("link"))?)
@@ -626,8 +637,9 @@ impl Store {
     /// Refuses a folder holding a store or a group's member key already:
     /// call before a pairing writes there.
     pub fn joinable(&self, dir: &Path) -> Result<()> {
-        let held =
-            ["key", "member", "link"].iter().any(|f| dir.join(f).exists());
+        let held = ["key", "member", "link", LEAVING]
+            .iter()
+            .any(|f| dir.join(f).exists());
         ensure!(
             !held && self.dirs().all(|d| d != dir),
             "{} holds a store",
@@ -686,6 +698,24 @@ impl Store {
             g.unopened.push(format!("{e:#}"));
         }
         Ok(g)
+    }
+
+    /// Whether the chain in `dir` still lists this device (`f`: its
+    /// sealed seed and root).
+    fn member_of(&self, dir: &Path, f: &[u8]) -> Result<bool> {
+        let all = open(&self.kek, f.get(16..).context("damaged")?);
+        let all = all.context("damaged")?;
+        ensure!(all.len() == 64, "damaged");
+        let (seed, root) = all.split_at(32);
+        let g = Store::open_member(dir, seed, std::str::from_utf8(root)?)?;
+        let me = g.member_id().context("not a group")?;
+        // Its removal is sealed to the rest alone: an envelope without it
+        // says so (a forged one only ends the syncing early).
+        let seen = fs::read_to_string(dir.join("leaving.seen"));
+        let seen = seen.unwrap_or_default();
+        let before: Vec<String> = seen.lines().map(String::from).collect();
+        Ok(g.members()?.iter().any(|m| m.id == me)
+            && !group::left_out(dir, &me, &before))
     }
 
     /// Linked groups opened again, as a sync left them: their chain now,
@@ -764,6 +794,24 @@ impl Store {
             }
             let was = format!("@{}:", self.label(&dir));
             self.unopened.retain(|u| !u.starts_with(&was));
+            // A group this device left: synced until the chain no longer
+            // lists it, then let go.
+            if let Ok(f) = fs::read(dir.join(LEAVING)) {
+                if f.get(..16) == Some(&self.owner()[..]) {
+                    let still = self.member_of(&dir, &f).unwrap_or(true);
+                    match still {
+                        true if !self.waiting.contains(&dir) => {
+                            self.waiting.push(dir)
+                        }
+                        true => {}
+                        false => {
+                            let _ = fs::remove_file(dir.join("leaving.seen"));
+                            drop(fs::remove_file(dir.join(LEAVING)))
+                        }
+                    }
+                }
+                continue;
+            }
             let (group, file) = match fs::read(dir.join("member")) {
                 Ok(f) => (true, f),
                 Err(_) => match fs::read(dir.join("link")) {
@@ -1096,9 +1144,14 @@ impl Store {
         x.heads.retain(|f, _| names.contains(f));
         x.old.retain(|f, _| names.contains(f));
         x.envelopes.retain(|f| names.contains(f));
-        let mut bad = 0;
-        let known =
-            |n: &&String| x.heads.contains_key(*n) || x.old.contains_key(*n);
+        x.bad.retain(|f| names.contains(f));
+        // A file read once: names are hashes of what they hold, and the
+        // index starts again whenever the keys change.
+        let known = |n: &&String| {
+            x.heads.contains_key(*n)
+                || x.old.contains_key(*n)
+                || x.envelopes.contains(*n)
+        };
         let new: Vec<&String> = names.iter().filter(|n| !known(n)).collect();
         for n in new {
             match self.head(n) {
@@ -1107,12 +1160,12 @@ impl Store {
                 // A group's envelope: its keys, not a version.
                 None if self.envelope(n) => drop(x.envelopes.insert(n.clone())),
                 None => {
-                    bad += 1;
+                    x.bad.insert(n.clone());
                     x.envelopes.insert(n.clone());
                 }
             }
         }
-        self.unreadable.store(bad, Relaxed);
+        self.unreadable.store(x.bad.len(), Relaxed);
         x.mtime = mtime;
         (x.tips, x.last) = Default::default();
         let heads = std::mem::take(&mut x.heads);
@@ -1485,8 +1538,11 @@ impl Store {
         // As sync takes it: a larger file would fail every sync.
         ensure!(ct.len() <= MAX, "over {MAX} bytes sealed");
         v.file = name_of(&ct);
+        let at = || fs::metadata(&self.v).and_then(|m| m.modified()).ok();
+        let before = at();
         write(&self.v.join(&v.file), &ct)?;
-        x.mtime = fs::metadata(&self.v).and_then(|m| m.modified()).ok();
+        // Taken as seen only if nothing else came since the last scan.
+        x.mtime = if before == x.mtime { at() } else { None };
         x.tip(&v);
         let file = v.file.clone();
         x.heads.insert(v.file.clone(), v);
@@ -2910,6 +2966,37 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_admins_fork_endorsed_by_a_higher_one_is_undone() {
+        let l = Lab::new("endorse", &["alice", "bob", "carol", "dave"]);
+        for w in ["bob", "carol", "dave"] {
+            l.add("alice", w);
+        }
+        let mut sa = l.open("alice");
+        l.g(&mut sa).promote("bob").unwrap();
+        l.g(&mut sa).promote("carol").unwrap();
+        for w in ["bob", "carol", "dave"] {
+            l.sync("alice", w);
+        }
+        let id = |w: &str| l.open(w).group("lab").unwrap().member_id().unwrap();
+        let rest: Vec<String> =
+            ["alice", "bob", "carol"].iter().map(|w| id(w)).collect();
+        // Bob removes carol; carol, at once, removes dave (no new key),
+        // and reaches alice first: alice's open signs on carol's fork.
+        l.open("bob").group_remove("lab", "carol").unwrap();
+        let mut sc = l.open("carol");
+        l.g(&mut sc).remove_quietly("dave", &rest, false).unwrap();
+        l.sync("carol", "alice");
+        drop(l.open("alice"));
+        // Bob's removal comes: alice removes carol again, before she writes.
+        l.sync("bob", "alice");
+        let sa = l.open("alice");
+        assert!(!l.names("alice").contains(&"carol".into()));
+        sa.put("@lab/s", b"s\n").unwrap();
+        l.sync("alice", "carol");
+        assert!(l.open("carol").get("@lab/s").is_err());
+    }
+
+    #[test]
     fn two_admins_at_once_merge_to_the_higher_and_strangers_are_not_admitted() {
         let l = Lab::new("admins", &["alice", "bob", "carol"]);
         l.add("alice", "bob");
@@ -3001,11 +3088,26 @@ mod tests {
             .links_in(vec![l.lab("bob")]);
         sb.unlink("lab").unwrap();
         assert!(!l.lab("bob").join("member").exists());
+        // Its folder still syncs, until its removal shows.
+        assert!(sb.reach().any(|d| d == l.lab("bob")));
+        let sb = Store::open(&own, b"b2", None)
+            .unwrap()
+            .links_in(vec![l.lab("bob")]);
+        assert!(
+            sb.reach().any(|d| d == l.lab("bob")),
+            "after a new unlock too"
+        );
         l.sync("bob", "alice");
         let mut sa = l.open("alice");
         let n = l.g(&mut sa).keys().len();
         assert_eq!(l.names("alice"), ["alice"]);
         assert_eq!(n, 2, "a new key");
+        l.sync("alice", "bob");
+        let sb = Store::open(&own, b"b2", None)
+            .unwrap()
+            .links_in(vec![l.lab("bob")]);
+        assert!(!sb.reach().any(|d| d == l.lab("bob")), "let go");
+        assert!(!l.lab("bob").join(LEAVING).exists());
     }
 
     #[test]
