@@ -15,3 +15,8 @@
   and `psk` (irnet), short codes (pairir). Hardening never costs a sync:
   what cannot be had is said, and sync goes on; a change that could delay
   or drop one comes with a test that it still gets through.
+- pasa's pushes depend on pasa alone, as chatir's on chatir: its process
+  outlives its activity (pushir's service lives in it), and it should
+  call `Pushir.hold` from its activity in sight and show `Pushir.held()`
+  (not yet done).
+  Each pushir bump is checked on a phone with pasa swiped away and locked.
