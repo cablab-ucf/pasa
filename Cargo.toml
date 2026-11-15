@@ -38,7 +38,7 @@ totp-lite = "2"
 data-encoding = "2"
 zeroize = "1"
 irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "fbd691d1b6dd34d4d2c027b6875df3f11c918f66", optional = true }
-pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "5c1681ba1440387039e07cf8c1d0450b32897701", optional = true }
+pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "99027245236911cfe2aa9bad66b7ae3beb544a01", optional = true }
 pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "6d250b2c47763c55c7f988a05eb65d5182ac7d91", optional = true }
 iroh = { version = "1.4", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
