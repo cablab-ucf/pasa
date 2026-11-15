@@ -164,7 +164,7 @@ with yours, one unlock for both:
 
 ```sh
 pasa --dir ~/lab init           # once, by one member; the others join it
-pasa link ~/lab                 # its password, once; Devices, Group stores
+pasa link ~/lab                 # its password, once; the window: Devices, Group stores
 pasa ls                         # yours, and @lab/NAME
 pasa set @lab/github            # kept in ~/lab, not in yours
 pasa unlink lab
@@ -176,35 +176,8 @@ was; only the open view unites them, in memory, and each write goes to
 its own store, which syncs, serves and commits as before. Your password,
 changed, seals the links anew; the group's, changed, asks for a new link.
 
-Not on yet (PLAN.md: an adversarial review of the signed chain first; a
-group already held keeps opening). A group made by pasa has no password.
-Each device makes its own seed, never sent: X-Wing (to open the keys) and
-Ed25519 with ML-DSA-65 (to sign; both must verify). The creator is the
-root. Every change is an envelope in `v/`: the store keys sealed to each
-member, with the member list and the hash of the envelope before, signed
-by an admin of that one. Authority runs from the root down this chain
-alone, never from files any member could write. Joining hands no key: the
-admin records a one-time invitation; the new device puts its public keys
-in `v/`, sealed with the pairing secret; that admin admits it once, at its
-next open. Removing one is a new store key sealed to the rest alone:
-nobody pairs again, and no password exists to change.
-
-```sh
-pasa group new ~/lab alice      # a group, this device its root, as alice
-pasa group add lab bob [--qr]   # a code; there: pasa group join ~/lab alice CODE
-pasa group ls lab               # members, admins
-pasa group admin lab bob        # bob adds and removes too, ranked below
-pasa group rm lab bob           # bob gets nothing written since
-```
-
-The window and the phone do the same in Devices, Group stores.
-
-Admins rank by age, the root first, which stays in its group (to hand
-it on, make a new one); an admin removes or demotes only those below it. Of two forks, the one a higher admin signed in holds, and
-a device says when a key it may have written with was set aside: a
-removed admin's fork, made before its removal or after, loses to the
-branch holding the removal; a losing fork changes nothing in the other.
-What a removed device read it keeps (`pasa health` lists those passwords).
+Per-device group keys (offboarding without a shared password) are in
+development apart: PLAN.md.
 
 ## Revocation
 

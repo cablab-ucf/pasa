@@ -11,10 +11,6 @@ same Rust (`apasa-jni`).
   when the app is off the screen (Android 12 on; before, asked at the next
   open). Android takes it only signed by this app's key. Settings, Updates:
   off stops the asking.
-- Group stores open with the store, one unlock: @NAME/... beside its
-  entries. Devices, Group stores: make one, join one (a code or a QR
-  code), add a device, remove one (a new key for the rest). They sit in
-  `groups/` beside the stores, and sync and serve with the store.
 - Unlock by password (and a YubiKey's slot 2 held to the phone or
   plugged in), or by quick unlock: a tap of the key and a PIN. Locks when
   the app leaves the screen.

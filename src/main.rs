@@ -62,14 +62,6 @@ pasa recover [FILE]          versions written under a retired key that its rotat
                              back
 pasa link DIR | unlink LABEL the store in DIR (a group's) opens with this one after its
                              password once: its entries show as @LABEL/NAME
-pasa group new DIR NAME      a group store in DIR: no password, a key per device (this
-                             one's, NAME); it opens with this store, as @DIR's-name/
-pasa group add LABEL NAME [--qr]   a code for device NAME to join @LABEL
-pasa group join DIR NAME CODE|--scan   join the group NAME's code is for, into DIR
-pasa group ls LABEL | rm LABEL MEMBER   its members; one removed: a new key, the
-                             rest's alone (nobody pairs again)
-pasa group admin LABEL MEMBER   MEMBER may add and remove devices too (admins
-                             rank by age: an older one's change wins)
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
@@ -968,7 +960,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "sync")]
         [
             "pair" | "join" | "sync" | "serve" | "listen" | "peers" | "forget"
-            | "revoke" | "group",
+            | "revoke",
             ..,
         ] => return sync(&a),
         ["show", n] | [n] => {
@@ -1189,87 +1181,9 @@ async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
             );
         }
         ["take", code] => println!("{}", B64.encode(&sync::fetch(code).await?)),
-        ["take-group", code] => {
-            println!("{}", B64.encode(&sync::fetch_in(code, true).await?))
-        }
         _ => bail!("{USAGE}"),
     }
     Ok(())
-}
-
-/// Shows device `name` the pairing `got` for the store in `dir` (a QR code,
-/// or a code through pairir), then serves until it has synced.
-#[cfg(feature = "sync")]
-async fn hand(
-    dir: &Path,
-    name: &str,
-    got: &[u8],
-    qr: bool,
-    there: &str,
-) -> Result<()> {
-    match qr {
-        true => {
-            let pw = qr_password(name)?;
-            let qr = pasa::sync::qr(got, text(&pw)?).await?;
-            // The password off the screen, scrollback too.
-            if std::io::stderr().is_terminal() {
-                eprint!("\x1b[H\x1b[2J\x1b[3J");
-            }
-            let c = qrcode::QrCode::new(&qr)?;
-            println!(
-                "{}",
-                c.render::<qrcode::render::unicode::Dense1x2>().build()
-            );
-            println!("there: scan it, or {there} {qr}");
-        }
-        false => {
-            let mut c = net_in(dir, &["give"])?;
-            let mut i = c.stdin.take().context("stdin")?;
-            writeln!(i, "{}", B64.encode(got))?;
-            let mut l = lines(&mut c);
-            let code = l.next().context("no code: no relay?")?;
-            println!("{code}\nthere: {there} {code}");
-            match l.next().as_deref() {
-                Some("taken") => eprintln!("{name} took it"),
-                Some("spent") => bail!(
-                    "the code was used by someone who did not prove it: \
-                     pasa forget {name} (a group's: pasa group rm LABEL \
-                     {name}), then pair again"
-                ),
-                _ => bail!(
-                    "nobody came: pair again (a group's: pasa group rm LABEL \
-                     {name} first)"
-                ),
-            }
-        }
-    }
-    serve_until_in(dir, name)
-}
-
-/// A pairing's payload from a code, a QR code's text, or `--scan`.
-#[cfg(feature = "sync")]
-async fn fetched(code: &str, group: bool) -> Result<Secret> {
-    let scanned = match code {
-        #[cfg(feature = "scan")]
-        "--scan" => {
-            eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
-            crate::scan::scan()?
-        }
-        c => c.to_string(),
-    };
-    let code = scanned.trim();
-    Ok(match code.starts_with("PAIRIR1:") {
-        true => {
-            let pw = ask("QR code password: ")?;
-            pasa::sync::unqr_in(code, text(&pw)?, group).await?
-        }
-        false => {
-            let take = if group { "take-group" } else { "take" };
-            let mut c = net(&[take, code])?;
-            let l = lines(&mut c).next().context("no answer")?;
-            Zeroizing::new(B64.decode(l.as_bytes())?)
-        }
-    })
 }
 
 #[cfg(feature = "sync")]
@@ -1292,92 +1206,63 @@ async fn sync(a: &[&str]) -> Result<()> {
     use pasa::sync;
     let dir = home();
     match a {
-        ["group", "new", d, name] => {
-            let (mut s, d) = (open()?, pasa::path(d));
-            let g = pasa::Store::create_group(&d, name)?;
-            pasa::remember(&d)?;
-            let l = s.link(g)?;
-            eprintln!(
-                "@{l}: a group store, opening with yours; pasa group add {l} NAME"
-            );
-        }
-        ["group", "add", l, name, ..] => {
-            let mut s = open()?;
-            let g = s.group(l)?;
-            let root = g.invite(name)?;
-            let (d, got) =
-                (g.dir.clone(), sync::offer_group(&g.dir, name, &root)?);
-            drop(s);
-            hand(
-                &d,
-                name,
-                &got,
-                a.contains(&"--qr"),
-                "pasa group join DIR NAME",
-            )
-            .await?;
-        }
-        ["group", "join", d, name, code] => {
-            let (mut s, d) = (open()?, pasa::path(d));
-            s.joinable(&d)?;
-            let got = fetched(code, true).await?;
-            let (root, psk) = sync::take_group(&d, name, &got)?;
-            s.join_group(&d, &root, &psk)?;
-            pasa::remember(&d)?;
-            net_run_in(&d, &["sync"])?;
-            eprintln!(
-                "@{}: asked; it opens with your store once the admin that \
-                 paired this device has opened theirs and synced",
-                s.label_of(&d)
-            );
-        }
-        ["group", "ls", l] => {
-            let mut s = open()?;
-            let g = s.group(l)?;
-            let me = g.member_id();
-            for m in g.members()? {
-                let here = if Some(&m.id) == me.as_ref() {
-                    "  (this device)"
-                } else {
-                    ""
-                };
-                let admin = if m.admin { "  admin" } else { "" };
-                println!("{}  {}{admin}{here}", m.id, m.name);
-            }
-        }
-        ["group", "admin", l, who] => {
-            let mut s = open()?;
-            let g = s.group(l)?;
-            g.promote(who)?;
-            let d = g.dir.clone();
-            record_in(&d);
-            if sync::on(&d) {
-                net_run_in(&d, &["sync", "--news"])?;
-            }
-            eprintln!("{who}: an admin of @{l}");
-        }
-        ["group", "rm", l, who] => {
-            let mut s = open()?;
-            let d = s.group(l)?.dir.clone();
-            let (id, name) = s.group_remove(l, who)?;
-            // Its pairing here, if this device paired it.
-            let _ = sync::forget(&d, &name);
-            record_in(&d);
-            if sync::on(&d) {
-                net_run_in(&d, &["sync", "--news"])?;
-            }
-            eprintln!(
-                "{id}: removed; a new key for the rest. What it read it keeps: \
-                 pasa health lists the passwords to change"
-            );
-        }
         ["pair", name, ..] => {
             let got = sync::offer(&dir, name)?;
-            hand(&dir, name, &got, a.contains(&"--qr"), "pasa join NAME")
-                .await?;
+            match a.contains(&"--qr") {
+                true => {
+                    let pw = qr_password(name)?;
+                    let qr = sync::qr(&got, text(&pw)?).await?;
+                    // The password off the screen, scrollback too.
+                    if std::io::stderr().is_terminal() {
+                        eprint!("\x1b[H\x1b[2J\x1b[3J");
+                    }
+                    let c = qrcode::QrCode::new(&qr)?;
+                    println!(
+                        "{}",
+                        c.render::<qrcode::render::unicode::Dense1x2>().build()
+                    );
+                    println!("there: scan it, or pasa join NAME {qr}");
+                }
+                false => {
+                    let mut c = net(&["give"])?;
+                    let mut i = c.stdin.take().context("stdin")?;
+                    writeln!(i, "{}", B64.encode(&got))?;
+                    let mut l = lines(&mut c);
+                    let code = l.next().context("no code: no relay?")?;
+                    println!("{code}\nthere: pasa join NAME {code}");
+                    match l.next().as_deref() {
+                        Some("taken") => eprintln!("{name} took it"),
+                        Some("spent") => bail!(
+                            "the code was used by someone who did not prove it: \
+                             pasa forget {name}, then pair again"
+                        ),
+                        _ => bail!("nobody came: pair again"),
+                    }
+                }
+            }
+            serve_until_in(&dir, name)?;
         }
         ["join", name, code] => {
-            let got = fetched(code, false).await?;
+            let scanned = match *code {
+                #[cfg(feature = "scan")]
+                "--scan" => {
+                    eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
+                    crate::scan::scan()?
+                }
+                c => c.to_string(),
+            };
+            let code = scanned.trim();
+            let got = match code.starts_with("PAIRIR1:") {
+                true => {
+                    let pw = ask("QR code password: ")?;
+                    sync::unqr(code, text(&pw)?).await?
+                }
+                false => {
+                    let mut c = net(&["take", code])?;
+                    let l = lines(&mut c).next().context("no answer")?;
+                    Zeroizing::new(B64.decode(l.as_bytes())?)
+                }
+            };
             sync::take(&dir, name, &got)?;
             net_run(&["sync"])?;
             eprintln!("The store is here: its password opens it (pasa ls)");

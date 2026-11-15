@@ -22,7 +22,6 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "sync")]
 pub mod confine;
-pub mod group;
 
 /// No core dump, and no same-user process reads this one's memory.
 pub fn harden() {
@@ -174,9 +173,7 @@ pub fn stores() -> Vec<PathBuf> {
     let t = fs::read_to_string(user(".pasa/stores")).unwrap_or_default();
     let mut all: Vec<PathBuf> = vec![];
     for p in [user(".pasa")].into_iter().chain(t.lines().map(PathBuf::from)) {
-        let held =
-            ["key", "member", LEAVING].iter().any(|f| p.join(f).exists());
-        if held && !all.contains(&p) {
+        if p.join("key").exists() && !all.contains(&p) {
             all.push(p);
         }
     }
@@ -213,8 +210,6 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
 }
 
 const OWN: &str = ".pasa/";
-/// A group's `member` file, once this device asked to leave it.
-const LEAVING: &str = "leaving";
 
 /// Notice of a retired key, sealed to that key: `RETIRED` + [`key_id`].
 const RETIRED: &str = ".pasa/retired/";
@@ -305,11 +300,8 @@ struct Index {
     mtime: Option<SystemTime>,
     tips: HashMap<String, (u64, String)>,
     last: u64,
-    /// Files that are no version here (a group's envelopes, their links
-    /// before they open, requests), and those its chain was last checked at.
-    envelopes: HashSet<String>,
-    checked: Option<HashSet<String>>,
-    /// Of those, the ones no key here opens.
+    /// Files no key here opens: read once (names are hashes of what they
+    /// hold, and the index starts again whenever the keys change).
     bad: HashSet<String>,
 }
 
@@ -364,18 +356,12 @@ pub struct Store {
     linked: Vec<(String, Store)>,
     /// Linked stores that did not open, and why.
     pub unopened: Vec<String>,
-    /// Their folders, and groups joined since: links a password change
-    /// must seal anew though not open.
+    /// Their folders: links a password change must seal anew though not
+    /// open.
     waiting: Vec<PathBuf>,
-    /// A group store's: this device's member key (seed); it has no `key`.
-    member: Option<Secret>,
-    /// A group store's root: whom its authority runs from.
-    root: Option<String>,
     /// How many of `keys` are current: 2 or more while rotations made at
     /// once are not yet merged by the next.
     current: usize,
-    /// A group store's view, from its chain of envelopes.
-    g: group::State,
     /// The key a rotation writes under before the key file holds it.
     staged: Option<Secret>,
 }
@@ -401,10 +387,7 @@ impl Store {
             linked: vec![],
             unopened: vec![],
             waiting: vec![],
-            member: None,
-            root: None,
             current: 1,
-            g: Default::default(),
             staged: None,
         })
     }
@@ -514,18 +497,16 @@ impl Store {
         yk: Option<(&[u8], &[u8])>,
     ) -> Result<()> {
         // Every link to this store, open now or not (a group joined and
-        // not yet synced): opened under the old KEK, sealed to the new.
+        // not open): opened under the old KEK, sealed to the new.
         let mut links = vec![];
         let dirs = self.dirs().map(Into::into).chain(self.waiting.clone());
         for d in stores().into_iter().chain(dirs) {
-            for f in ["member", "link", LEAVING] {
-                let Ok(b) = fs::read(d.join(f)) else { continue };
-                if b.get(..16) != Some(&self.owner()[..]) {
-                    continue;
-                }
-                let pt = open(&self.kek, &b[16..]).context("a damaged link")?;
-                links.push((d.join(f), pt));
+            let Ok(b) = fs::read(d.join("link")) else { continue };
+            if b.get(..16) != Some(&self.owner()[..]) {
+                continue;
             }
+            let pt = open(&self.kek, &b[16..]).context("a damaged link")?;
+            links.push((d.join("link"), pt));
         }
         let salt = yk.map_or(rand::<32>().to_vec(), |c| c.0.to_vec());
         self.salt = [&salt[..], &[yk.is_some() as u8]].concat();
@@ -554,47 +535,13 @@ impl Store {
         Ok(label)
     }
 
-    /// Opens with this store no more. A store with a password opens on
-    /// its own again. A group store has none: this device leaves it (its
-    /// removal, signed by itself: the others' next key is not sealed to
-    /// it), and its member key goes.
+    /// Opens with this store no more; it opens on its own again, with its
+    /// password.
     pub fn unlink(&mut self, label: &str) -> Result<()> {
         let i = self.linked.iter().position(|l| l.0 == label);
         let i = i.context("no such linked store")?;
-        if self.linked[i].1.member.is_some() {
-            self.linked[i].1.leave()?;
-            let (_, s) = self.linked.remove(i);
-            // Kept, and synced, until an admin removed it: its request
-            // reaches the admins; the folder holds no store for it then.
-            let seen = group::envelope_files(&s.dir).join("\n");
-            write(&s.dir.join("leaving.seen"), seen.as_bytes())?;
-            fs::rename(s.dir.join("member"), s.dir.join(LEAVING))?;
-            self.waiting.push(s.dir.clone());
-            return Ok(());
-        }
         let (_, s) = self.linked.remove(i);
         Ok(fs::remove_file(s.dir.join("link"))?)
-    }
-
-    /// Removes `who` from linked group `label`: a new key for the rest,
-    /// and this device's link holding it at once. Its id and name.
-    pub fn group_remove(
-        &mut self,
-        label: &str,
-        who: &str,
-    ) -> Result<(String, String)> {
-        let g = self.group(label)?;
-        let name =
-            g.members()?.into_iter().find(|m| m.id == who || m.name == who);
-        let id = g.remove_member(who)?;
-        let g = &self
-            .linked
-            .iter()
-            .find(|l| l.0 == label.trim_start_matches('@'))
-            .context("gone")?
-            .1;
-        self.seal_link(g)?;
-        Ok((id, name.map(|m| m.name).unwrap_or_default()))
     }
 
     /// The linked store labelled so.
@@ -617,138 +564,9 @@ impl Store {
 
     /// `other`'s KEK, sealed to this one's, in `other/link`: never in `v/`,
     /// so never synced, and pairing hands none.
-    /// A group store's: `member` instead, its seed and root sealed so.
     fn seal_link(&self, other: &Store) -> Result<()> {
-        if let (Some(seed), Some(root)) = (&other.member, other.root()) {
-            return self.seal_member(&other.dir, seed, root);
-        }
         let sealed = seal(&self.kek, &other.kek)?;
         write(&other.dir.join("link"), &[&self.owner()[..], &sealed].concat())
-    }
-
-    /// `member`: owner (16), then sealed: this device's seed in the group
-    /// (32) and the group's root (its id, 32).
-    fn seal_member(&self, dir: &Path, seed: &[u8], root: &str) -> Result<()> {
-        let all = Zeroizing::new([seed, root.as_bytes()].concat());
-        let sealed = seal(&self.kek, &all)?;
-        write(&dir.join("member"), &[&self.owner()[..], &sealed].concat())
-    }
-
-    /// Refuses a folder holding a store or a group's member key already:
-    /// call before a pairing writes there.
-    pub fn joinable(&self, dir: &Path) -> Result<()> {
-        let held = ["key", "member", "link", LEAVING]
-            .iter()
-            .any(|f| dir.join(f).exists());
-        ensure!(
-            !held && self.dirs().all(|d| d != dir),
-            "{} holds a store",
-            dir.display()
-        );
-        Ok(())
-    }
-
-    /// Joins group `root` in `dir`: a seed made here, never sent; its
-    /// public keys put in `v/` sealed to the pairing's secret `psk`, for the
-    /// admin that paired it to sign. It opens with this store once a sync
-    /// brings an envelope to it.
-    pub fn join_group(
-        &mut self,
-        dir: &Path,
-        root: &str,
-        psk: &[u8],
-    ) -> Result<()> {
-        ensure!(group::ON, group::OFF);
-        ensure!(
-            !["key", "member", "link"].iter().any(|f| dir.join(f).exists()),
-            "{} holds a store",
-            dir.display()
-        );
-        let seed = Zeroizing::new(rand::<32>().to_vec());
-        let ask = group::request(&seed, psk, root)?;
-        write(&versions(dir).join(name_of(&ask)), &ask)?;
-        self.seal_member(dir, &seed, root)?;
-        self.waiting.push(dir.into());
-        Ok(())
-    }
-
-    /// A linked group store, by this device's member key: made its own if
-    /// handed, and settled (a removal or a member since, sealed anew).
-    /// `was`: its keys and index before (a refresh): kept if the keys are,
-    /// so no file is tried again with them.
-    fn open_group(
-        &self,
-        dir: &Path,
-        f: &[u8],
-        was: Option<(Vec<Secret>, Index)>,
-    ) -> Result<Store> {
-        let sealed = f.get(16..).context("a damaged link")?;
-        let all = open(&self.kek, sealed).context("a damaged link")?;
-        ensure!(all.len() == 64, "a damaged link");
-        let (seed, root) = all.split_at(32);
-        let root = std::str::from_utf8(root).context("a damaged link")?;
-        let mut g = Store::open_member(dir, seed, root)?;
-        if let Some((_, mut x)) = was.filter(|w| w.0 == g.keys) {
-            x.checked = None;
-            *g.index.get_mut().unwrap_or_else(|p| p.into_inner()) = x;
-        }
-        // An admin's work undone opens the group all the same: its sync,
-        // and what it holds, go on.
-        if let Err(e) = g.settle() {
-            g.unopened.push(format!("{e:#}"));
-        }
-        Ok(g)
-    }
-
-    /// Whether the chain in `dir` still lists this device (`f`: its
-    /// sealed seed and root).
-    fn member_of(&self, dir: &Path, f: &[u8]) -> Result<bool> {
-        let all = open(&self.kek, f.get(16..).context("damaged")?);
-        let all = all.context("damaged")?;
-        ensure!(all.len() == 64, "damaged");
-        let (seed, root) = all.split_at(32);
-        let g = Store::open_member(dir, seed, std::str::from_utf8(root)?)?;
-        let me = g.member_id().context("not a group")?;
-        // Its removal is sealed to the rest alone: an envelope without it
-        // says so (a forged one only ends the syncing early).
-        let seen = fs::read_to_string(dir.join("leaving.seen"));
-        let seen = seen.unwrap_or_default();
-        let before: Vec<String> = seen.lines().map(String::from).collect();
-        Ok(g.members()?.iter().any(|m| m.id == me)
-            && !group::left_out(dir, &me, &before))
-    }
-
-    /// Linked groups opened again, as a sync left them: their chain now,
-    /// an admin's work done (admissions, removals asked for).
-    pub fn refresh_groups(&mut self) {
-        for i in 0..self.linked.len() {
-            let (label, g) = &self.linked[i];
-            let (label, dir) = (label.clone(), g.dir.clone());
-            let Ok(f) = fs::read(dir.join("member")) else { continue };
-            let was = format!("@{label}:");
-            self.unopened.retain(|u| !u.starts_with(&was));
-            let old = &mut self.linked[i].1;
-            let x = std::mem::take(
-                old.index.get_mut().unwrap_or_else(|p| p.into_inner()),
-            );
-            let was = Some((old.keys.clone(), x));
-            match self.open_group(&dir, &f, was) {
-                Ok(mut g) => {
-                    let said = g.unopened.drain(..);
-                    let said: Vec<_> =
-                        said.map(|m| format!("@{label}: {m}")).collect();
-                    self.unopened.extend(said);
-                    self.linked[i].1 = g;
-                }
-                Err(e) => self.unopened.push(format!("@{label}: {e:#}")),
-            }
-        }
-    }
-
-    /// What a sync or serve covers: this store's folder, its linked
-    /// stores', and groups joined but not open yet (their keys come so).
-    pub fn reach(&self) -> impl Iterator<Item = &Path> {
-        self.dirs().chain(self.waiting.iter().map(PathBuf::as_path))
     }
 
     /// The folder's name, without `/` or `@`, made unique.
@@ -785,8 +603,7 @@ impl Store {
         self
     }
 
-    /// Opens the stores in `dirs` linked to this one and not open yet: a
-    /// group joined since, once a sync brought its keys.
+    /// Opens the stores in `dirs` linked to this one and not open yet.
     pub fn add_links(&mut self, dirs: Vec<PathBuf>) {
         for dir in dirs {
             if self.dirs().any(|d| d == dir) {
@@ -794,42 +611,15 @@ impl Store {
             }
             let was = format!("@{}:", self.label(&dir));
             self.unopened.retain(|u| !u.starts_with(&was));
-            // A group this device left: synced until the chain no longer
-            // lists it, then let go.
-            if let Ok(f) = fs::read(dir.join(LEAVING)) {
-                if f.get(..16) == Some(&self.owner()[..]) {
-                    let still = self.member_of(&dir, &f).unwrap_or(true);
-                    match still {
-                        true if !self.waiting.contains(&dir) => {
-                            self.waiting.push(dir)
-                        }
-                        true => {}
-                        false => {
-                            let _ = fs::remove_file(dir.join("leaving.seen"));
-                            drop(fs::remove_file(dir.join(LEAVING)))
-                        }
-                    }
-                }
-                continue;
-            }
-            let (group, file) = match fs::read(dir.join("member")) {
-                Ok(f) => (true, f),
-                Err(_) => match fs::read(dir.join("link")) {
-                    Ok(f) => (false, f),
-                    Err(_) => continue,
-                },
-            };
+            let Ok(file) = fs::read(dir.join("link")) else { continue };
             if file.get(..16) != Some(&self.owner()[..]) {
                 continue;
             }
             let label = self.label(&dir);
-            let opened = match group {
-                true => self.open_group(&dir, &file, None),
-                false => open(&self.kek, &file[16..])
-                    .context("a damaged link")
-                    .and_then(|kek| Store::unsealed(&dir, kek))
-                    .context("its password changed there: link it again"),
-            };
+            let opened = open(&self.kek, &file[16..])
+                .context("a damaged link")
+                .and_then(|kek| Store::unsealed(&dir, kek))
+                .context("its password changed there: link it again");
             match opened {
                 Ok(mut s) => {
                     let said =
@@ -892,9 +682,6 @@ impl Store {
 
     /// Refuses if another process rewrote `key` since it was read.
     pub(crate) fn save(&self) -> Result<()> {
-        if self.member.is_some() {
-            return Ok(()); // a group store's keys are in its envelopes
-        }
         fs::create_dir_all(&self.dir)?;
         let mut lock = fs::OpenOptions::new();
         let lock = lock
@@ -934,17 +721,6 @@ impl Store {
     }
 
     /// Keys a rotation made elsewhere, newest first; true if any was new.
-    /// Back to `keys`, as before a rotation that went no further.
-    pub(crate) fn set_keys(&mut self, keys: Vec<Secret>) {
-        self.ids = keys.iter().map(|k| identity(k)).collect();
-        if let Some(k) = keys.first() {
-            self.newest = recipient(k);
-        }
-        self.keys = keys;
-        *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
-            Index::default();
-    }
-
     pub(crate) fn add_keys(&mut self, ks: &[u8]) -> Result<bool> {
         let new: Vec<_> = ks
             .chunks(32)
@@ -1064,13 +840,8 @@ impl Store {
 
     /// The notice to devices on the key before the newest, under that key,
     /// if a rotation was cut short before it.
-    /// A group store writes none: its envelopes say which key is newest,
-    /// and a notice any member could write would stop its writes.
     pub(crate) fn finish(&mut self) -> Result<()> {
         let Some(old) = self.keys.get(1).cloned() else { return Ok(()) };
-        if self.member.is_some() {
-            return Ok(());
-        }
         let at = format!("{RETIRED}{}", key_id(&old));
         let said = self.index()?.old.values().any(|(v, _)| v.name == at);
         if said {
@@ -1084,10 +855,7 @@ impl Store {
         r
     }
     pub fn retired(&self) -> bool {
-        let Some(k) = self.keys.first().filter(|_| self.member.is_none())
-        else {
-            return false;
-        };
+        let Some(k) = self.keys.first() else { return false };
         let at = format!("{RETIRED}{}", key_id(k));
         self.index().is_ok_and(|x| x.tips.contains_key(&at))
     }
@@ -1143,26 +911,20 @@ impl Store {
         let names: HashSet<String> = names.filter(|n| is_name(n)).collect();
         x.heads.retain(|f, _| names.contains(f));
         x.old.retain(|f, _| names.contains(f));
-        x.envelopes.retain(|f| names.contains(f));
         x.bad.retain(|f| names.contains(f));
         // A file read once: names are hashes of what they hold, and the
         // index starts again whenever the keys change.
         let known = |n: &&String| {
             x.heads.contains_key(*n)
                 || x.old.contains_key(*n)
-                || x.envelopes.contains(*n)
+                || x.bad.contains(*n)
         };
         let new: Vec<&String> = names.iter().filter(|n| !known(n)).collect();
         for n in new {
             match self.head(n) {
                 Some((h, None)) => drop(x.heads.insert(n.clone(), h)),
                 Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
-                // A group's envelope: its keys, not a version.
-                None if self.envelope(n) => drop(x.envelopes.insert(n.clone())),
-                None => {
-                    x.bad.insert(n.clone());
-                    x.envelopes.insert(n.clone());
-                }
+                None => drop(x.bad.insert(n.clone())),
             }
         }
         self.unreadable.store(x.bad.len(), Relaxed);
@@ -1176,13 +938,6 @@ impl Store {
         x.frozen =
             h.chunks_exact(32).filter_map(|d| d.try_into().ok()).collect();
         Ok(x)
-    }
-
-    fn envelope(&self, file: &str) -> bool {
-        let mut head = [0; 40];
-        let f = fs::File::open(self.v.join(file));
-        f.and_then(|mut f| f.read_exact(&mut head)).is_ok()
-            && group::is_envelope(&head)
     }
 
     /// This store's own versions, oldest first, frozen history included.
@@ -1499,24 +1254,10 @@ impl Store {
              password or a pairing): unlock again"
         );
         drop(loaded);
-        // A group's: written only on the chain this unlock read (a device
-        // removed since must not read it), checked again as envelopes come.
-        if let (Some(seed), Some(root)) = (&self.member, &self.root)
-            && x.checked.as_ref() != Some(&x.envelopes)
-        {
-            let now = Store::open_member(&self.dir, seed, root)?;
-            ensure!(
-                now.g.head() == self.g.head(),
-                "the group changed since this unlock (a device added or \
-                 removed): unlock again"
-            );
-            x.checked = Some(x.envelopes.clone());
-        }
         let newest = self.staged.as_ref().or(self.keys.first());
         let newest = newest.context("no store key")?;
         ensure!(
             name.starts_with(RETIRED)
-                || self.member.is_some()
                 || !x
                     .tips
                     .contains_key(&format!("{RETIRED}{}", key_id(newest))),
@@ -2337,458 +2078,6 @@ mod tests {
         assert_eq!(&s.get("wifi").unwrap()[..], b"w\n");
     }
 
-    /// Devices with stores of their own, a group folder each, and sync as a
-    /// union of `v/`.
-    struct Lab(PathBuf);
-
-    impl Lab {
-        fn new(t: &str, who: &[&str]) -> Lab {
-            let d = dir(t);
-            for w in who {
-                Store::create(&d.join(w).join("own"), w.as_bytes(), None)
-                    .unwrap();
-            }
-            let l = Lab(d);
-            let mut sa = Store::open(
-                &l.0.join(who[0]).join("own"),
-                who[0].as_bytes(),
-                None,
-            )
-            .unwrap();
-            sa.link(Store::create_group(&l.lab(who[0]), who[0]).unwrap())
-                .unwrap();
-            l
-        }
-        fn lab(&self, w: &str) -> PathBuf {
-            self.0.join(w).join("lab")
-        }
-        fn sync(&self, from: &str, to: &str) {
-            copy_v(&self.lab(from), &self.lab(to));
-        }
-        fn open(&self, w: &str) -> Store {
-            let own = self.0.join(w).join("own");
-            Store::open(&own, w.as_bytes(), None)
-                .unwrap()
-                .links_in(vec![self.lab(w)])
-        }
-        fn g<'a>(&self, s: &'a mut Store) -> &'a mut Store {
-            s.group("lab").unwrap()
-        }
-        fn names(&self, w: &str) -> Vec<String> {
-            let mut s = self.open(w);
-            self.g(&mut s)
-                .members()
-                .unwrap()
-                .into_iter()
-                .map(|m| m.name)
-                .collect()
-        }
-        /// `admin` pairs `w` in; `w` asks; `admin` admits it at its next
-        /// open. The pairing's secret.
-        fn add(&self, admin: &str, w: &str) -> Secret {
-            let mut sa = self.open(admin);
-            let root = self.g(&mut sa).invite(w).unwrap();
-            let got =
-                crate::sync::offer_group(&self.lab(admin), w, &root).unwrap();
-            let (root, psk) =
-                crate::sync::take_group(&self.lab(w), admin, &got).unwrap();
-            self.open(w).join_group(&self.lab(w), &root, &psk).unwrap();
-            self.sync(w, admin);
-            drop(self.open(admin)); // admits, seals
-            self.sync(admin, w);
-            psk
-        }
-    }
-
-    fn copy_v(from: &Path, to: &Path) {
-        fs::create_dir_all(versions(to)).unwrap();
-        for e in fs::read_dir(versions(from)).unwrap().flatten() {
-            let at = versions(to).join(e.file_name());
-            if !at.exists() {
-                fs::copy(e.path(), at).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn a_group_adds_and_removes_devices_by_signed_envelopes() {
-        let l = Lab::new("group", &["alice", "bob", "carol"]);
-        assert!(!l.lab("alice").join("key").exists(), "no group password");
-        l.open("alice").put("@lab/wifi", b"w1\n").unwrap();
-        l.add("alice", "bob");
-        let mut sb = l.open("bob");
-        let seed = l.g(&mut sb).member.clone().unwrap();
-        let has = |e: fs::DirEntry| {
-            fs::read(e.path()).unwrap().windows(32).any(|w| w == &seed[..])
-        };
-        assert!(
-            !versions(&l.lab("bob")).read_dir().unwrap().flatten().any(has),
-            "no seed in v/"
-        );
-        assert_eq!(&sb.get("@lab/wifi").unwrap()[..], b"w1\n");
-        assert!(!l.g(&mut sb).is_admin(), "a member, not an admin");
-        l.add("alice", "carol");
-        assert_eq!(l.names("alice"), ["alice", "bob", "carol"]);
-        // Bob, not an admin, invites, promotes and removes nobody.
-        assert!(l.g(&mut sb).invite("x").is_err());
-        assert!(l.g(&mut sb).promote("bob").is_err());
-        assert!(l.g(&mut sb).remove_member("carol").is_err());
-        // Alice removes bob: a new key for alice and carol alone.
-        let mut sa = l.open("alice");
-        let bob = l.g(&mut sb).member_id().unwrap();
-        sa.group_remove("lab", &bob).unwrap();
-        sa.put("@lab/wifi", b"w2\n").unwrap();
-        // Bob's own envelope (a puppet, a key), and his writes: none counts.
-        let mut sb = l.open("bob");
-        l.g(&mut sb).add_puppet(&rand::<32>(), true).unwrap();
-        // Honest code writes on no chain but the valid one; an attacker's,
-        // under its own key: neither counts.
-        assert!(sb.put("@lab/evil", b"x\n").is_err());
-        l.open("bob").put("@lab/evil", b"x\n").unwrap();
-        for (f, t) in [
-            ("bob", "carol"),
-            ("alice", "carol"),
-            ("alice", "bob"),
-            ("bob", "alice"),
-        ] {
-            l.sync(f, t);
-        }
-        for w in ["alice", "carol"] {
-            let s = l.open(w);
-            assert_eq!(&s.get("@lab/wifi").unwrap()[..], b"w2\n", "{w}");
-            assert!(s.get("@lab/evil").is_err(), "{w}");
-            assert_eq!(l.names(w), ["alice", "carol"]);
-        }
-        let sb = l.open("bob");
-        assert_eq!(
-            &sb.get("@lab/wifi").unwrap()[..],
-            b"w1\n",
-            "the old one only"
-        );
-    }
-
-    #[test]
-    fn a_removed_admins_race_and_its_puppet_lose() {
-        let l = Lab::new("race", &["alice", "bob", "carol"]);
-        l.add("alice", "bob");
-        l.add("alice", "carol");
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.sync("alice", "bob");
-        l.sync("alice", "carol");
-        let mut sb = l.open("bob");
-        assert!(l.g(&mut sb).is_admin());
-        // Bob, about to go, makes a puppet admin and a key; alice removes
-        // him at the same epoch.
-        l.g(&mut sb).add_puppet(&rand::<32>(), true).unwrap();
-        sb.put("@lab/wifi", b"bob's\n").unwrap();
-        let mut sa = l.open("alice");
-        let bob = l.g(&mut sb).member_id().unwrap();
-        sa.group_remove("lab", &bob).unwrap();
-        sa.put("@lab/wifi", b"alice's\n").unwrap();
-        // Carol hears bob first: she follows his key for now (the race).
-        l.sync("bob", "carol");
-        assert_eq!(&l.open("carol").get("@lab/wifi").unwrap()[..], b"bob's\n");
-        // Then alice's: his key and his puppet go, and carol is told.
-        l.sync("alice", "carol");
-        let sc = l.open("carol");
-        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"alice's\n");
-        assert_eq!(l.names("carol"), ["alice", "carol"]);
-        assert!(
-            sc.unopened.iter().any(|u| u.contains("beside the one taken")),
-            "{:?}",
-            sc.unopened
-        );
-    }
-
-    #[test]
-    fn a_removed_admins_fork_from_long_ago_counts_for_nothing() {
-        let l = Lab::new("fork", &["alice", "bob", "carol", "dave"]);
-        for w in ["bob", "carol", "dave"] {
-            l.add("alice", w);
-        }
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.g(&mut sa).promote("dave").unwrap();
-        for w in ["bob", "carol", "dave"] {
-            l.sync("alice", w);
-        }
-        // Bob keeps a copy of the group as it is now.
-        let old = l.0.join("bob").join("old");
-        copy_v(&l.lab("bob"), &old);
-        fs::copy(l.lab("bob").join("member"), old.join("member")).unwrap();
-        // Dave, below bob, extends it (a puppet, as good as any change);
-        // then alice removes bob.
-        let mut sd = l.open("dave");
-        l.g(&mut sd).add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("dave", "alice");
-        let mut sa = l.open("alice");
-        let mut sb = l.open("bob");
-        let bob = l.g(&mut sb).member_id().unwrap();
-        sa.group_remove("lab", &bob).unwrap();
-        sa.put("@lab/wifi", b"after\n").unwrap();
-        // Bob, from his copy, outranks dave's envelope there: in vain.
-        let own = l.0.join("bob").join("own");
-        let mut sb = Store::open(&own, b"bob", None)
-            .unwrap()
-            .links_in(vec![old.clone()]);
-        assert!(sb.unopened.is_empty(), "{:?}", sb.unopened);
-        let g = sb.group("old").unwrap();
-        g.add_puppet(&rand::<32>(), true).unwrap();
-        g.put("wifi", b"bob's\n").unwrap();
-        copy_v(&old, &l.lab("carol"));
-        l.sync("alice", "carol");
-        let sc = l.open("carol");
-        assert_eq!(&sc.get("@lab/wifi").unwrap()[..], b"after\n");
-        assert!(!l.names("carol").contains(&"bob".to_string()));
-    }
-
-    #[test]
-    fn a_losing_forks_removal_changes_nothing_in_the_chain_that_holds() {
-        let l = Lab::new("losing", &["alice", "bob", "carol", "dave", "erin"]);
-        for w in ["bob", "carol", "dave", "erin"] {
-            l.add("alice", w);
-        }
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.g(&mut sa).promote("carol").unwrap();
-        for w in ["bob", "carol", "dave", "erin"] {
-            l.sync("alice", w);
-        }
-        // Bob removes carol; alice, at once, extends the same envelope.
-        let mut sb = l.open("bob");
-        sb.group_remove("lab", "carol").unwrap();
-        let mut sa = l.open("alice");
-        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("alice", "carol");
-        // Carol, an admin on alice's, adds; alice removes dave and writes.
-        let mut sc = l.open("carol");
-        l.g(&mut sc).add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("carol", "alice");
-        let mut sa = l.open("alice");
-        sa.group_remove("lab", "dave").unwrap();
-        sa.put("@lab/s", b"s\n").unwrap();
-        l.sync("alice", "erin");
-        // Bob's losing removal comes late: nothing goes back.
-        l.sync("bob", "erin");
-        l.sync("bob", "alice");
-        for w in ["erin", "alice"] {
-            let s = l.open(w);
-            assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n", "{w}");
-            let n = l.names(w);
-            assert!(
-                n.contains(&"carol".into()) && !n.contains(&"dave".into()),
-                "{w} {n:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_old_self_removal_and_a_members_junk_change_nothing() {
-        let l = Lab::new("junk", &["alice", "bob", "carol", "dave", "dave2"]);
-        for w in ["bob", "carol", "dave"] {
-            l.add("alice", w);
-        }
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        for w in ["bob", "carol", "dave"] {
-            l.sync("alice", w);
-        }
-        let old = l.0.join("bob").join("old");
-        copy_v(&l.lab("bob"), &old);
-        fs::copy(l.lab("bob").join("member"), old.join("member")).unwrap();
-        // Bob extends; alice removes dave and writes.
-        let mut sb = l.open("bob");
-        l.g(&mut sb).add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("bob", "alice");
-        let mut sa = l.open("alice");
-        sa.group_remove("lab", "dave").unwrap();
-        sa.put("@lab/s", b"s\n").unwrap();
-        l.sync("alice", "carol");
-        // Bob leaves on his old copy: his own later envelopes stand.
-        let own = l.0.join("bob").join("own");
-        let mut sb = Store::open(&own, b"bob", None)
-            .unwrap()
-            .links_in(vec![old.clone()]);
-        sb.unlink("old").unwrap();
-        copy_v(&old, &l.lab("carol"));
-        // Carol, a member, seals junk keys to everyone, and an envelope of
-        // the current key naming a stranger: no new key at alice's.
-        for _ in 0..3 {
-            let mut sc = l.open("carol");
-            l.g(&mut sc).puppet(&rand::<32>(), true, true).unwrap();
-        }
-        let mut sc = l.open("carol");
-        l.g(&mut sc).puppet(&rand::<32>(), false, false).unwrap();
-        l.sync("carol", "alice");
-        let mut sa = l.open("alice");
-        let n = l.g(&mut sa).keys().len();
-        drop(sa);
-        let mut sa = l.open("alice");
-        assert_eq!(l.g(&mut sa).keys().len(), n, "no rotation forced");
-        for w in ["alice", "carol"] {
-            let s = l.open(w);
-            assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n", "{w}");
-            assert!(!l.names(w).contains(&"dave".into()), "{w}");
-        }
-        // A device added after the junk opens the group.
-        l.add("alice", "dave2");
-        let s = l.open("dave2");
-        assert!(
-            s.unopened.iter().all(|u| !u.contains("no keys")),
-            "{:?}",
-            s.unopened
-        );
-        assert_eq!(&s.get("@lab/s").unwrap()[..], b"s\n");
-    }
-
-    #[test]
-    fn a_hidden_envelope_splits_nothing_and_a_lost_removal_is_made_again() {
-        let l = Lab::new("split", &["alice", "bob", "carol", "dave", "erin"]);
-        for w in ["bob", "carol", "dave"] {
-            l.add("alice", w);
-        }
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.g(&mut sa).promote("carol").unwrap();
-        for w in ["bob", "carol", "dave"] {
-            l.sync("alice", w);
-        }
-        // Carol removes dave, sealed to alice alone, with a new key and
-        // without: not sealed to all it lists, it counts nowhere.
-        let alice = l.open("alice").group("lab").unwrap().member_id().unwrap();
-        for key in [false, true] {
-            let mut sc = l.open("carol");
-            l.g(&mut sc)
-                .remove_quietly("dave", std::slice::from_ref(&alice), key)
-                .unwrap();
-        }
-        l.sync("carol", "alice");
-        l.open("alice").put("@lab/s", b"s\n").unwrap();
-        for _ in 0..2 {
-            for (f, t) in
-                [("alice", "bob"), ("alice", "carol"), ("bob", "carol")]
-            {
-                l.sync(f, t);
-            }
-        }
-        for w in ["alice", "bob", "carol"] {
-            assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
-            assert!(l.names(w).contains(&"dave".into()), "{w}");
-        }
-        // Bob removes nobody yet; alice adds erin while bob, at once,
-        // removes carol: alice's holds, and bob's next open removes again.
-        let mut sb = l.open("bob");
-        sb.group_remove("lab", "carol").unwrap();
-        l.add("alice", "erin");
-        l.sync("bob", "alice");
-        l.sync("alice", "bob");
-        assert!(l.names("bob").contains(&"erin".into()));
-        drop(l.open("bob")); // removes carol again
-        l.sync("bob", "alice");
-        l.sync("bob", "erin");
-        for w in ["alice", "bob", "erin"] {
-            let n = l.names(w);
-            assert!(
-                !n.contains(&"carol".into()) && n.contains(&"erin".into()),
-                "{w} {n:?}"
-            );
-        }
-        // The root stays.
-        let mut sa = l.open("alice");
-        assert!(sa.unlink("lab").is_err());
-    }
-
-    #[test]
-    fn an_admins_leave_holds_and_a_lost_forks_writes_are_said() {
-        let l = Lab::new("leave", &["alice", "bob", "carol", "dave"]);
-        for w in ["bob", "carol", "dave"] {
-            l.add("alice", w);
-        }
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.g(&mut sa).promote("carol").unwrap();
-        for w in ["bob", "carol", "dave"] {
-            l.sync("alice", w);
-        }
-        // Bob keeps a copy, leaves; carol, below him, cannot remove him;
-        // alice does, with a new key.
-        let old = l.0.join("bob").join("old");
-        copy_v(&l.lab("bob"), &old);
-        fs::copy(l.lab("bob").join("member"), old.join("member")).unwrap();
-        let mut sb = l.open("bob");
-        sb.unlink("lab").unwrap();
-        l.sync("bob", "carol");
-        l.sync("bob", "alice");
-        assert!(
-            l.names("carol").contains(&"bob".into()),
-            "carol does not outrank him"
-        );
-        l.sync("carol", "alice");
-        let sa = l.open("alice");
-        assert!(!l.names("alice").contains(&"bob".into()));
-        sa.put("@lab/s", b"s\n").unwrap();
-        // From his copy, bob extends the old chain: in vain.
-        let own = l.0.join("bob").join("own");
-        let mut sb = Store::open(&own, b"bob", None)
-            .unwrap()
-            .links_in(vec![old.clone()]);
-        sb.group("old").unwrap().add_puppet(&rand::<32>(), false).unwrap();
-        copy_v(&old, &l.lab("dave"));
-        l.sync("alice", "dave");
-        let sd = l.open("dave");
-        assert_eq!(&sd.get("@lab/s").unwrap()[..], b"s\n");
-        assert!(!l.names("dave").contains(&"bob".into()));
-        // Carol, with a new key, writes; alice, at once, makes a change of
-        // hers that holds: carol is told.
-        let mut sc = l.open("carol");
-        l.g(&mut sc).add_puppet(&rand::<32>(), false).unwrap();
-        sc.put("@lab/c", b"c\n").unwrap();
-        let mut sa = l.open("alice");
-        l.g(&mut sa).puppet(&rand::<32>(), false, false).unwrap();
-        l.sync("alice", "carol");
-        let sc = l.open("carol");
-        assert!(
-            sc.unopened.iter().any(|u| u.contains("beside the one taken")),
-            "{:?}",
-            sc.unopened
-        );
-        assert!(sc.get("@lab/c").is_err());
-    }
-
-    #[test]
-    fn junk_naming_every_link_hides_no_removal() {
-        let l = Lab::new("links", &["alice", "bob", "carol"]);
-        l.add("alice", "bob");
-        l.add("alice", "carol");
-        let mut sa = l.open("alice");
-        sa.group_remove("lab", "bob").unwrap();
-        sa.put("@lab/s", b"s\n").unwrap();
-        l.sync("alice", "carol");
-        // Bob sees every file's name, and names each in junk, many times.
-        l.sync("alice", "bob");
-        let files: Vec<String> = fs::read_dir(versions(&l.lab("bob")))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().into_string().unwrap())
-            .collect();
-        let mut sb = l.open("bob");
-        for _ in 0..4 {
-            l.g(&mut sb).junk_naming(&files).unwrap();
-        }
-        l.sync("bob", "carol");
-        l.sync("bob", "alice");
-        for w in ["alice", "carol"] {
-            assert!(!l.names(w).contains(&"bob".into()), "{w}");
-            assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
-        }
-        // Alice's next change holds for carol, without bob.
-        let mut sa = l.open("alice");
-        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("alice", "carol");
-        assert!(!l.names("carol").contains(&"bob".into()));
-    }
-
     #[test]
     fn a_far_off_date_outdates_no_edit() {
         let d = dir("ahead");
@@ -2802,312 +2091,24 @@ mod tests {
     }
 
     #[test]
-    fn a_damaged_version_and_a_stale_window_leak_nothing() {
-        let l = Lab::new("stale", &["alice", "bob", "carol"]);
-        l.add("alice", "bob");
-        l.add("alice", "carol");
-        // Bob plants a version saying it is longer than it is.
-        let mut sb = l.open("bob");
-        let k = l.g(&mut sb).keys()[0].clone();
+    fn a_damaged_or_unwritable_version_stops_no_rotation() {
+        let d = dir("damaged");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        s.put("bank", b"1\n").unwrap();
+        // Versions any key holder could plant: longer than said, a name
+        // no write takes.
+        let k = s.keys()[0].clone();
         let ms = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis();
-        let pt = format!("{ms} - 999999 zzz\n12345");
-        let ct = encrypt(&recipient(&k), pt.as_bytes()).unwrap();
-        fs::write(versions(&l.lab("bob")).join(name_of(&ct)), &ct).unwrap();
-        // And a version no write would make (its name too long): rotation
-        // passes it over (a body at the limit goes the same way).
         let long = format!("{ms} - 1 {}\nx", "n".repeat(300));
-        let ct = encrypt(&recipient(&k), long.as_bytes()).unwrap();
-        fs::write(versions(&l.lab("bob")).join(name_of(&ct)), &ct).unwrap();
-        l.sync("bob", "alice");
-        l.sync("alice", "carol");
-        // Carol's window is open; alice removes bob all the same.
-        let mut sc = l.open("carol");
-        let mut sa = l.open("alice");
-        sa.group_remove("lab", "bob").unwrap();
-        sa.health().unwrap();
-        l.sync("alice", "carol");
-        // Carol's window, opened before: it writes nothing under the old key.
-        assert!(sc.put("@lab/after", b"secret\n").is_err());
-        assert!(l.g(&mut sc).put("after", b"secret\n").is_err());
-        let sc = l.open("carol");
-        sc.put("@lab/after", b"secret\n").unwrap();
-        l.sync("carol", "bob");
-        assert!(l.open("bob").get("@lab/after").is_err());
-    }
-
-    #[test]
-    fn an_admission_set_aside_is_made_again() {
-        let l = Lab::new("admit", &["alice", "bob", "dave"]);
-        l.add("alice", "bob");
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.sync("alice", "bob");
-        // Bob pairs dave in; alice, at once, makes a change of hers.
-        let mut sb = l.open("bob");
-        let root = l.g(&mut sb).invite("dave").unwrap();
-        let got =
-            crate::sync::offer_group(&l.lab("bob"), "dave", &root).unwrap();
-        let (root, psk) =
-            crate::sync::take_group(&l.lab("dave"), "bob", &got).unwrap();
-        l.open("dave").join_group(&l.lab("dave"), &root, &psk).unwrap();
-        l.sync("dave", "bob");
-        drop(l.open("bob")); // admits dave
-        let mut sa = l.open("alice");
-        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("alice", "bob");
-        l.sync("bob", "alice");
-        assert!(!l.names("alice").contains(&"dave".into()), "alice's holds");
-        drop(l.open("bob")); // admits dave again, on alice's
-        l.sync("bob", "alice");
-        l.sync("bob", "dave");
-        assert!(l.names("alice").contains(&"dave".into()));
-        l.open("alice").put("@lab/s", b"s\n").unwrap();
-        l.sync("alice", "dave");
-        assert_eq!(&l.open("dave").get("@lab/s").unwrap()[..], b"s\n");
-    }
-
-    #[test]
-    fn an_invitation_admits_one_device_once() {
-        let l = Lab::new("once", &["alice", "bob", "dave"]);
-        l.add("alice", "bob");
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.sync("alice", "bob");
-        let psk = l.add("bob", "dave");
-        l.sync("bob", "alice");
-        assert!(l.names("alice").contains(&"dave".into()));
-        // A name in use is no invitation.
-        let mut sb = l.open("bob");
-        assert!(l.g(&mut sb).invite("alice").is_err());
-        // Alice removes dave; bob's next open forgets dave's pairing.
-        l.open("alice").group_remove("lab", "dave").unwrap();
-        l.sync("alice", "bob");
-        drop(l.open("bob"));
-        assert!(
-            crate::sync::peers(&l.lab("bob")).iter().all(|p| p.name != "dave")
-        );
-        // Dave asks again, a new device, with the old secret: in vain.
-        let root =
-            l.open("bob").group("lab").unwrap().root().unwrap().to_string();
-        let ask = group::request(&rand::<32>(), &psk, &root).unwrap();
-        fs::write(versions(&l.lab("bob")).join(name_of(&ask)), &ask).unwrap();
-        drop(l.open("bob"));
-        l.sync("bob", "alice");
-        assert!(!l.names("alice").contains(&"dave".into()));
-        assert!(!l.names("bob").contains(&"dave".into()));
-    }
-
-    #[test]
-    fn a_removal_whose_link_comes_late_still_stops_a_window() {
-        let l = Lab::new("late", &["alice", "bob", "carol"]);
-        l.add("alice", "bob");
-        l.add("alice", "carol");
-        let mut sc = l.open("carol");
-        l.open("alice").group_remove("lab", "bob").unwrap();
-        // Envelopes first, as a sync cut short might bring them.
-        for e in fs::read_dir(versions(&l.lab("alice"))).unwrap().flatten() {
-            let mut head = [0; 40];
-            let f = fs::File::open(e.path())
-                .and_then(|mut f| f.read_exact(&mut head));
-            let at = versions(&l.lab("carol")).join(e.file_name());
-            if f.is_ok() && group::is_envelope(&head) && !at.exists() {
-                fs::copy(e.path(), at).unwrap();
-            }
+        for pt in [format!("{ms} - 999999 zzz\n12345"), long] {
+            let ct = encrypt(&recipient(&k), pt.as_bytes()).unwrap();
+            fs::write(versions(&d).join(name_of(&ct)), &ct).unwrap();
         }
-        let _ = sc.put("@lab/early", b"e\n");
-        // Then the rest: carol's window writes no more under the old key.
-        l.sync("alice", "carol");
-        assert!(sc.put("@lab/late", b"secret\n").is_err());
-        assert!(l.g(&mut sc).put("late", b"secret\n").is_err());
-    }
-
-    #[test]
-    fn copies_sealed_to_fewer_and_junk_stanzas_split_nothing() {
-        let l = Lab::new("copies", &["alice", "bob", "carol", "dave"]);
-        for w in ["bob", "carol", "dave"] {
-            l.add("alice", w);
-        }
-        // Alice removes dave; bob, a member, seals the envelope again to
-        // alice and carol alone, many times.
-        l.open("alice").group_remove("lab", "dave").unwrap();
-        l.sync("alice", "bob");
-        let mut sb = l.open("bob");
-        let ids: Vec<String> = ["alice", "carol"]
-            .iter()
-            .map(|w| l.open(w).group("lab").unwrap().member_id().unwrap())
-            .collect();
-        for _ in 0..8 {
-            l.g(&mut sb).reseal_head(&ids).unwrap();
-        }
-        l.sync("bob", "alice");
-        l.sync("bob", "carol");
-        l.sync("alice", "carol");
-        l.open("alice").put("@lab/s", b"s\n").unwrap();
-        l.sync("alice", "carol");
-        for w in ["alice", "carol"] {
-            assert!(!l.names(w).contains(&"dave".into()), "{w}");
-            assert_eq!(&l.open(w).get("@lab/s").unwrap()[..], b"s\n", "{w}");
-        }
-        // An admin's envelope with a junk stanza for carol ahead of hers:
-        // taken by nobody.
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.sync("alice", "bob");
-        let carol = ids[1].clone();
-        let mut sb = l.open("bob");
-        let g = l.g(&mut sb);
-        g.g.junk = Some(carol);
-        g.add_puppet(&rand::<32>(), false).unwrap();
-        l.sync("bob", "alice");
-        l.sync("bob", "carol");
-        for w in ["alice", "carol"] {
-            assert_eq!(l.names(w).len(), 3, "{w}");
-        }
-    }
-
-    #[test]
-    fn a_removed_admins_fork_endorsed_by_a_higher_one_is_undone() {
-        let l = Lab::new("endorse", &["alice", "bob", "carol", "dave"]);
-        for w in ["bob", "carol", "dave"] {
-            l.add("alice", w);
-        }
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.g(&mut sa).promote("carol").unwrap();
-        for w in ["bob", "carol", "dave"] {
-            l.sync("alice", w);
-        }
-        let id = |w: &str| l.open(w).group("lab").unwrap().member_id().unwrap();
-        let rest: Vec<String> =
-            ["alice", "bob", "carol"].iter().map(|w| id(w)).collect();
-        // Bob removes carol; carol, at once, removes dave (no new key),
-        // and reaches alice first: alice's open signs on carol's fork.
-        l.open("bob").group_remove("lab", "carol").unwrap();
-        let mut sc = l.open("carol");
-        l.g(&mut sc).remove_quietly("dave", &rest, false).unwrap();
-        l.sync("carol", "alice");
-        drop(l.open("alice"));
-        // Bob's removal comes: alice removes carol again, before she writes.
-        l.sync("bob", "alice");
-        let sa = l.open("alice");
-        assert!(!l.names("alice").contains(&"carol".into()));
-        sa.put("@lab/s", b"s\n").unwrap();
-        l.sync("alice", "carol");
-        assert!(l.open("carol").get("@lab/s").is_err());
-    }
-
-    #[test]
-    fn two_admins_at_once_merge_to_the_higher_and_strangers_are_not_admitted() {
-        let l = Lab::new("admins", &["alice", "bob", "carol"]);
-        l.add("alice", "bob");
-        let psk = l.add("alice", "carol");
-        let mut sa = l.open("alice");
-        l.g(&mut sa).promote("bob").unwrap();
-        l.sync("alice", "bob");
-        l.sync("alice", "carol");
-        // Both admins make a key at the same epoch: everyone takes alice's.
-        let (mut sa, mut sb) = (l.open("alice"), l.open("bob"));
-        l.g(&mut sb).add_puppet(&rand::<32>(), false).unwrap();
-        sb.put("@lab/b", b"b\n").unwrap();
-        l.g(&mut sa).add_puppet(&rand::<32>(), false).unwrap();
-        sa.put("@lab/a", b"a\n").unwrap();
-        for (f, t) in [
-            ("alice", "carol"),
-            ("bob", "carol"),
-            ("alice", "bob"),
-            ("bob", "alice"),
-        ] {
-            l.sync(f, t);
-        }
-        for w in ["alice", "bob", "carol"] {
-            let s = l.open(w);
-            assert_eq!(&s.get("@lab/a").unwrap()[..], b"a\n", "{w}");
-            assert!(s.get("@lab/b").is_err(), "{w}");
-        }
-        assert!(
-            l.open("carol")
-                .unopened
-                .iter()
-                .any(|u| u.contains("beside the one taken"))
-        );
-        let root =
-            l.open("alice").group("lab").unwrap().root().unwrap().to_string();
-        // A request sealed with a secret no pairing made, and one by carol,
-        // admitted already, with hers: neither is admitted.
-        for ask in [
-            group::request(&rand::<32>(), &rand::<32>(), &root).unwrap(),
-            group::request(&rand::<32>(), &psk, &root).unwrap(),
-        ] {
-            fs::write(versions(&l.lab("alice")).join(name_of(&ask)), &ask)
-                .unwrap();
-        }
-        assert_eq!(l.names("alice").len(), 4, "alice, bob, carol, a puppet");
-    }
-
-    #[test]
-    fn a_group_survives_junk_a_new_password_and_a_device_leaving() {
-        let l = Lab::new("group-edges", &["alice", "bob"]);
-        l.open("alice").put("@lab/x", b"1\n").unwrap();
-        let mut sb = l.open("bob");
-        // No pairing writes into a folder holding a store or a group.
-        assert!(sb.joinable(&l.0.join("bob/own")).is_err());
-        let root = l.open("alice").group("lab").unwrap().invite("bob").unwrap();
-        let got =
-            crate::sync::offer_group(&l.lab("alice"), "bob", &root).unwrap();
-        let (root, psk) =
-            crate::sync::take_group(&l.lab("bob"), "alice", &got).unwrap();
-        sb.join_group(&l.lab("bob"), &root, &psk).unwrap();
-        assert!(sb.joinable(&l.lab("bob")).is_err());
-        assert!(
-            sb.join_group(&l.lab("bob"), &root, &psk).is_err(),
-            "no second join"
-        );
-        // A new password before its keys came: the group is kept.
-        sb.lock(b"b2", None).unwrap();
-        l.sync("bob", "alice");
-        drop(l.open("alice"));
-        l.sync("alice", "bob");
-        let own = l.0.join("bob/own");
-        let mut sb = Store::open(&own, b"b2", None)
-            .unwrap()
-            .links_in(vec![l.lab("bob")]);
-        assert!(sb.unopened.is_empty(), "{:?}", sb.unopened);
-        assert_eq!(&sb.get("@lab/x").unwrap()[..], b"1\n");
-        // A member's retire notice and junk records stop nothing.
-        let g = l.g(&mut sb);
-        let k = key_id(&g.keys()[0]);
-        g.put(&format!("{RETIRED}{k}"), b"retired").unwrap();
-        g.put(".pasa/members/00", b"junk").unwrap();
-        l.sync("bob", "alice");
-        let sa = l.open("alice");
-        sa.put("@lab/x", b"2\n").unwrap();
-        assert_eq!(l.names("alice"), ["alice", "bob"]);
-        // Bob leaves: alice's next open makes a new key for alice alone.
-        let mut sb = Store::open(&own, b"b2", None)
-            .unwrap()
-            .links_in(vec![l.lab("bob")]);
-        sb.unlink("lab").unwrap();
-        assert!(!l.lab("bob").join("member").exists());
-        // Its folder still syncs, until its removal shows.
-        assert!(sb.reach().any(|d| d == l.lab("bob")));
-        let sb = Store::open(&own, b"b2", None)
-            .unwrap()
-            .links_in(vec![l.lab("bob")]);
-        assert!(
-            sb.reach().any(|d| d == l.lab("bob")),
-            "after a new unlock too"
-        );
-        l.sync("bob", "alice");
-        let mut sa = l.open("alice");
-        let n = l.g(&mut sa).keys().len();
-        assert_eq!(l.names("alice"), ["alice"]);
-        assert_eq!(n, 2, "a new key");
-        l.sync("alice", "bob");
-        let sb = Store::open(&own, b"b2", None)
-            .unwrap()
-            .links_in(vec![l.lab("bob")]);
-        assert!(!sb.reach().any(|d| d == l.lab("bob")), "let go");
-        assert!(!l.lab("bob").join(LEAVING).exists());
+        let mut s = Store::open(&d, b"pw", None).unwrap();
+        s.rotate().unwrap();
+        s.health().unwrap();
+        let s = Store::open(&d, b"pw", None).unwrap();
+        assert_eq!(&s.get("bank").unwrap()[..], b"1\n");
     }
 
     #[test]
