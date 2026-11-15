@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 use pasa::{Form, Store, home, sync};
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -405,7 +406,15 @@ struct App {
     pairing: Option<Pairing>,
     scanning: Option<Scanning>,
     synced: Arc<Mutex<Option<String>>>,
-    serving: bool,
+    /// A store to link: its folder and password.
+    link_dir: String,
+    link_pw: Zeroizing<String>,
+    /// Locked: egui's memory (text fields' undo history) goes next frame.
+    forget: bool,
+    /// When the clipboard crate's copy is cleared.
+    wipe: Option<SystemTime>,
+    /// Stores served from here: this one and its linked ones.
+    serving: std::collections::HashSet<PathBuf>,
     rt: Option<tokio::runtime::Runtime>,
 }
 
@@ -600,17 +609,21 @@ impl eframe::App for App {
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Q)) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
-            self.used = Some(SystemTime::now());
-        }
         let idle = Duration::from_secs(self.prefs.lock * 60);
-        // A clock set back counts as idle too.
+        // A clock set back counts as idle too. Before this frame's input,
+        // so a key pressed on waking does not undo the time asleep.
         let left = |t: SystemTime| t.elapsed().map_or(true, |e| e > idle);
         if self.v.is_some() && self.used.is_some_and(left) {
             self.lock();
         }
+        if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
+            self.used = Some(SystemTime::now());
+        }
+        if std::mem::take(&mut self.forget) {
+            ui.ctx().data_mut(|d| d.clear());
+        }
         ui.ctx().request_repaint_after(idle);
-        self.serve(&ui.ctx().clone());
+        self.serve(&ui.ctx().clone(), self.dirs());
         if let Some(job) = self.job.take() {
             let was = (self.v.is_some(), self.joined);
             self.said = self
@@ -618,9 +631,14 @@ impl eframe::App for App {
                 .err()
                 .map(|e| format!("{e:#}"))
                 .unwrap_or_default();
+            // Opened: what was typed to open it goes from egui's memory too
+            // (a text field keeps its undo history there, a password's too).
+            if !was.0 && self.v.is_some() {
+                ui.ctx().data_mut(|d| d.clear());
+            }
             // Joined or opened: sync. Joined, the store precedes its password.
             if was != (self.v.is_some(), self.joined) {
-                self.sync_now(ui.ctx(), false);
+                self.sync_now(ui.ctx(), false, self.dirs());
             }
             ui.ctx().request_repaint();
         }
@@ -633,16 +651,32 @@ impl eframe::App for App {
             None if self.joining => self.join(ui),
             None => self.create(ui),
         }
+        // The clipboard crate's copy (no wl-copy, xclip or pbcopy) is
+        // cleared after 45 s too, by this window, locked or not.
+        if self.wipe.is_some_and(|t| t.elapsed().is_ok()) {
+            self.wipe = None;
+            ui.ctx().copy_text(String::new());
+        }
         // Ctrl+C/X leave by crate::clip, cleared after 45 s; the clipboard
         // crate only without wl-copy, xclip or pbcopy. Selections never
         // reach PRIMARY, which nothing clears.
+        let mut fell = false;
         ui.ctx().output_mut(|o| {
             o.commands.retain(|c| match c {
-                egui::OutputCommand::CopyText(s) => crate::clip(s).is_err(),
+                egui::OutputCommand::CopyText(s) => {
+                    let kept = crate::clip(s).is_err();
+                    fell |= kept && !s.is_empty();
+                    kept
+                }
                 egui::OutputCommand::TextSelectionSettled(_) => false,
                 _ => true,
             })
         });
+        if fell {
+            let clear = Duration::from_secs(45);
+            self.wipe = Some(SystemTime::now() + clear);
+            ui.ctx().request_repaint_after(clear);
+        }
     }
 }
 
@@ -651,9 +685,11 @@ impl App {
         *self = App {
             prefs: self.prefs.clone(),
             synced: self.synced.clone(),
-            serving: self.serving,
+            serving: self.serving.clone(),
             peer: "home".into(),
             quick: true,
+            forget: true,
+            wipe: self.wipe,
             ..App::default()
         };
     }
@@ -1684,10 +1720,12 @@ impl App {
             return;
         }
         if self.health.is_none() {
-            self.health = v.s.health().ok();
+            // Once a showing: a damaged version is not read every frame.
+            self.health = Some(v.s.health().unwrap_or_default());
         }
         let h = self.health.clone().unwrap_or_default();
-        let (weak, reused, expired) = (h.weak, h.reused, h.expired);
+        let (weak, reused, expired, exposed) =
+            (h.weak, h.reused, h.expired, h.exposed);
         let part = |ui: &mut Ui, t: String| {
             ui.add_space(4.0);
             ui.label(RichText::new(t).small().color(l.muted));
@@ -1712,6 +1750,34 @@ impl App {
             part(ui, format!("EXPIRED: {}", expired.len()));
             for name in &expired {
                 ui.label(name);
+            }
+            part(ui, format!("READ BY A REVOKED DEVICE: {}", exposed.len()));
+            for name in &exposed {
+                ui.label(name);
+            }
+            // Written under a retired key, held by no rotation: an offline
+            // device's edits, or a revoked one's. Never taken unasked.
+            let left = v.s.excluded().unwrap_or_default();
+            part(ui, format!("LEFT OUT AT A NEW STORE KEY: {}", left.len()));
+            for e in &left {
+                ui.horizontal(|ui| {
+                    ui.label(&e.name);
+                    let at = humantime::format_rfc3339_seconds(
+                        UNIX_EPOCH + Duration::from_millis(e.ms),
+                    );
+                    ui.label(
+                        RichText::new(at.to_string()).small().color(l.muted),
+                    );
+                    let why = "An offline device's edit, or a revoked one's: \
+                               take it back only if you know it";
+                    if ui.small_button("Take back").on_hover_text(why).clicked()
+                    {
+                        v.note = match v.s.recover(&e.file) {
+                            Ok(n) => format!("{n}: taken back"),
+                            Err(e) => format!("{e:#}"),
+                        };
+                    }
+                });
             }
             if let Some(found) =
                 &*self.breached.lock().unwrap_or_else(|p| p.into_inner())
@@ -2042,13 +2108,17 @@ impl App {
             ctx,
             |ui| {
                 ui.set_width(420.0);
-                match self.win {
-                    Win::Generator => self.generate(ui, v),
-                    Win::History => self.history(ui, v),
-                    Win::Health => self.health(ui, v),
-                    Win::Devices => self.devices(ui, v),
-                    _ => self.settings(ui),
-                }
+                let tall = ui.ctx().content_rect().height() - 120.0;
+                ScrollArea::vertical().max_height(tall).show(
+                    ui,
+                    |ui| match self.win {
+                        Win::Generator => self.generate(ui, v),
+                        Win::History => self.history(ui, v),
+                        Win::Health => self.health(ui, v),
+                        Win::Devices => self.devices(ui, v),
+                        _ => self.settings(ui),
+                    },
+                );
                 ui.add_space(6.0);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     close = ui.button("Close").clicked();
@@ -2108,7 +2178,11 @@ impl App {
                 Err(e) => format!("{e:#}"),
             };
             if on {
-                self.sync_now(ui.ctx(), false);
+                self.sync_now(
+                    ui.ctx(),
+                    false,
+                    v.s.dirs().map(Into::into).collect(),
+                );
             }
         }
         let about = "Devices that hold this store sync with each other directly, \
@@ -2149,8 +2223,8 @@ impl App {
                             Ok(()) => format!(
                                 "{}: revoked. A new store key: pair the other \
                                  devices again, and forget {} on each. What it \
-                                 knew it still knows: change those passwords at \
-                                 their services",
+                                 knew it still knows: Health lists the passwords \
+                                 to change at their services",
                                 p.name, p.name
                             ),
                             Err(e) => format!("{e:#}"),
@@ -2163,8 +2237,9 @@ impl App {
         }
         if on && !peers.is_empty() && ui.button("Sync now").clicked() {
             v.note = "Syncing".into();
-            self.sync_now(ui.ctx(), true);
+            self.sync_now(ui.ctx(), true, v.s.dirs().map(Into::into).collect());
         }
+        self.groups(ui, v);
         ui.separator();
         ui.label(RichText::new("Add a device").strong());
         field(ui, "A name for it", &mut self.device, false);
@@ -2183,16 +2258,103 @@ impl App {
         }
     }
 
-    /// In a process of its own: the window opens no socket.
-    fn sync_now(&self, ctx: &Context, news: bool) {
-        if !sync::net(&home()).join("peers").exists() || !sync::on(&home()) {
-            return;
+    /// Linked stores: listed, unlinked, linked.
+    fn groups(&mut self, ui: &mut Ui, v: &mut View) {
+        let l = look(ui);
+        ui.separator();
+        ui.label(RichText::new("Group stores").strong());
+        let about = "A group's passwords, kept with others in a store of its \
+                     own, open with yours after its password once: \
+                     @NAME/..., each written to its own store.";
+        ui.label(RichText::new(about).small().color(l.muted));
+        let links: Vec<(String, PathBuf)> =
+            v.s.links().map(|(l, d)| (l.into(), d.into())).collect();
+        let mut gone = None;
+        let h = std::env::home_dir().unwrap_or_default();
+        for (label, dir) in &links {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("@{label}")).strong());
+                let at = dir
+                    .strip_prefix(&h)
+                    .map_or(dir.display().to_string(), |r| {
+                        format!("~/{}", r.display())
+                    });
+                ui.label(RichText::new(at).small().color(l.muted));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Unlink").clicked() {
+                        gone = Some(label.clone());
+                    }
+                });
+            });
         }
+        for u in &v.s.unopened {
+            ui.label(RichText::new(u).small().color(l.bad));
+        }
+        if let Some(g) = gone {
+            v.note = match v.s.unlink(&g) {
+                Ok(()) => format!("@{g}: unlinked"),
+                Err(e) => format!("{e:#}"),
+            };
+            v.load();
+        }
+        egui::CollapsingHeader::new("Link a store with a password").show(
+            ui,
+            |ui| {
+                field(ui, "Its folder", &mut self.link_dir, false);
+                let typed = field(ui, "Its password", &mut self.link_pw, true);
+                let ok = !self.link_dir.trim().is_empty()
+                    && !self.link_pw.is_empty();
+                let go = ui.add_enabled(ok, Button::new("Link")).clicked();
+                if go || (ok && entered(ui, &typed)) {
+                    v.note = match self.link(v) {
+                        Ok(g) => {
+                            format!("@{g}: opens with this store from now on")
+                        }
+                        Err(e) => format!("{e:#}"),
+                    };
+                    v.load();
+                }
+            },
+        );
+    }
+
+    fn link(&mut self, v: &mut View) -> Result<String> {
+        let d = pasa::path(&self.link_dir);
+        let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+        anyhow::ensure!(
+            pasa::challenge(&k).is_none(),
+            "it asks for its YubiKey too: pasa link {} in a terminal",
+            d.display()
+        );
+        let g = pasa::Store::open(&d, self.link_pw.as_bytes(), None)?;
+        pasa::remember(&d)?;
+        let label = v.s.link(g)?;
+        (self.link_dir, self.link_pw) = Default::default();
+        Ok(label)
+    }
+
+    /// This store's folder, and its linked stores' once open.
+    fn dirs(&self) -> Vec<PathBuf> {
+        let open =
+            self.v.as_ref().map(|v| v.s.dirs().map(Into::into).collect());
+        open.unwrap_or_else(|| vec![home()])
+    }
+
+    /// In a process of its own, a store each: the window opens no socket.
+    fn sync_now(&self, ctx: &Context, news: bool, dirs: Vec<PathBuf>) {
+        for dir in dirs {
+            if sync::net(&dir).join("peers").exists() && sync::on(&dir) {
+                self.sync_in(ctx, news, dir);
+            }
+        }
+    }
+
+    fn sync_in(&self, ctx: &Context, news: bool, dir: PathBuf) {
         let (out, ctx) = (self.synced.clone(), ctx.clone());
         std::thread::spawn(move || {
             let run = std::env::current_exe().and_then(|p| {
                 std::process::Command::new(p)
-                    .env("PASA_DIR", home())
+                    .env("PASA_DIR", &dir)
                     .arg("sync")
                     .args(news.then_some("--news"))
                     .stdin(std::process::Stdio::null())
@@ -2209,27 +2371,30 @@ impl App {
         });
     }
 
-    /// Started once: the serving process itself follows sync off and on.
-    fn serve(&mut self, ctx: &Context) {
-        let paired = sync::net(&home()).join("peers").exists();
-        if self.serving || !paired || !sync::on(&home()) {
-            return;
-        }
-        self.serving = true;
-        let (out, ctx) = (self.synced.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            // Another process may serve this store: then it does.
-            let Ok(mut c) = crate::net(&["serve"]) else { return };
-            for (who, r) in crate::results(&mut c) {
-                if let Ok(n @ 1..) = r {
-                    *out.lock().unwrap_or_else(|p| p.into_inner()) =
-                        Some(format!("{who}: {n} new"));
-                }
-                crate::report(&who, r);
-                ctx.request_repaint();
+    /// Started once a store: the serving process itself follows sync off
+    /// and on.
+    fn serve(&mut self, ctx: &Context, dirs: Vec<PathBuf>) {
+        for dir in dirs {
+            let paired = sync::net(&dir).join("peers").exists();
+            if self.serving.contains(&dir) || !paired || !sync::on(&dir) {
+                continue;
             }
-            let _ = c.wait();
-        });
+            self.serving.insert(dir.clone());
+            let (out, ctx) = (self.synced.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                // Another process may serve this store: then it does.
+                let Ok(mut c) = crate::net_in(&dir, &["serve"]) else { return };
+                for (who, r) in crate::results(&mut c) {
+                    if let Ok(n @ 1..) = r {
+                        *out.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(format!("{who}: {n} new"));
+                    }
+                    crate::report_in(&dir, &who, r);
+                    ctx.request_repaint();
+                }
+                let _ = c.wait();
+            });
+        }
     }
 
     /// Some(true): the QR code; Some(false): the code to type.
@@ -2263,7 +2428,7 @@ impl App {
             repaint.request_repaint();
         });
         p.state = "Waiting for it".into();
-        self.serve(ctx);
+        self.serve(ctx, vec![home()]);
         Ok(())
     }
 
@@ -2315,7 +2480,7 @@ impl App {
             let p = self.pairing.as_mut().context("no pairing")?;
             (p.img, p.code) = (Some(qr_image(&ctx, &qr)?), qr);
             p.state = "Waiting for it to sync".into();
-            self.serve(&ctx);
+            self.serve(&ctx, vec![home()]);
         }
         Ok(())
     }
@@ -2444,5 +2609,43 @@ impl App {
             home().display()
         );
         ui.label(RichText::new(about).small().color(l.muted));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use eframe::egui::{Context, Event, RawInput, TextEdit};
+
+    /// One frame of a password field, with `events`; its text after.
+    fn frame(ctx: &Context, text: &mut String, events: Vec<Event>) {
+        // A second a frame: egui keeps an undo point once text is still.
+        let time = Some(ctx.input(|i| i.time) + 1.0);
+        let input =
+            RawInput { events, focused: true, time, ..Default::default() };
+        let mut out = ctx.run_ui(input, |ui| {
+            let r =
+                ui.add(TextEdit::singleline(text).password(true).id_salt("pw"));
+            r.request_focus();
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_lock_leaves_no_text_field_state_behind() {
+        use eframe::egui::text_edit::TextEditState;
+        let ctx = Context::default();
+        let mut pw = String::new();
+        frame(&ctx, &mut pw, vec![]);
+        frame(&ctx, &mut pw, vec![Event::Text("hunter2".into())]);
+        frame(&ctx, &mut pw, vec![]);
+        assert_eq!(pw, "hunter2");
+        // A text field's state (its undo history, a password's too).
+        assert!(ctx.data_mut(|d| d.count::<TextEditState>()) > 0);
+        // What lock, and an unlock, do.
+        ctx.data_mut(|d| d.clear());
+        assert_eq!(ctx.data_mut(|d| d.count::<TextEditState>()), 0);
+        pw.clear();
+        frame(&ctx, &mut pw, vec![]);
+        assert_eq!(pw, "");
     }
 }

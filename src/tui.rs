@@ -27,7 +27,7 @@ fn screen(on: bool) -> Result<()> {
 
 pub fn run(s: pasa::Store) -> Result<()> {
     screen(true)?;
-    crate::aside(false);
+    s.dirs().for_each(|d| crate::aside_in(d, false));
     let mut v = View::new(s);
     v.note = checkin();
     let r = browse(v);

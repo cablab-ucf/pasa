@@ -102,7 +102,7 @@ data class Form(
 
 data class Health(
     val weak: List<Pair<String, Int>> = listOf(), val reused: List<List<String>> = listOf(),
-    val expired: List<String> = listOf(),
+    val expired: List<String> = listOf(), val exposed: List<String> = listOf(),
 )
 
 /** Quick: a tap (and PIN) opens the store beside the password; Both: a second factor with it. */
@@ -150,6 +150,9 @@ interface Host {
     /** null: off; else whether a PIN goes with the tap. */
     val quick: Boolean?
     val nfcOff: Boolean
+    /** Whether the app may install its own updates (Android asks once). */
+    val mayInstall: Boolean
+    fun allowInstalls()
     val fidoKeys: Int
     val fidoPin: Boolean
     suspend fun fidoAdd(pin: String)
@@ -1088,7 +1091,7 @@ private fun Health(host: Host, nav: Nav) {
             }
             return@Page
         }
-        val (weak, reused, expired) = found ?: Health()
+        val (weak, reused, expired, exposed) = found ?: Health()
         Label("WEAK: ${weak.size}")
         for ((n, bits) in weak) Row(Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, verticalAlignment = Alignment.CenterVertically) {
             Text(n, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
@@ -1100,6 +1103,9 @@ private fun Health(host: Host, nav: Nav) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("EXPIRED: ${expired.size}")
         for (n in expired) Text(n, Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, style = MaterialTheme.typography.bodyLarge)
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Label("READ BY A REVOKED DEVICE: ${exposed.size}")
+        for (n in exposed) Text(n, Modifier.fillMaxWidth().clickable { nav.screen = Screen.Entry(n) }, style = MaterialTheme.typography.bodyLarge)
         breached?.let { hits ->
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
             Label("IN KNOWN BREACHES: ${hits.size}")
@@ -1202,7 +1208,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                 }
             }
             TextButton({ go { host.forget(p); "$p: forgotten" } }) { Text("Forget") }
-            TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again. What it knew it still knows: change those passwords at their services." } }) { Text("Revoke") }
+            TextButton({ go { host.revoke(p); "$p: revoked. A new store key: pair the other devices again. What it knew it still knows: Health lists the passwords to change at their services." } }) { Text("Revoke") }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Label("ADD A DEVICE")
@@ -1259,6 +1265,11 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     pick("clip", "Clipboard", "Copied secrets are marked sensitive and leave the clipboard after this long.", listOf(15 to "15 s", 30 to "30 s", 45 to "45 s", 90 to "90 s"))
     pick("lock", "Locking", "The store locks when the app has been off the screen this long.", listOf(0 to "At once", 60 to "1 min", 300 to "5 min"))
     pick("theme", "Looks", "Dark or light.", listOf(0 to "As the phone", 1 to "Dark", 2 to "Light"))
+    pick("updates", "Updates", "Daily, the newest release is asked of GitHub (your address and the time, nothing of the store), checked, and installed when the app is off the screen. Android installs it only if signed as this app is.", listOf(1 to "On", 0 to "Off"))
+    if (host.setting("updates") != 0 && !host.mayInstall) {
+        Text("Android asks once before an app installs its own updates.", style = MaterialTheme.typography.bodySmall, color = muted)
+        OutlinedButton({ host.allowInstalls() }) { Text("Allow updates to install") }
+    }
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
     var keyPin by remember { mutableStateOf("") }
     val keys = rememberJob()

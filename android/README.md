@@ -6,6 +6,11 @@ same Rust (`apasa-jni`).
 
 - Several stores side by side, one per person or purpose: Store, on the
   lock screen.
+- Updates: daily, the newest release's APK is fetched from GitHub,
+  checked against its `.sha256`, and installed by the package installer
+  when the app is off the screen (Android 12 on; before, asked at the next
+  open). Android takes it only signed by this app's key. Settings, Updates:
+  off stops the asking.
 - Unlock by password (and a YubiKey's slot 2 held to the phone or
   plugged in), or by quick unlock: a tap of the key and a PIN. Locks when
   the app leaves the screen.

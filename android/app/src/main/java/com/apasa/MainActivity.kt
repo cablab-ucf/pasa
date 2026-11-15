@@ -24,7 +24,11 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.SecureRandom
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import org.pairir.ScanQr
 
@@ -67,6 +71,32 @@ class MainActivity : ComponentActivity(), Host {
     override fun onResume() {
         super.onResume()
         nfcIsOff = nfcOff(this)
+        updates()
+    }
+
+    /** An update downloaded and checked, waiting to install. */
+    private val ready get() = File(cacheDir, "update").listFiles { f -> f.name.endsWith(".apk") }?.firstOrNull()
+    override val mayInstall get() = packageManager.canRequestPackageInstalls()
+    override fun allowInstalls() {
+        runCatching { startActivity(Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))) }
+    }
+
+    /** Daily, the newest release fetched and checked. Installed when the
+     *  app leaves the screen (Android 12 on, no prompt), or asked for here. */
+    private fun updates() {
+        if (setting("updates") == 0) return
+        ready?.let { if (android.os.Build.VERSION.SDK_INT < 31 && mayInstall) Update.install(this, it); return }
+        val prefs = getSharedPreferences("pasa", 0)
+        val day = 24 * 3600 * 1000L
+        if (System.currentTimeMillis() - prefs.getLong("checked", 0) < day) return
+        prefs.edit().putLong("checked", System.currentTimeMillis()).apply()
+        val ours = version
+        Thread {
+            runCatching {
+                val v = Update.latest() ?: return@runCatching
+                if (Update.newer(ours, v)) Update.fetch(File(cacheDir, "update"), v)
+            }
+        }.start()
     }
 
     override fun nfcSettings() {
@@ -75,6 +105,8 @@ class MainActivity : ComponentActivity(), Host {
 
     override fun onStop() {
         super.onStop()
+        // Off the screen: an update replaces the app now, mid-use never.
+        if (setting("updates") != 0 && android.os.Build.VERSION.SDK_INT >= 31 && mayInstall) ready?.let { Update.install(this, it) }
         here(false)
         keySecret?.fill(0)
         keySecret = null
@@ -114,7 +146,7 @@ class MainActivity : ComponentActivity(), Host {
     private val locker = Runnable { lock() }
 
     private val settings = mutableStateMapOf<String, Int>()
-    private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0)
+    private val usual = mapOf("clip" to 45, "lock" to 0, "theme" to 0, "updates" to 1)
     override fun setting(name: String) = settings.getOrPut(name) { getSharedPreferences("pasa", 0).getInt(name, usual[name] ?: 0) }
     override fun set(name: String, value: Int) {
         settings[name] = value
@@ -153,10 +185,25 @@ class MainActivity : ComponentActivity(), Host {
     private fun readQuick() { quickNow = Native.quick(dir)?.let { it[32].toInt() == 1 }; readFido() }
     private fun fresh() = ByteArray(32).also { SecureRandom().nextBytes(it) }
 
+    /** Bumped by each lock: an unlock begun before it keeps nothing open. */
+    private var era = 0
+
+    /** [f]'s open store: never dropped on a cancel, and closed at once if
+     *  the app locked (or the attempt was cancelled) while it opened. */
+    private suspend fun opening(f: () -> Long): Long {
+        val at = era
+        val h = withContext(NonCancellable + Dispatchers.IO) { f() }
+        if (at != era || !currentCoroutineContext().isActive) {
+            Native.close(h)
+            throw CancellationException("locked while it opened")
+        }
+        return h
+    }
+
     override suspend fun create(pw: String, key: Key, pin: String) {
         val c = if (key == Key.Both) fresh() else null
         val r = c?.let { yubikey(this, it, enroll = true) }
-        val h = io { Native.open(dir, pw.toByteArray(), c, r, true) }
+        val h = opening { Native.open(dir, pw.toByteArray(), c, r, true) }
         if (key == Key.Quick) runCatching { quickOn(h, pin) }.onFailure { Native.close(h); File(dir, "key").delete(); throw it }
         handle = h
         stored = true
@@ -197,7 +244,7 @@ class MainActivity : ComponentActivity(), Host {
                 (quick!![32].toInt() != 1).also { if (it) unlockQuick("") }
             }
             is Tapped.Ctap -> {
-                handle = io { Native.openFido(dir, t.cred, t.secret) }
+                handle = opening { Native.openFido(dir, t.cred, t.secret) }
                 t.secret.fill(0)
                 if (sync) io { runCatching { Native.sync(dir, false) } }
                 true
@@ -208,7 +255,7 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun unlockQuick(pin: String) {
         val r = answer ?: yubikey(this, Native.quick(dir)!!.copyOf(32))
         // A wrong PIN throws here, keeping the answer for the next try.
-        handle = io { Native.openQuick(dir, pin.toByteArray(), r) }
+        handle = opening { Native.openQuick(dir, pin.toByteArray(), r) }
         r.fill(0)
         answer = null
         if (sync) io { runCatching { Native.sync(dir, false) } }
@@ -238,7 +285,7 @@ class MainActivity : ComponentActivity(), Host {
 
     override suspend fun unlock(pw: String) {
         val r = Native.challenge(dir)?.let { yubikey(this, it) }
-        handle = io { Native.open(dir, pw.toByteArray(), null, r, false) }
+        handle = opening { Native.open(dir, pw.toByteArray(), null, r, false) }
         if (sync) io { runCatching { Native.sync(dir, false) } }
     }
 
@@ -254,6 +301,7 @@ class MainActivity : ComponentActivity(), Host {
     }
 
     override fun lock() {
+        era++
         if (handle != 0L) Native.close(handle)
         handle = 0
         nav.screen = Screen.List
@@ -290,6 +338,7 @@ class MainActivity : ComponentActivity(), Host {
             rows.filter { it[0] == "weak" }.map { it[1] to it[2].toInt() },
             rows.filter { it[0] == "reused" }.map { it.drop(1) },
             rows.filter { it[0] == "expired" }.map { it[1] },
+            rows.filter { it[0] == "exposed" }.map { it[1] },
         )
     }
 
@@ -364,4 +413,5 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
     override suspend fun revoke(name: String) = changed { Native.revoke(handle, name) }
     override suspend fun pair(name: String, qrPw: String?) = io { Native.pair(handle, name, qrPw) }
+
 }

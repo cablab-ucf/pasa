@@ -51,11 +51,17 @@ pasa gen NAME [N] -w [-d] [-s CHARS] [-l]
                              CHARS between them, -l: some letters as 1337)
 pasa attach NAME FILE        keep a file with an entry
 pasa files NAME [FILE]       those files, or one, to stdout
-pasa health [--pwned]        weak, reused and expired passwords; --pwned: breached ones,
+pasa health [--pwned]        weak, reused, expired, and exposed: read by a revoked device;
+                             --pwned: breached ones,
                              from the list $PASA_PWNED names, else asking
                              haveibeenpwned.com by 5 hex digits of each SHA-1
 pasa stats                   the store in numbers
 pasa rm NAME | mv OLD NEW
+pasa recover [FILE]          versions written under a retired key that its rotation did
+                             not hold (an offline device's, or a revoked one's); one taken
+                             back
+pasa link DIR | unlink LABEL the store in DIR (a group's) opens with this one after its
+                             password once: its entries show as @LABEL/NAME
 pasa log NAME                every version
 pasa load < x.tar | dump     tar in or out: path = name
 pasa init [-y] | passwd [-y|-n]   -y: and a YubiKey (per device)
@@ -425,6 +431,13 @@ fn open() -> Result<Store> {
     if s.retired() {
         eprintln!("{}", pasa::RETIRED_SAY);
     }
+    s.unopened.iter().for_each(|u| eprintln!("{u}"));
+    if let Ok(n @ 1..) = s.excluded().map(|e| e.len()) {
+        eprintln!(
+            "{n} version(s) written under a retired key are left out (an \
+             offline device's, or a revoked one's): pasa recover"
+        );
+    }
     Ok(s)
 }
 
@@ -549,8 +562,11 @@ fn edit(old: &[u8]) -> Result<Secret> {
 fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
     let ram = [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
     let ram = ram.into_iter().flatten().map(std::path::PathBuf::from);
-    let base =
-        ram.into_iter().find(|d| d.is_dir()).unwrap_or_else(std::env::temp_dir);
+    // Never the disk: an entry there outlives a kill, and backups take it.
+    let base = ram.into_iter().find(|d| d.is_dir()).context(
+        "no folder in memory here (XDG_RUNTIME_DIR, /dev/shm): an editor would \
+         leave the entry on disk; pasa set (from stdin) or the window instead",
+    )?;
     let d = base.join(format!("pasa-{}", HEXLOWER.encode(&rand::<8>())));
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -668,6 +684,7 @@ fn record_in(dir: &Path) {
 }
 
 fn main() -> Result<()> {
+    pasa::harden();
     let mut a: Vec<String> = std::env::args().skip(1).collect();
     if a.first().is_some_and(|f| f == "--dir") {
         ensure!(a.len() > 1, "{USAGE}");
@@ -815,6 +832,30 @@ fn main() -> Result<()> {
             s.remove(n)?
         }
         ["mv", from, to] => open()?.rename(from, to)?,
+        ["link", d] => {
+            let (mut s, d) = (open()?, pasa::path(d));
+            let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+            let pw = ask(&format!("{}'s password: ", d.display()))?;
+            let yk = challenge(&k).map(yubikey).transpose()?;
+            let g = Store::open(&d, &pw, yk.as_deref().map(|v| &v[..]))?;
+            pasa::remember(&d)?;
+            let l = s.link(g)?;
+            eprintln!("{}: opens with this store, as @{l}/NAME", d.display());
+        }
+        ["unlink", l] => open()?.unlink(l)?,
+        ["recover"] => {
+            for v in open()?.excluded()? {
+                let at = humantime::format_rfc3339_seconds(
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_millis(v.ms),
+                );
+                println!("{}  {at}  {}", v.file, v.name);
+            }
+        }
+        ["recover", f] => {
+            let n = open()?.recover(f)?;
+            eprintln!("{n}: taken back, its newest version now");
+        }
         ["health", ..] => {
             let s = open()?;
             let h = s.health()?;
@@ -823,6 +864,7 @@ fn main() -> Result<()> {
                 .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
             h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
             h.expired.iter().for_each(|n| println!("expired {n}"));
+            h.exposed.iter().for_each(|n| println!("exposed {n}"));
             // Passwords alone: not what is attached, nor an empty one.
             let asked = |n: &String| {
                 flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
@@ -957,24 +999,29 @@ fn reopen(dir: &Path, cmd: &str) -> Result<Command> {
 /// `pasa sync` beside a view, unseen: what it brings shows as `v/` changes.
 #[cfg(any(feature = "tui", feature = "gui"))]
 fn aside(news: bool) {
+    aside_in(&home(), news)
+}
+
+/// [`aside`] for the store in `dir`.
+#[cfg(any(feature = "tui", feature = "gui"))]
+fn aside_in(dir: &Path, news: bool) {
     #[cfg(feature = "sync")]
-    if pasa::sync::net(&home()).join("peers").exists()
-        && pasa::sync::on(&home())
-    {
+    if pasa::sync::net(dir).join("peers").exists() && pasa::sync::on(dir) {
         let c = std::env::current_exe().map(Command::new);
         let _ = c.map(|mut c| {
             c.arg("sync").args(news.then_some("--news")).stdin(Stdio::null());
-            c.env("PASA_DIR", home());
+            c.env("PASA_DIR", dir);
             c.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
         });
     }
-    let _ = news;
+    let _ = (dir, news);
 }
 
+/// What a sync brought `dir`: committed, and said.
 #[cfg(feature = "sync")]
-fn report(who: &str, r: Result<usize>) {
+fn report_in(dir: &Path, who: &str, r: Result<usize>) {
     if matches!(r, Ok(1..)) {
-        record();
+        record_in(dir);
     }
     match r {
         Ok(n) => eprintln!("{who}: {n} new"),
@@ -985,7 +1032,13 @@ fn report(who: &str, r: Result<usize>) {
 /// The confined network side ([`net_side`]); it exits when its stdin closes.
 #[cfg(feature = "sync")]
 fn net(args: &[&str]) -> Result<std::process::Child> {
-    let dir = home();
+    net_in(&home(), args)
+}
+
+/// [`net`] for the store in `dir`.
+#[cfg(feature = "sync")]
+fn net_in(dir: &Path, args: &[&str]) -> Result<std::process::Child> {
+    let dir = dir.to_path_buf();
     // Migrate layouts here: the confined child cannot.
     pasa::sync::net(&dir);
     pasa::versions(&dir);
@@ -1019,19 +1072,24 @@ fn results(
 
 #[cfg(feature = "sync")]
 fn net_run(args: &[&str]) -> Result<()> {
-    let mut c = net(args)?;
-    results(&mut c).for_each(|(w, r)| report(&w, r));
+    net_run_in(&home(), args)
+}
+
+#[cfg(feature = "sync")]
+fn net_run_in(dir: &Path, args: &[&str]) -> Result<()> {
+    let mut c = net_in(dir, args)?;
+    results(&mut c).for_each(|(w, r)| report_in(dir, &w, r));
     ensure!(c.wait()?.success(), "the network side failed");
     Ok(())
 }
 
 #[cfg(feature = "sync")]
-fn serve_until(name: &str) -> Result<()> {
+fn serve_until_in(dir: &Path, name: &str) -> Result<()> {
     eprintln!("waiting for {name} to sync (Ctrl-C: later, by pasa serve)");
-    let mut c = net(&["serve"])?;
+    let mut c = net_in(dir, &["serve"])?;
     for (w, r) in results(&mut c) {
         let done = w == name && r.is_ok();
-        report(&w, r);
+        report_in(dir, &w, r);
         if done {
             return Ok(());
         }
@@ -1043,8 +1101,21 @@ fn serve_until(name: &str) -> Result<()> {
 #[cfg(feature = "sync")]
 fn net_side(a: &[&str]) -> Result<()> {
     let dir = home();
-    if !pasa::confine::confine(&dir)? {
-        eprintln!("pasa: the network side is not confined: no Landlock here");
+    // `listen` reaches pushir's daemon; nothing else reaches a unix socket.
+    let sock = pushir::local::sock();
+    // Its socket alone, not the folder (XDG_RUNTIME_DIR holds D-Bus too).
+    let unix = (a == ["listen"] && sock.exists()).then_some(sock.as_path());
+    // Never at sync's cost: what cannot be had is said, and sync goes on.
+    use pasa::confine::Confined;
+    match pasa::confine::confine(&dir, unix) {
+        Ok(Confined::Fully) => {}
+        Ok(Confined::Partly(why)) => {
+            eprintln!("pasa: the network side is partly confined: {why}")
+        }
+        Ok(Confined::No) => eprintln!(
+            "pasa: the network side is not confined: no Landlock here"
+        ),
+        Err(e) => eprintln!("pasa: the network side is not confined: {e:#}"),
     }
     let mut got = String::new();
     if a == ["give"] {
@@ -1169,7 +1240,7 @@ async fn sync(a: &[&str]) -> Result<()> {
                     }
                 }
             }
-            serve_until(name)?;
+            serve_until_in(&dir, name)?;
         }
         ["join", name, code] => {
             let scanned = match *code {
@@ -1223,16 +1294,18 @@ async fn sync(a: &[&str]) -> Result<()> {
         }
         ["forget", name] => sync::forget(&dir, name)?,
         ["revoke", name] => {
-            sync::revoke(&mut open()?, name)?;
+            let mut s = open()?;
+            sync::revoke(&mut s, name)?;
             if sync::on(&dir) {
                 net_run(&["sync", "--news"])?;
             }
             eprintln!(
                 "A new store key: pair the other devices again (pasa pair \
                  NAME here, join there), and forget {name} on each. What \
-                 {name} knew it still knows: change those passwords at \
-                 their services"
+                 {name} knew it still knows: change these passwords at \
+                 their services (pasa health lists those left):"
             );
+            s.health()?.exposed.iter().for_each(|n| println!("{n}"));
         }
         _ => bail!("{USAGE}"),
     }
@@ -1257,8 +1330,19 @@ mod tests {
         fs::write(&ed, script).unwrap();
         let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
         fs::set_permissions(&ed, mode).unwrap();
-        let new = super::edit_with(ed.to_str().unwrap(), b"old\n").unwrap();
-        assert_eq!(&new[..], b"new\n");
+        // No folder in memory (macOS): refused, never written to disk.
+        let ram =
+            [std::env::var_os("XDG_RUNTIME_DIR"), Some("/dev/shm".into())];
+        let ram = ram
+            .into_iter()
+            .flatten()
+            .any(|d| std::path::Path::new(&d).is_dir());
+        let new = super::edit_with(ed.to_str().unwrap(), b"old\n");
+        if !ram {
+            assert!(new.is_err() && !d.join("ed.sh.at").exists());
+            return fs::remove_dir_all(&d).unwrap();
+        }
+        assert_eq!(&new.unwrap()[..], b"new\n");
         let at = fs::read_to_string(d.join("ed.sh.at")).unwrap();
         assert!(!std::path::Path::new(at.trim()).exists(), "left behind");
         fs::remove_dir_all(&d).unwrap();

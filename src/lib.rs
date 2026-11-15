@@ -22,6 +22,21 @@ use zeroize::Zeroizing;
 
 #[cfg(feature = "sync")]
 pub mod confine;
+
+/// No core dump, and no same-user process reads this one's memory.
+pub fn harden() {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Resource, Rlimit, setrlimit};
+        let none = Rlimit { current: Some(0), maximum: Some(0) };
+        let _ = setrlimit(Resource::Core, none);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let _ = rustix::process::set_dumpable_behavior(
+            rustix::process::DumpableBehavior::NotDumpable,
+        );
+    }
+}
+
 #[cfg(feature = "sync")]
 pub mod sync;
 
@@ -188,7 +203,9 @@ pub fn write(p: &Path, b: &[u8]) -> Result<()> {
     f.write_all(b)?;
     f.sync_all()?;
     fs::rename(tmp, p)?;
-    let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+    // The rename is durable once its folder is (where a folder opens).
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -227,6 +244,14 @@ fn kek(pw: &[u8], salt: &[u8], yk: Option<&[u8]>) -> Result<Secret> {
 }
 
 /// Bounds what a file's size reveals.
+/// Whether a version named `name` of `len` bytes is one [`Store::keep`]
+/// writes: its name, and its size sealed (line, padding, age's overhead).
+fn fits(name: &str, len: usize) -> bool {
+    let pt = padded(len + name.len() + 80);
+    let ok = !name.is_empty() && !name.contains(['\n', '\r']);
+    ok && name.len() <= 255 && pt + pt.div_ceil(64 << 10) * 16 + 1024 <= MAX
+}
+
 fn padded(n: usize) -> usize {
     match n.max(256).next_power_of_two() {
         p if p <= 64 << 10 => p,
@@ -275,6 +300,15 @@ struct Index {
     mtime: Option<SystemTime>,
     tips: HashMap<String, (u64, String)>,
     last: u64,
+    /// Files no key here opens: read once (names are hashes of what they
+    /// hold, and the index starts again whenever the keys change).
+    bad: HashSet<String>,
+}
+
+/// A day from now, in ms.
+fn ahead() -> u64 {
+    let now = std::time::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis());
+    now as u64 + 86_400_000
 }
 
 fn sorted<'a>(vs: impl Iterator<Item = &'a Version>) -> Vec<Version> {
@@ -288,7 +322,12 @@ impl Index {
         self.old.values().filter(|(_, d)| self.frozen.contains(d))
     }
 
+    /// A version dated over a day ahead is never the newest: one far-off
+    /// date (a member's, or an import's) would outdate every edit after.
     fn tip(&mut self, v: &Version) {
+        if v.ms > ahead() {
+            return;
+        }
         let t = (v.ms, v.file.clone());
         match self.tips.get_mut(&v.name) {
             Some(old) if *old >= t => {}
@@ -312,6 +351,19 @@ pub struct Store {
     loaded: Mutex<Vec<u8>>,
     index: Mutex<Index>,
     pub unreadable: AtomicUsize,
+    /// Stores opened with this one ([`Store::link`]), by label: their
+    /// entries show as `@LABEL/NAME`.
+    linked: Vec<(String, Store)>,
+    /// Linked stores that did not open, and why.
+    pub unopened: Vec<String>,
+    /// Their folders: links a password change must seal anew though not
+    /// open.
+    waiting: Vec<PathBuf>,
+    /// How many of `keys` are current: 2 or more while rotations made at
+    /// once are not yet merged by the next.
+    current: usize,
+    /// The key a rotation writes under before the key file holds it.
+    staged: Option<Secret>,
 }
 
 impl Store {
@@ -332,6 +384,11 @@ impl Store {
             loaded: Mutex::new(fs::read(dir.join("key")).unwrap_or_default()),
             index: Default::default(),
             unreadable: 0.into(),
+            linked: vec![],
+            unopened: vec![],
+            waiting: vec![],
+            current: 1,
+            staged: None,
         })
     }
 
@@ -352,6 +409,7 @@ impl Store {
         let salt = f.get(..32).context("not a pasa key file")?;
         Store::unsealed(dir, kek(pw, salt, yk)?)
             .context("wrong password or key")
+            .map(Store::with_links)
     }
 
     pub fn open_quick(dir: &Path, pin: &[u8], yk: &[u8]) -> Result<Store> {
@@ -362,6 +420,7 @@ impl Store {
         let kek = open(&k, sealed).context("wrong PIN or key")?;
         Store::unsealed(dir, kek)
             .context("quick unlock is out of date: use the password")
+            .map(Store::with_links)
     }
 
     /// `quick`: `challenge`, PIN flag, the KEK sealed to Argon2id(`pin`, `yk`).
@@ -414,6 +473,7 @@ impl Store {
             .context("the key's answer does not open it")?;
         Store::unsealed(dir, kek)
             .context("the security key is out of date: use the password")
+            .map(Store::with_links)
     }
 
     fn unsealed(dir: &Path, kek: Secret) -> Result<Store> {
@@ -436,6 +496,18 @@ impl Store {
         pw: &[u8],
         yk: Option<(&[u8], &[u8])>,
     ) -> Result<()> {
+        // Every link to this store, open now or not (a group joined and
+        // not open): opened under the old KEK, sealed to the new.
+        let mut links = vec![];
+        let dirs = self.dirs().map(Into::into).chain(self.waiting.clone());
+        for d in stores().into_iter().chain(dirs) {
+            let Ok(b) = fs::read(d.join("link")) else { continue };
+            if b.get(..16) != Some(&self.owner()[..]) {
+                continue;
+            }
+            let pt = open(&self.kek, &b[16..]).context("a damaged link")?;
+            links.push((d.join("link"), pt));
+        }
         let salt = yk.map_or(rand::<32>().to_vec(), |c| c.0.to_vec());
         self.salt = [&salt[..], &[yk.is_some() as u8]].concat();
         self.kek = kek(pw, &salt, yk.map(|c| c.1))?;
@@ -443,7 +515,169 @@ impl Store {
         // quick and ctap hold the old KEK.
         let _ = fs::remove_file(self.dir.join("quick"));
         let _ = fs::remove_file(self.dir.join("ctap"));
+        links.sort_by(|a, b| a.0.cmp(&b.0));
+        links.dedup_by(|a, b| a.0 == b.0);
+        for (at, pt) in links {
+            write(&at, &[&self.owner()[..], &seal(&self.kek, &pt)?].concat())?;
+        }
         Ok(())
+    }
+
+    /// `other` opens with this store from now on, its entries shown as
+    /// `@LABEL/NAME`: its label.
+    pub fn link(&mut self, other: Store) -> Result<String> {
+        ensure!(other.dir != self.dir, "a store links others, not itself");
+        ensure!(self.dirs().all(|d| d != other.dir), "linked already");
+        self.seal_link(&other)?;
+        let label = self.label(&other.dir);
+        self.unopened.retain(|u| !u.starts_with(&format!("@{label}:")));
+        self.linked.push((label.clone(), other));
+        Ok(label)
+    }
+
+    /// Opens with this store no more; it opens on its own again, with its
+    /// password.
+    pub fn unlink(&mut self, label: &str) -> Result<()> {
+        let i = self.linked.iter().position(|l| l.0 == label);
+        let i = i.context("no such linked store")?;
+        let (_, s) = self.linked.remove(i);
+        Ok(fs::remove_file(s.dir.join("link"))?)
+    }
+
+    /// The linked store labelled so.
+    pub fn group(&mut self, label: &str) -> Result<&mut Store> {
+        let l = label.trim_start_matches('@');
+        let g = self.linked.iter_mut().find(|g| g.0 == l);
+        Ok(&mut g.with_context(|| format!("@{l}: no such linked store"))?.1)
+    }
+
+    /// The label `dir` has, or would have, among the linked stores.
+    pub fn label_of(&self, dir: &Path) -> String {
+        let l = self.linked.iter().find(|g| g.1.dir == dir);
+        l.map_or_else(|| self.label(dir), |g| g.0.clone())
+    }
+
+    /// Linked stores: label and folder.
+    pub fn links(&self) -> impl Iterator<Item = (&str, &Path)> {
+        self.linked.iter().map(|(l, s)| (l.as_str(), s.dir.as_path()))
+    }
+
+    /// `other`'s KEK, sealed to this one's, in `other/link`: never in `v/`,
+    /// so never synced, and pairing hands none.
+    fn seal_link(&self, other: &Store) -> Result<()> {
+        let sealed = seal(&self.kek, &other.kek)?;
+        write(&other.dir.join("link"), &[&self.owner()[..], &sealed].concat())
+    }
+
+    /// The folder's name, without `/` or `@`, made unique.
+    fn label(&self, dir: &Path) -> String {
+        let base = dir.file_name().map(|n| n.to_string_lossy().into_owned());
+        let base = base.unwrap_or_default().replace(['/', '@'], "");
+        let mut label = base.clone();
+        for i in 2.. {
+            if !self.linked.iter().any(|l| l.0 == label) {
+                break;
+            }
+            label = format!("{base}{i}");
+        }
+        label
+    }
+
+    /// What a link names its store by: the key file's salt, hashed.
+    fn owner(&self) -> [u8; 16] {
+        Sha256::digest(&self.salt).as_slice()[..16]
+            .try_into()
+            .unwrap_or_default()
+    }
+
+    /// Opens every store in [`stores`] linked to this one. One that no
+    /// longer opens (its password changed) is left out, and said.
+    fn with_links(mut self) -> Store {
+        // A rotation cut short after its commit: finished here.
+        let _ = self.finish();
+        self.links_in(stores())
+    }
+
+    pub(crate) fn links_in(mut self, dirs: Vec<PathBuf>) -> Store {
+        self.add_links(dirs);
+        self
+    }
+
+    /// Opens the stores in `dirs` linked to this one and not open yet.
+    pub fn add_links(&mut self, dirs: Vec<PathBuf>) {
+        for dir in dirs {
+            if self.dirs().any(|d| d == dir) {
+                continue;
+            }
+            let was = format!("@{}:", self.label(&dir));
+            self.unopened.retain(|u| !u.starts_with(&was));
+            let Ok(file) = fs::read(dir.join("link")) else { continue };
+            if file.get(..16) != Some(&self.owner()[..]) {
+                continue;
+            }
+            let label = self.label(&dir);
+            let opened = open(&self.kek, &file[16..])
+                .context("a damaged link")
+                .and_then(|kek| Store::unsealed(&dir, kek))
+                .context("its password changed there: link it again");
+            match opened {
+                Ok(mut s) => {
+                    let said =
+                        s.unopened.drain(..).map(|m| format!("@{label}: {m}"));
+                    self.unopened.extend(said.collect::<Vec<_>>());
+                    self.waiting.retain(|d| *d != dir);
+                    self.linked.push((label, s));
+                }
+                Err(e) => {
+                    self.unopened.push(format!("@{label}: {e:#}"));
+                    if !self.waiting.contains(&dir) {
+                        self.waiting.push(dir);
+                    }
+                }
+            }
+        }
+    }
+
+    /// This store's folder and its linked stores'.
+    pub fn dirs(&self) -> impl Iterator<Item = &Path> {
+        let linked = self.linked.iter().map(|(_, s)| s.dir.as_path());
+        std::iter::once(self.dir.as_path()).chain(linked)
+    }
+
+    /// `@LABEL/` names a linked store: never one of this store's own, so a
+    /// group's secret never lands here when its store did not open.
+    fn not_linked(&self, name: &str) -> Result<()> {
+        let label =
+            name.strip_prefix('@').map(|r| r.split('/').next().unwrap_or(r));
+        let say = |l| {
+            format!("@{l}: not open here (pasa link, or its note at unlock)")
+        };
+        label.map_or(Ok(()), |l| Err(anyhow::anyhow!(say(l))))
+    }
+
+    /// The linked store `name` is in, and its name there.
+    fn at<'a>(&'a self, name: &'a str) -> Option<(&'a Store, &'a str)> {
+        let rest = name.strip_prefix('@')?;
+        self.linked.iter().find_map(|(l, s)| {
+            Some((s, rest.strip_prefix(l.as_str())?.strip_prefix('/')?))
+        })
+    }
+
+    /// Each linked store's names as this one shows them.
+    fn shown<T>(
+        &self,
+        f: impl Fn(&Store) -> Result<Vec<T>>,
+        mut name: impl FnMut(&mut T) -> &mut String,
+    ) -> Result<Vec<T>> {
+        let mut out = vec![];
+        for (l, s) in &self.linked {
+            for mut t in f(s)? {
+                let n = name(&mut t);
+                *n = format!("@{l}/{n}");
+                out.push(t);
+            }
+        }
+        Ok(out)
     }
 
     /// Refuses if another process rewrote `key` since it was read.
@@ -506,33 +740,137 @@ impl Store {
         Ok(!new.is_empty())
     }
 
-    /// Notice under the old key; [`HISTORY`] and entries under a new one.
+    /// A new store key, in three steps, each safe to be cut short:
+    /// [`HISTORY`] and every entry sealed again under it, while the key file
+    /// does not hold it yet (cut short: unreadable files, the store as it
+    /// was); the key file saved with it (the commit); then the notice to
+    /// devices on the old key, under that key (cut short: written at the
+    /// next open, by [`Store::finish`]).
     pub fn rotate(&mut self) -> Result<()> {
-        let e = self.entries()?.into_values().map(|v| Ok((self.body(&v)?, v)));
-        let e = e.collect::<Result<Vec<_>>>()?;
-        let old = key_id(self.keys.first().context("no store key")?);
-        self.put(&format!("{RETIRED}{old}"), b"retired")?;
+        let new = Zeroizing::new(rand::<32>().to_vec());
+        self.stage(&new)?;
+        self.add_keys(&new)?;
+        self.finish()
+    }
+
+    /// Writes history and entries under `new`, not yet a key of the store.
+    pub(crate) fn stage(&mut self, new: &[u8]) -> Result<()> {
+        // A damaged version (any key holder can write one) stops no
+        // rotation, and so no removal: left behind, and said.
+        let all: Vec<Version> = self.entries_here()?.into_values().collect();
+        let n = all.len();
+        // So is one no write would make (a name, a size): any key holder
+        // can put one there.
+        let e: Vec<_> = all
+            .into_iter()
+            .filter_map(|v| Some((self.body(&v).ok()?, v)))
+            .filter(|(b, v)| fits(&v.name, b.len()))
+            .collect();
+        if e.len() < n {
+            let d = n - e.len();
+            self.unopened.push(format!(
+                "{d} damaged or oversized version(s) left at the old key"
+            ));
+        }
         let x = self.index()?;
-        let mut frozen: Vec<u8> = x.past().flat_map(|(_, d)| *d).collect();
+        // Oldest first, so a cap drops the oldest.
+        let mut past: Vec<&(Version, [u8; 32])> = x.past().collect();
+        past.sort_by_key(|(v, _)| v.ms);
+        let mut frozen: Vec<u8> =
+            past.into_iter().flat_map(|(_, d)| *d).collect();
         let now: Vec<String> = x.heads.keys().cloned().collect();
         drop(x);
         for f in now {
-            frozen.extend(Sha256::digest(fs::read(self.v.join(f))?));
+            frozen.extend(Sha256::digest(self.bytes(&f)?));
         }
-        self.add_keys(&rand::<32>())?;
-        self.put_on(HISTORY, &frozen, None)?;
-        let mut e = e.iter();
-        e.try_for_each(|(b, v)| self.put_on(&v.name, b, Some(v.file.clone())))
+        // A list too long for a version keeps its newest digests (any key
+        // holder could fill it): the oldest history goes, no rotation.
+        if !fits(HISTORY, frozen.len()) {
+            let n = frozen.len() / 32;
+            let keep =
+                (0..n).rev().find(|k| fits(HISTORY, k * 32)).unwrap_or(0);
+            frozen.drain(..(n - keep) * 32);
+            self.unopened.push("the oldest history is no longer kept".into());
+        }
+        let was = std::mem::replace(&mut self.newest, recipient(new));
+        self.staged = Some(Zeroizing::new(new.to_vec()));
+        let go = || -> Result<()> {
+            self.put_on(HISTORY, &frozen, None)?;
+            let mut e = e.iter();
+            e.try_for_each(|(b, v)| {
+                self.put_on(&v.name, b, Some(v.file.clone())).map(drop)
+            })
+        };
+        let r = go();
+        // Its versions are not this store's until the key file says so.
+        (self.newest, self.staged) = (was, None);
+        *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+            Index::default();
+        r
     }
 
+    /// Versions under a retired key that no rotation held: an offline
+    /// device's edits, or a revoked one's. Never counted, never shown as
+    /// entries; each may be taken back by hand ([`Store::recover`]).
+    /// Linked stores' too, as `@LABEL/NAME`.
+    pub fn excluded(&self) -> Result<Vec<Version>> {
+        let x = self.index()?;
+        let out = x.old.values().filter(|(v, d)| {
+            !x.frozen.contains(d) && !v.name.starts_with(OWN) && v.size > 0
+        });
+        let mut all = sorted(out.map(|(v, _)| v));
+        drop(x);
+        for (l, s) in &self.linked {
+            for mut v in s.excluded()? {
+                v.name = format!("@{l}/{}", v.name);
+                all.push(v);
+            }
+        }
+        Ok(all)
+    }
+
+    /// Takes left-out version `file` back: its body, its entry's newest
+    /// version now. The entry's name.
+    pub fn recover(&self, file: &str) -> Result<String> {
+        let v = self.excluded()?.into_iter().find(|v| v.file == file);
+        let v = v.context("no such left-out version")?;
+        self.put(&v.name, &self.body(&v)?)?;
+        Ok(v.name)
+    }
+
+    /// The notice to devices on the key before the newest, under that key,
+    /// if a rotation was cut short before it.
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        let Some(old) = self.keys.get(1).cloned() else { return Ok(()) };
+        let at = format!("{RETIRED}{}", key_id(&old));
+        let said = self.index()?.old.values().any(|(v, _)| v.name == at);
+        if said {
+            return Ok(());
+        }
+        let now = std::mem::replace(&mut self.newest, recipient(&old));
+        let r = self.put(&at, b"retired");
+        self.newest = now;
+        *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
+            Index::default();
+        r
+    }
     pub fn retired(&self) -> bool {
         let Some(k) = self.keys.first() else { return false };
         let at = format!("{RETIRED}{}", key_id(k));
         self.index().is_ok_and(|x| x.tips.contains_key(&at))
     }
 
-    fn version(&self, file: &str) -> Result<impl Read + use<'_>> {
-        reader(&self.ids, fs::File::open(self.v.join(file))?)
+    /// A version file's bytes, read once and checked against its name: a
+    /// file put in another's place opens as nothing.
+    fn bytes(&self, file: &str) -> Result<Vec<u8>> {
+        let f = fs::File::open(self.v.join(file))?;
+        let mut b = vec![];
+        f.take(MAX as u64 + 1).read_to_end(&mut b)?;
+        ensure!(
+            b.len() <= MAX && name_of(&b) == file,
+            "{file}: not the version named so"
+        );
+        Ok(b)
     }
 
     /// A version's head, and its file's SHA-256 if an older key opened it.
@@ -542,12 +880,11 @@ impl Store {
             std::io::BufReader::new(r).read_line(&mut l).ok()?;
             Version::parse(l.strip_suffix('\n')?, file)
         };
-        let (newest, older) = self.ids.split_first()?;
-        let f = fs::File::open(self.v.join(file)).ok()?;
-        if let Ok(r) = reader(std::slice::from_ref(newest), f) {
+        let (now, older) = self.ids.split_at(self.current.min(self.ids.len()));
+        let b = self.bytes(file).ok()?;
+        if let Ok(r) = reader(now, &b[..]) {
             return Some((line(Box::new(r) as Box<dyn Read>)?, None));
         }
-        let b = fs::read(self.v.join(file)).ok()?;
         let r = reader(older, &b[..]).ok()?;
         Some((line(Box::new(r))?, Some(Sha256::digest(&b).into())))
     }
@@ -574,18 +911,23 @@ impl Store {
         let names: HashSet<String> = names.filter(|n| is_name(n)).collect();
         x.heads.retain(|f, _| names.contains(f));
         x.old.retain(|f, _| names.contains(f));
-        let mut bad = 0;
-        let known =
-            |n: &&String| x.heads.contains_key(*n) || x.old.contains_key(*n);
+        x.bad.retain(|f| names.contains(f));
+        // A file read once: names are hashes of what they hold, and the
+        // index starts again whenever the keys change.
+        let known = |n: &&String| {
+            x.heads.contains_key(*n)
+                || x.old.contains_key(*n)
+                || x.bad.contains(*n)
+        };
         let new: Vec<&String> = names.iter().filter(|n| !known(n)).collect();
         for n in new {
             match self.head(n) {
                 Some((h, None)) => drop(x.heads.insert(n.clone(), h)),
                 Some((h, Some(d))) => drop(x.old.insert(n.clone(), (h, d))),
-                None => bad += 1,
+                None => drop(x.bad.insert(n.clone())),
             }
         }
-        self.unreadable.store(bad, Relaxed);
+        self.unreadable.store(x.bad.len(), Relaxed);
         x.mtime = mtime;
         (x.tips, x.last) = Default::default();
         let heads = std::mem::take(&mut x.heads);
@@ -598,25 +940,64 @@ impl Store {
         Ok(x)
     }
 
-    /// Oldest first, frozen history included.
-    pub fn versions(&self) -> Result<Vec<Version>> {
+    /// This store's own versions, oldest first, frozen history included.
+    fn versions_here(&self) -> Result<Vec<Version>> {
         let x = self.index()?;
         Ok(sorted(x.heads.values().chain(x.past().map(|(v, _)| v))))
     }
 
+    /// Oldest first, frozen history included.
+    pub fn versions(&self) -> Result<Vec<Version>> {
+        let mine = self.versions_here()?;
+        let theirs = self.shown(Store::versions, |v| &mut v.name)?;
+        Ok(match theirs.is_empty() {
+            true => mine,
+            false => sorted(mine.iter().chain(&theirs)),
+        })
+    }
+
     pub fn body(&self, v: &Version) -> Result<Secret> {
+        if let Some((s, _)) = self.at(&v.name) {
+            return s.body(v);
+        }
         let mut b = Zeroizing::new(vec![]);
-        self.version(&v.file)?
+        let ct = self.bytes(&v.file)?;
+        reader(&self.ids, &ct[..])?
             .read_to_end(&mut b)
             .context("damaged version")?;
         let at =
             b.iter().position(|&c| c == b'\n').context("damaged version")? + 1;
+        // The version it says it is: the one asked for (a linked store's
+        // name shown here under its label).
+        let head = std::str::from_utf8(&b[..at - 1]).ok();
+        let said = head.and_then(|l| Version::parse(l, &v.file));
+        let named = |n: &str| {
+            n == v.name
+                || v.name.ends_with(&format!("/{n}")) && v.name.starts_with('@')
+        };
+        let same = said.is_some_and(|s| {
+            s.ms == v.ms
+                && s.size == v.size
+                && s.parent == v.parent
+                && named(&s.name)
+        });
+        ensure!(same, "{}: not the version it was read as", v.file);
         // `size` comes from another device: no sum that can overflow.
         let body = b.get(at..).and_then(|b| b.get(..v.size));
         Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
     }
 
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
+        let mut all = self.entries_here()?;
+        let theirs = |s: &Store| Ok(s.entries()?.into_values().collect());
+        for v in self.shown(theirs, |v| &mut v.name)? {
+            all.insert(v.name.clone(), v);
+        }
+        Ok(all)
+    }
+
+    /// This store's own entries: no linked store's.
+    fn entries_here(&self) -> Result<BTreeMap<String, Version>> {
         let x = self.index()?;
         let tips = x.tips.values().filter_map(|t| x.heads.get(&t.1));
         let live = tips.filter(|v| v.size > 0 && !v.name.starts_with(OWN));
@@ -630,6 +1011,9 @@ impl Store {
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
+        if let Some((s, n)) = self.at(name) {
+            return s.remove(n);
+        }
         for f in self.files(name)? {
             self.put(&format!("{name}{FILES}{f}"), b"")?;
         }
@@ -638,6 +1022,13 @@ impl Store {
 
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
         ensure!(self.get(to).is_err(), "{to} exists");
+        if let Some((s, f)) = self.at(from) {
+            let into = self.at(to).filter(|t| std::ptr::eq(t.0, s));
+            let (_, t) =
+                into.context("a linked store's entry is renamed within it")?;
+            return s.rename(f, t);
+        }
+        ensure!(self.at(to).is_none(), "an entry is renamed within its store");
         for f in self.files(from)? {
             let body = self.get(&format!("{from}{FILES}{f}"))?;
             self.put(&format!("{to}{FILES}{f}"), &body)?;
@@ -656,7 +1047,12 @@ impl Store {
     pub fn health(&self) -> Result<Health> {
         let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let (mut h, today) = (Health::default(), today());
+        // A revoked device read every version under a retired key.
+        let read = self.read_by_revoked()?;
         for (name, f) in self.forms()? {
+            if read.contains(&f.pass) || read.contains(&f.otp) {
+                h.exposed.push(name.clone());
+            }
             if !f.expires.is_empty() && f.expires < today {
                 h.expired.push(name.clone());
             }
@@ -673,14 +1069,34 @@ impl Store {
         Ok(h)
     }
 
+    /// Passwords and one-time seeds in versions under a retired key, here
+    /// and in linked stores.
+    fn read_by_revoked(&self) -> Result<HashSet<String>> {
+        let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
+        let past =
+            self.index()?.past().map(|p| p.0.clone()).collect::<Vec<_>>();
+        let past = past.into_iter().filter(|v| shown(&v.name));
+        let mut read: HashSet<String> = HashSet::new();
+        for v in past {
+            let Ok(b) = self.body(&v) else { continue };
+            let f = Form::parse(&String::from_utf8_lossy(&b));
+            read.extend([f.pass, f.otp].into_iter().filter(|s| !s.is_empty()));
+        }
+        for (_, s) in &self.linked {
+            read.extend(s.read_by_revoked()?);
+        }
+        Ok(read)
+    }
+
     fn forms(&self) -> Result<Vec<(String, Form)>> {
         let shown = |n: &String| !n.split('/').any(|c| c.starts_with('.'));
         let names = self.entries()?.into_keys().filter(shown);
+        // A damaged version is passed over, not a stop to every check.
         let form = |n: String| {
-            let f = Form::parse(&String::from_utf8_lossy(&self.get(&n)?));
-            Ok((n, f))
+            let f = Form::parse(&String::from_utf8_lossy(&self.get(&n).ok()?));
+            Some((n, f))
         };
-        names.map(form).collect()
+        Ok(names.filter_map(form).collect())
     }
 
     pub fn stats(&self) -> Result<Vec<(&'static str, String)>> {
@@ -747,10 +1163,16 @@ impl Store {
             let split = last.get(&v.name).is_some_and(|p| p.0 != v.parent);
             last.insert(v.name.clone(), (v.file, split));
         }
-        Ok(last.into_iter().filter(|(_, (_, c))| *c).map(|(n, _)| n).collect())
+        let mine = last.into_iter().filter(|(_, (_, c))| *c).map(|(n, _)| n);
+        let mut all: Vec<String> = mine.collect();
+        all.extend(self.shown(Store::conflicts, |n| n)?);
+        Ok(all)
     }
 
     pub fn get(&self, name: &str) -> Result<Secret> {
+        if let Some((s, n)) = self.at(name) {
+            return s.get(n);
+        }
         let x = self.index()?;
         let v = x.tips.get(name).and_then(|t| x.heads.get(&t.1));
         let v = v.filter(|v| v.size > 0);
@@ -761,16 +1183,20 @@ impl Store {
 
     /// Empty `body` deletes; dated after every version seen.
     pub fn put(&self, name: &str, body: &[u8]) -> Result<()> {
-        self.put_on(name, body, None)
+        if let Some((s, n)) = self.at(name) {
+            return s.put(n, body);
+        }
+        self.not_linked(name)?;
+        self.put_on(name, body, None).map(drop)
     }
 
-    /// `parent`: for a rotation, the version under the retired key.
-    fn put_on(
+    /// `parent`: for a rotation, the version under the retired key. Its file.
+    pub(crate) fn put_on(
         &self,
         name: &str,
         body: &[u8],
         parent: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let mut x = self.index()?;
         let tip = || x.tips.get(name).map_or("-".into(), |t| t.1.clone());
         let parent = parent.unwrap_or_else(tip);
@@ -782,6 +1208,11 @@ impl Store {
     /// An import, dated `at` ms. The same body in the same second is kept once;
     /// one in the newest version's second goes just after it.
     pub fn put_at(&self, name: &str, body: &[u8], at: u64) -> Result<()> {
+        if let Some((s, n)) = self.at(name) {
+            return s.put_at(n, body, at);
+        }
+        ensure!(at <= ahead(), "{name}: dated ahead of now");
+        self.not_linked(name)?;
         let mut x = self.index()?;
         let named = |v: &&Version| v.name == name;
         let mut of: Vec<Version> =
@@ -801,7 +1232,7 @@ impl Store {
         };
         let before = of.iter().rfind(|v| v.ms < ms);
         let parent = before.map_or("-".into(), |v| v.file.clone());
-        self.keep(&mut x, name, body, ms, parent)
+        self.keep(&mut x, name, body, ms, parent).map(drop)
     }
 
     fn keep(
@@ -811,7 +1242,7 @@ impl Store {
         body: &[u8],
         ms: u64,
         parent: String,
-    ) -> Result<()> {
+    ) -> Result<String> {
         ensure!(!name.is_empty() && !name.contains(['\n', '\r']), "bad name");
         ensure!(name.len() <= 255, "name over 255 bytes");
         // Never write under a key that may be retired, here or by sync.
@@ -823,7 +1254,8 @@ impl Store {
              password or a pairing): unlock again"
         );
         drop(loaded);
-        let newest = self.keys.first().context("no store key")?;
+        let newest = self.staged.as_ref().or(self.keys.first());
+        let newest = newest.context("no store key")?;
         ensure!(
             name.starts_with(RETIRED)
                 || !x
@@ -831,7 +1263,7 @@ impl Store {
                     .contains_key(&format!("{RETIRED}{}", key_id(newest))),
             "{RETIRED_SAY}"
         );
-        ensure!(padded(body.len() + 320) <= MAX, "over {MAX} bytes");
+        ensure!(fits(name, body.len()), "over {MAX} bytes");
         let mut v = Version {
             ms,
             size: body.len(),
@@ -844,12 +1276,18 @@ impl Store {
         let n = padded(pt.len());
         pt.resize(n, 0);
         let ct = encrypt(&self.newest, &pt)?;
+        // As sync takes it: a larger file would fail every sync.
+        ensure!(ct.len() <= MAX, "over {MAX} bytes sealed");
         v.file = name_of(&ct);
+        let at = || fs::metadata(&self.v).and_then(|m| m.modified()).ok();
+        let before = at();
         write(&self.v.join(&v.file), &ct)?;
-        x.mtime = fs::metadata(&self.v).and_then(|m| m.modified()).ok();
+        // Taken as seen only if nothing else came since the last scan.
+        x.mtime = if before == x.mtime { at() } else { None };
         x.tip(&v);
+        let file = v.file.clone();
         x.heads.insert(v.file.clone(), v);
-        Ok(())
+        Ok(file)
     }
 }
 
@@ -1019,6 +1457,8 @@ pub struct Health {
     pub weak: Vec<(String, u32)>,
     pub reused: Vec<Vec<String>>,
     pub expired: Vec<String>,
+    /// Password or one-time code unchanged since a revoked device read it.
+    pub exposed: Vec<String>,
 }
 
 /// Top 10,000 passwords by rank (SecLists, MIT); EFF long list (CC BY 3.0).
@@ -1360,8 +1800,9 @@ mod tests {
         let body = String::from_utf8(s.get("mail").unwrap().to_vec()).unwrap();
         assert_eq!(field(&body, "user").as_deref(), Some("me"));
         assert_eq!(field(&body, "pass").as_deref(), Some("b"));
-        // 4 puts, the retired notice, the history list, mail resealed.
-        assert_eq!(s.versions().unwrap().len(), 7);
+        // 4 puts, the history list, mail resealed; the retired notice is
+        // under the old key, for devices still on it, not history.
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert!(s.conflicts().unwrap().is_empty());
         fs::write(
             crate::versions(&d).join("0123456789abcdef0123456789abcdef"),
@@ -1370,7 +1811,7 @@ mod tests {
         .unwrap();
         drop(s);
         let mut s = Store::open(&d, b"pw", None).unwrap();
-        assert_eq!(s.versions().unwrap().len(), 7);
+        assert_eq!(s.versions().unwrap().len(), 6);
         assert_eq!(s.unreadable.load(Relaxed), 1);
         s.lock(b"new", Some((&[9; 32], b"hmac"))).unwrap();
         let k = fs::read(d.join("key")).unwrap();
@@ -1476,7 +1917,10 @@ mod tests {
         sr.put("bank", b"forged").unwrap();
         sr.put("new", b"planted").unwrap();
         sr.put_at("mail", b"backdated", 1).unwrap();
-        sr.put_at("bank", b"ahead", u64::MAX / 4).unwrap();
+        assert!(sr.put_at("bank", b"ahead", u64::MAX / 4).is_err());
+        let mut x = sr.index().unwrap();
+        sr.keep(&mut x, "bank", b"ahead", u64::MAX / 4, "-".into()).unwrap();
+        drop(x);
         for e in fs::read_dir(crate::versions(&r)).unwrap().flatten() {
             let to = crate::versions(&a).join(e.file_name());
             let _ = fs::copy(e.path(), to);
@@ -1510,6 +1954,161 @@ mod tests {
         let mut sa = Store::open(&a, b"pw", None).unwrap();
         sa.rotate().unwrap();
         check(&sa, 3);
+    }
+
+    #[test]
+    fn health_lists_what_a_revoked_device_read_until_changed() {
+        let mut s = Store::create(&dir("exposed"), b"pw", None).unwrap();
+        s.put("a", b"pa\n").unwrap();
+        s.put("b", b"pb\notp: otpauth://totp/x?secret=AAAA\n").unwrap();
+        assert!(s.health().unwrap().exposed.is_empty());
+        s.rotate().unwrap();
+        assert_eq!(s.health().unwrap().exposed, ["a", "b"]);
+        s.put("a", b"new\n").unwrap();
+        s.put("b", b"new\notp: otpauth://totp/x?secret=AAAA\n").unwrap();
+        s.put("d", b"pa\n").unwrap();
+        let h = s.health().unwrap().exposed;
+        assert_eq!(h, ["b", "d"], "a seed unchanged; a password it read");
+        s.put("a", b"pa\n").unwrap();
+        assert_eq!(s.health().unwrap().exposed, ["a", "b", "d"]);
+    }
+
+    #[test]
+    fn a_linked_store_opens_with_this_one_and_shows_under_its_label() {
+        let d = dir("linked");
+        let (me, lab) = (d.join("me"), d.join("lab"));
+        let s = Store::create(&me, b"mine", None).unwrap();
+        s.put("mail", b"m\n").unwrap();
+        let g = Store::create(&lab, b"ours", None).unwrap();
+        g.put("github", b"g\n").unwrap();
+        let mut s = s;
+        let ours = Store::open(&lab, b"ours", None).unwrap();
+        assert_eq!(s.link(ours).unwrap(), "lab");
+        assert_eq!(s.links().collect::<Vec<_>>(), [("lab", lab.as_path())]);
+        // Not in v/: the network side never sees, and pairing never hands it.
+        assert!(
+            lab.join("link").exists() && !versions(&lab).join("link").exists()
+        );
+        let open = || {
+            Store::open(&me, b"mine", None).unwrap().links_in(vec![lab.clone()])
+        };
+        let mut s = open();
+        let names: Vec<String> = s.entries().unwrap().into_keys().collect();
+        assert_eq!(names, ["@lab/github", "mail"]);
+        assert_eq!(&s.get("@lab/github").unwrap()[..], b"g\n");
+        s.put("@lab/wiki", b"w\n").unwrap();
+        assert_eq!(&g.get("wiki").unwrap()[..], b"w\n", "written there");
+        assert!(s.entries_here().unwrap().keys().all(|n| !n.starts_with('@')));
+        assert_eq!(s.history("@lab/github").unwrap().len(), 1);
+        assert!(s.rename("@lab/wiki", "wiki").is_err(), "not out of its store");
+        s.rename("@lab/wiki", "@lab/docs").unwrap();
+        assert!(g.get("docs").is_ok() && g.get("wiki").is_err());
+        // Another store's link is not this one's; a rotation keeps it out.
+        let other = Store::create(&d.join("other"), b"x", None).unwrap();
+        assert!(
+            other.links_in(vec![lab.clone()]).entries().unwrap().is_empty()
+        );
+        s.rotate().unwrap();
+        assert!(s.entries_here().unwrap().keys().all(|n| !n.starts_with('@')));
+        // A new password here seals the link anew; one there needs a new link.
+        s.lock(b"new", None).unwrap();
+        let s =
+            Store::open(&me, b"new", None).unwrap().links_in(vec![lab.clone()]);
+        assert!(s.get("@lab/github").is_ok());
+        let mut g = Store::open(&lab, b"ours", None).unwrap();
+        g.lock(b"changed", None).unwrap();
+        let s =
+            Store::open(&me, b"new", None).unwrap().links_in(vec![lab.clone()]);
+        assert!(s.unopened[0].starts_with("@lab: its password changed"));
+        assert!(s.get("@lab/github").is_err());
+        let mut s = Store::open(&me, b"new", None).unwrap();
+        s.link(Store::open(&lab, b"changed", None).unwrap()).unwrap();
+        s.unlink("lab").unwrap();
+        assert!(!lab.join("link").exists() && s.links().next().is_none());
+    }
+
+    #[test]
+    fn a_version_put_in_anothers_place_reads_as_nothing() {
+        let s = Store::create(&dir("swap"), b"pw", None).unwrap();
+        s.put("bank", b"b4nk\n").unwrap();
+        s.put("mail", b"m41l\n").unwrap();
+        let e = s.entries().unwrap();
+        assert_eq!(&s.get("bank").unwrap()[..], b"b4nk\n");
+        // Cached, then mail's ciphertext where bank's was.
+        let at = |n: &str| versions(&s.dir).join(&e[n].file);
+        fs::copy(at("mail"), at("bank")).unwrap();
+        assert!(s.get("bank").is_err(), "not mail's password as bank's");
+        assert_eq!(&s.get("mail").unwrap()[..], b"m41l\n");
+        // A file at the limit is refused before it is written.
+        assert!(s.put("big", &vec![7; MAX - 400]).is_err());
+    }
+
+    #[test]
+    fn a_rotation_cut_short_loses_nothing_and_left_out_edits_come_back() {
+        let d = dir("cut");
+        let mut s = Store::create(&d, b"pw", None).unwrap();
+        s.put("bank", b"1\n").unwrap();
+        s.put("mail", b"m\n").unwrap();
+        // Cut before the commit: written under a key no file holds.
+        s.stage(&rand::<32>()).unwrap();
+        let mut s = Store::open(&d, b"pw", None).unwrap();
+        assert_eq!(s.entries().unwrap().len(), 2, "the store as it was");
+        assert_eq!(s.keys().len(), 1);
+        // Cut after the commit: the notice is written at the next open. An
+        // edit on the old key after the snapshot (another device's, offline
+        // through it) is no part of the new key's history.
+        let new = rand::<32>();
+        s.stage(&new).unwrap();
+        s.put("wifi", b"w\n").unwrap();
+        s.add_keys(&new).unwrap();
+        let s = Store::open(&d, b"pw", None).unwrap();
+        assert_eq!(s.keys().len(), 2);
+        assert_eq!(&s.get("bank").unwrap()[..], b"1\n");
+        assert_eq!(s.history("bank").unwrap().len(), 2, "1, sealed again");
+        let at = format!("{RETIRED}{}", key_id(&s.keys()[1]));
+        assert!(s.index().unwrap().old.values().any(|(v, _)| v.name == at));
+        // That edit: left out, said, and taken back by hand.
+        assert!(s.get("wifi").is_err());
+        let left = s.excluded().unwrap();
+        assert_eq!(
+            left.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["wifi"]
+        );
+        assert_eq!(s.recover(&left[0].file).unwrap(), "wifi");
+        assert_eq!(&s.get("wifi").unwrap()[..], b"w\n");
+    }
+
+    #[test]
+    fn a_far_off_date_outdates_no_edit() {
+        let d = dir("ahead");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        assert!(s.put_at("k", b"x", u64::MAX).is_err());
+        let mut x = s.index().unwrap();
+        s.keep(&mut x, "k", b"evil", u64::MAX, "-".into()).unwrap();
+        drop(x);
+        s.put("k", b"good").unwrap();
+        assert_eq!(&s.get("k").unwrap()[..], b"good");
+    }
+
+    #[test]
+    fn a_damaged_or_unwritable_version_stops_no_rotation() {
+        let d = dir("damaged");
+        let s = Store::create(&d, b"pw", None).unwrap();
+        s.put("bank", b"1\n").unwrap();
+        // Versions any key holder could plant: longer than said, a name
+        // no write takes.
+        let k = s.keys()[0].clone();
+        let ms = std::time::UNIX_EPOCH.elapsed().unwrap().as_millis();
+        let long = format!("{ms} - 1 {}\nx", "n".repeat(300));
+        for pt in [format!("{ms} - 999999 zzz\n12345"), long] {
+            let ct = encrypt(&recipient(&k), pt.as_bytes()).unwrap();
+            fs::write(versions(&d).join(name_of(&ct)), &ct).unwrap();
+        }
+        let mut s = Store::open(&d, b"pw", None).unwrap();
+        s.rotate().unwrap();
+        s.health().unwrap();
+        let s = Store::open(&d, b"pw", None).unwrap();
+        assert_eq!(&s.get("bank").unwrap()[..], b"1\n");
     }
 
     #[test]

@@ -369,7 +369,9 @@ pub extern "system" fn Java_com_apasa_Native_health<'l>(
         let reused =
             h.reused.iter().map(|g| format!("reused\t{}", g.join("\t")));
         let expired = h.expired.iter().map(|n| format!("expired\t{n}"));
-        let all: Vec<String> = weak.chain(reused).chain(expired).collect();
+        let exposed = h.exposed.iter().map(|n| format!("exposed\t{n}"));
+        let all: Vec<String> =
+            weak.chain(reused).chain(expired).chain(exposed).collect();
         Ok(e.new_string(all.join("\n"))?)
     })
 }
@@ -730,6 +732,14 @@ pub extern "system" fn Java_com_apasa_Native_wake<'l>(
             return Ok(e.new_string("")?);
         }
         let _one = SYNC.lock().unwrap_or_else(|p| p.into_inner());
+        // A wake replayed (a relay can) costs one sync in EVERY at most.
+        static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let last = *LAST.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = last {
+            std::thread::sleep(sync::EVERY.saturating_sub(t.elapsed()));
+        }
+        *LAST.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(std::time::Instant::now());
         WAITING.store(false, SeqCst);
         let r = RT.block_on(sync::sync(Path::new(&dir.to_string()), false))?;
         Ok(e.new_string(report(r))?)
