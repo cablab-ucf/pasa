@@ -133,7 +133,9 @@ replaces stays as `key.old`), syncing the versions; neither asks for or
 sees the password or a hardware key. A QR code's password is shown
 before the code, never beside it. A short code meets once at the
 [pairir](https://github.com/cablab-ucf/pairir) relay (CPace, then
-X-Wing; one try, one minute).
+X-Wing; one try, one minute). A device that holds a store already joins
+another beside it, its own untouched: Devices, *Join another device's
+store* (`pasa --dir DIR join`).
 
 Only ciphertext crosses the network, and received files must be
 versions that match their names. On a computer the network side is a

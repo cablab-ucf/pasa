@@ -403,6 +403,8 @@ struct App {
     hist: (usize, usize, bool),
     generator: Generator,
     device: String,
+    /// Another device's store, joined beside this one: its folder.
+    beside: String,
     pairing: Option<Pairing>,
     scanning: Option<Scanning>,
     synced: Arc<Mutex<Option<String>>>,
@@ -418,7 +420,8 @@ struct App {
     rt: Option<tokio::runtime::Runtime>,
 }
 
-pub fn run() -> Result<()> {
+/// `join`: a store's folder still empty, opened to join one (Devices).
+pub fn run(join: bool) -> Result<()> {
     let view = egui::ViewportBuilder::default()
         .with_title("pasa")
         .with_app_id("pasa")
@@ -427,7 +430,12 @@ pub fn run() -> Result<()> {
     let o = eframe::NativeOptions { viewport: view, ..Default::default() };
     let app = |c: &eframe::CreationContext<'_>| {
         style(&c.egui_ctx);
-        let a = App { peer: "home".into(), quick: true, ..App::default() };
+        let a = App {
+            peer: "home".into(),
+            quick: true,
+            joining: join,
+            ..App::default()
+        };
         c.egui_ctx.set_theme(a.prefs.theme);
         Ok(Box::new(a) as Box<dyn eframe::App>)
     };
@@ -2255,6 +2263,24 @@ impl App {
         }
         if let Err(e) = self.pairing(ui) {
             (self.pairing, v.note) = (None, format!("{e:#}"));
+        }
+        ui.separator();
+        ui.label(RichText::new("Join another device's store").strong());
+        let how = "Beside this one, which stays as it is: in a folder of its \
+                   own and a window of its own, where its code is typed or \
+                   scanned. The store menu, top left, switches back.";
+        ui.label(RichText::new(how).small().color(l.muted));
+        field(ui, "Its folder (~/pasa-work)", &mut self.beside, false);
+        let d = pasa::path(&self.beside);
+        let ok = !self.beside.trim().is_empty() && !d.join("key").exists();
+        if ui.add_enabled(ok, egui::Button::new("Join it there")).clicked() {
+            let c = crate::reopen(&d, "gui");
+            match c.and_then(|mut c| Ok(c.arg("--join").spawn()?)) {
+                Ok(_) => {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close)
+                }
+                Err(e) => v.note = format!("{e:#}"),
+            }
         }
     }
 

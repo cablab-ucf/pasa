@@ -58,6 +58,11 @@ class MainActivity : ComponentActivity(), Host {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         if (android.os.Build.VERSION.SDK_INT >= 31) window.setHideOverlayWindows(true)
         stored = File(dir, "key").exists()
+        // Opened from Devices to join another device's store.
+        getSharedPreferences("pasa", 0).run {
+            nav.joining = !stored && getBoolean("join", false)
+            edit().remove("join").apply()
+        }
         readQuick()
         setContent {
             BackHandler(enabled = !nav.atTop) { nav.back() }
@@ -158,11 +163,11 @@ class MainActivity : ComponentActivity(), Host {
     override val stores get() =
         (filesDir.list().orEmpty().filter { it == "pasa" || it.startsWith("pasa-") } + "pasa" + storeName).distinct().sorted()
 
-    override fun useStore(name: String) {
+    override fun useStore(name: String, join: Boolean) {
         here(false)
         if (sync) org.pushir.Pushir.stop(this)
         lock()
-        getSharedPreferences("pasa", 0).edit().putString("store", name).commit()
+        getSharedPreferences("pasa", 0).edit().putString("store", name).putBoolean("join", join).commit()
         if (sync) push(this)
         recreate()
     }

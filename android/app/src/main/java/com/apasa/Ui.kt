@@ -141,8 +141,9 @@ interface Host {
     /** Folder names, "pasa" first; [storeName] is the open one. */
     val stores: List<String>
     val storeName: String
-    /** Locks, and opens store [name]: a new name makes a new store. */
-    fun useStore(name: String)
+    /** Locks, and opens store [name]: a new name makes a new store, at
+     *  [join]'s screen if asked. */
+    fun useStore(name: String, join: Boolean = false)
     val needsKey: Boolean
     val open: Boolean
     val version: String
@@ -302,7 +303,7 @@ private fun Stores(host: Host) {
         { naming = false }, title = { Text("New store") },
         text = {
             OutlinedTextField(
-                name, { t -> name = t.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it in "-_" }.take(32) },
+                name, { name = slot(it) },
                 label = { Text("Its name: one per person or purpose") }, singleLine = true,
             )
         },
@@ -310,6 +311,9 @@ private fun Stores(host: Host) {
         dismissButton = { TextButton({ naming = false }) { Text("Cancel") } },
     )
 }
+
+/** A store's name as its folder takes it. */
+private fun slot(t: String) = t.filter { it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it in "-_" }.take(32)
 
 private data class Work(val busy: Boolean, val err: String, val go: (suspend () -> Unit) -> Unit, val stop: () -> Unit)
 
@@ -1182,6 +1186,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
     var name by remember { mutableStateOf("") }
     var pairing by remember { mutableStateOf<Pair<String, String>?>(null) }
     var qrPw by remember { mutableStateOf<String?>(null) }
+    var beside by remember { mutableStateOf("") }
     Page("Devices and sync", nav) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -1240,6 +1245,14 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
                 }
             }
         }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        Label("JOIN ANOTHER DEVICE'S STORE")
+        Text(
+            "Added beside this one, which stays as it is; its code is typed or scanned next. Store, on the lock screen, switches between them.",
+            style = MaterialTheme.typography.bodySmall, color = muted,
+        )
+        Field(beside, { beside = slot(it) }, "A name for it here")
+        OutlinedButton({ host.useStore("pasa-$beside", join = true) }, enabled = beside.isNotEmpty() && "pasa-$beside" !in host.stores) { Text("Join it") }
     }
 }
 
