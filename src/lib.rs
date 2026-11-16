@@ -595,6 +595,9 @@ impl Store {
     fn with_links(mut self) -> Store {
         // A rotation cut short after its commit: finished here.
         let _ = self.finish();
+        // Its devices known to each other: each syncs with all.
+        #[cfg(feature = "sync")]
+        let _ = sync::introduce(&self);
         self.links_in(stores())
     }
 
@@ -622,6 +625,8 @@ impl Store {
                 .context("its password changed there: link it again");
             match opened {
                 Ok(mut s) => {
+                    #[cfg(feature = "sync")]
+                    let _ = sync::introduce(&s);
                     let said =
                         s.unopened.drain(..).map(|m| format!("@{label}: {m}"));
                     self.unopened.extend(said.collect::<Vec<_>>());
@@ -987,6 +992,31 @@ impl Store {
         Ok(Zeroizing::new(body.context("damaged version")?.to_vec()))
     }
 
+    /// The store's own versions under `prefix` (in `.pasa/`) as the newest
+    /// key has them, by name: their bodies. A damaged one is passed over.
+    pub fn hidden(&self, prefix: &str) -> Result<Vec<(String, Secret)>> {
+        ensure!(prefix.starts_with(OWN), "{prefix}: not the store's own");
+        let of: Vec<Version> = {
+            let x = self.index()?;
+            let tips = x.tips.values().filter_map(|t| x.heads.get(&t.1));
+            let of = tips.filter(|v| v.size > 0 && v.name.starts_with(prefix));
+            of.cloned().collect()
+        };
+        let read = |v: &Version| Some((v.name.clone(), self.body(v).ok()?));
+        Ok(of.iter().filter_map(read).collect())
+    }
+
+    /// For each store key, newest first, what devices introduced through
+    /// the store pair with ([`sync::introduce`]): never a key itself. A
+    /// device without the newest key (revoked) cannot follow.
+    pub fn intro(&self) -> Vec<[u8; 32]> {
+        let one = |k: &Secret| {
+            let h = Sha256::new().chain_update(b"pasa intro 1\0");
+            h.chain_update(&k[..]).finalize().into()
+        };
+        self.keys.iter().map(one).collect()
+    }
+
     pub fn entries(&self) -> Result<BTreeMap<String, Version>> {
         let mut all = self.entries_here()?;
         let theirs = |s: &Store| Ok(s.entries()?.into_values().collect());
@@ -1163,7 +1193,9 @@ impl Store {
             let split = last.get(&v.name).is_some_and(|p| p.0 != v.parent);
             last.insert(v.name.clone(), (v.file, split));
         }
-        let mine = last.into_iter().filter(|(_, (_, c))| *c).map(|(n, _)| n);
+        let split =
+            |(n, (_, c)): &(String, (String, bool))| *c && !n.starts_with(OWN);
+        let mine = last.into_iter().filter(split).map(|(n, _)| n);
         let mut all: Vec<String> = mine.collect();
         all.extend(self.shown(Store::conflicts, |n| n)?);
         Ok(all)
