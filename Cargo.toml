@@ -38,7 +38,7 @@ totp-lite = "2"
 data-encoding = "2"
 zeroize = "1"
 irnet = { git = "https://github.com/cablab-ucf/irnet", rev = "7f8c000428461e8000657866620952d4dad247d5", optional = true }
-pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "7b39d398155b0b5c726567150a67f996179fc7ca", optional = true }
+pushir = { git = "https://github.com/cablab-ucf/pushir", rev = "3b3e6ae1211259990a479455fed95d47a92c6e92", optional = true }
 pairir = { git = "https://github.com/cablab-ucf/pairir", rev = "a991f1baf716c016bbc386132baa495536b50b78", optional = true }
 iroh = { version = "1.4", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
@@ -61,7 +61,7 @@ eframe = { version = "0.37.0", default-features = false, features = ["glow", "wa
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita-notitle"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "system"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
