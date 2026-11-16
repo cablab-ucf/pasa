@@ -733,7 +733,9 @@ fn main() -> Result<()> {
         #[cfg(feature = "tui")]
         ["tui"] => return tui::run(open()?),
         #[cfg(feature = "gui")]
-        ["gui"] => return gui::run(),
+        ["gui"] => return gui::run(false),
+        #[cfg(feature = "gui")]
+        ["gui", "--join"] => return gui::run(true),
         ["--clear-clipboard", i] => return clear_clipboard(i.parse()?),
         ["keys"] => {
             print!("{}", *open()?.passphrases());

@@ -5,7 +5,7 @@ on a desk too; `MainActivity.kt` is what it asks of the phone) over the
 same Rust (`apasa-jni`).
 
 - Several stores side by side, one per person or purpose: Store, on the
-  lock screen.
+  lock screen; another device's joined beside this one: Devices.
 - Updates: daily, the newest release's APK is fetched from GitHub,
   checked against its `.sha256`, and installed by the package installer
   when the app is off the screen (Android 12 on; before, asked at the next
