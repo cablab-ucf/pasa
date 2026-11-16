@@ -4,15 +4,23 @@ use crate::{MAX, Store, is_name, name_of, rand, write};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use data_encoding::HEXLOWER;
 use irnet::psk::{Rx, Tx};
+use iroh::endpoint::{ConnectOptions, Connection};
 use iroh::{EndpointAddr, PublicKey, RelayUrl, SecretKey, TransportAddr};
 use pushir::Lane;
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, fs, sync::Arc, time::Duration};
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-const ALPN: &[u8] = b"pasa/6";
+/// `pasa/7` first; `pasa/6`, without the digest, for peers before 0.4.19.
+const ALPN: &[u8] = b"pasa/7";
+const ALPN6: &[u8] = b"pasa/6";
+
+fn alpns() -> Vec<Vec<u8>> {
+    vec![ALPN.into(), ALPN6.into()]
+}
 
 /// The network side's files beside `v/`: never a key file.
 pub fn net(dir: &Path) -> PathBuf {
@@ -27,16 +35,19 @@ pub fn net(dir: &Path) -> PathBuf {
     n
 }
 
-/// `id`: its endpoint, once known; `seen`: last sync or pairing, Unix seconds.
+/// `id`: its endpoint, once known; `seen`: last sync or pairing, Unix seconds;
+/// `at`: its direct addresses when last dialled.
 pub struct Peer {
     pub name: String,
     pub psk: [u8; 32],
     pub id: Option<PublicKey>,
     pub lane: Option<Lane>,
     pub seen: Option<u64>,
+    pub at: Vec<SocketAddr>,
 }
 
-/// `psk id lane seen name` a line; name last, where older versions read it.
+/// `psk id lane seen at name` a line, `at` comma-separated: `seen` fourth
+/// and name last, where older versions read them.
 pub fn peers(dir: &Path) -> Vec<Peer> {
     let f = fs::read_to_string(net(dir).join("peers")).unwrap_or_default();
     let peer = |l: &str| {
@@ -48,7 +59,10 @@ pub fn peers(dir: &Path) -> Vec<Peer> {
         let name = w[3..].last()?.to_string();
         let seen =
             w.get(3).filter(|_| w.len() > 4).and_then(|s| s.parse().ok());
-        Some(Peer { psk, id, lane, seen, name })
+        let at = w.get(4).filter(|_| w.len() > 5);
+        let at = at.iter().flat_map(|a| a.split(','));
+        let at = at.filter_map(|a| a.parse().ok()).collect();
+        Some(Peer { psk, id, lane, seen, at, name })
     };
     f.lines().filter_map(peer).collect()
 }
@@ -58,7 +72,10 @@ fn save(dir: &Path, ps: &[Peer]) -> Result<()> {
         let m = p.lane.as_ref().map_or("-".into(), Lane::to_string);
         let id = p.id.map_or("-".into(), |k| k.to_string());
         let seen = p.seen.map_or("-".into(), |t| t.to_string());
-        format!("{} {id} {m} {seen} {}\n", HEXLOWER.encode(&p.psk), p.name)
+        let at: Vec<String> = p.at.iter().map(SocketAddr::to_string).collect();
+        let at = if at.is_empty() { "-".into() } else { at.join(",") };
+        let psk = HEXLOWER.encode(&p.psk);
+        format!("{psk} {id} {m} {seen} {at} {}\n", p.name)
     };
     write(
         &net(dir).join("peers"),
@@ -229,7 +246,8 @@ pub fn introduce(s: &Store) -> Result<()> {
                     true => format!("{name}-{}", &id.to_string()[..8]),
                 };
                 let id = Some(*id);
-                ps.push(Peer { name, psk, id, lane: None, seen: None });
+                let (lane, seen, at) = (None, None, vec![]);
+                ps.push(Peer { name, psk, id, lane, seen, at });
                 changed = true;
             }
         }
@@ -272,8 +290,10 @@ fn ep() -> Result<iroh::endpoint::Builder> {
 /// (peer's lane, peer's endpoint, versions taken)
 type Swapped = (Option<Lane>, Option<PublicKey>, usize);
 
-/// Wire: lane, endpoint key, names (32 bytes each), files the other lacks, "".
-async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
+/// Wire: lane, endpoint key, then on `pasa/7` the SHA-256 of the sorted
+/// names, names (32 bytes each) unless both digests match, files the other
+/// lacks, "".
+async fn swap(dir: &Path, v7: bool, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     let mailbox = fs::read(net(dir).join("mailbox")).unwrap_or_default();
     tx.send(&mailbox).await?;
     tx.send(key(dir, "node")?.public().as_bytes()).await?;
@@ -287,15 +307,27 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| is_name(n))
         .collect();
-    // Both at once: past the 2 MiB stream window, sequential sends deadlock.
-    let names = mine.iter().map(String::as_str).collect::<String>();
-    let (sent, list) = tokio::join!(tx.send(names.as_bytes()), rx.recv(MAX));
-    let list = (sent?, list?).1;
-    let other: HashSet<String> = list
-        .chunks(32)
-        .filter_map(|c| String::from_utf8(c.to_vec()).ok())
-        .filter(|n| is_name(n))
-        .collect();
+    let mut names: Vec<&str> = mine.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let names = names.concat();
+    let digest = Sha256::digest(&names);
+    let same = v7 && {
+        tx.send(&digest).await?;
+        rx.recv(32).await? == digest[..]
+    };
+    let other = if same {
+        mine.clone()
+    } else {
+        // Both at once: past the 2 MiB stream window, sequential sends
+        // deadlock.
+        let (sent, list) =
+            tokio::join!(tx.send(names.as_bytes()), rx.recv(MAX));
+        let list = (sent?, list?).1;
+        list.chunks(32)
+            .filter_map(|c| String::from_utf8(c.to_vec()).ok())
+            .filter(|n| is_name(n))
+            .collect()
+    };
     let give = async {
         for n in mine.difference(&other) {
             let b = fs::read(v.join(n))?;
@@ -332,17 +364,21 @@ async fn swap(dir: &Path, mut tx: Tx, mut rx: Rx) -> Result<Swapped> {
     Ok((theirs, id, t?))
 }
 
-/// Records a sync with `name`; `lane: None` keeps the known lane.
+/// Records a sync with `name`; `lane: None` and no `at` keep the known.
 fn learnt(
     dir: &Path,
     name: &str,
     lane: Option<Option<Lane>>,
     id: Option<PublicKey>,
+    at: Vec<SocketAddr>,
 ) {
     let mut ps = peers(dir);
     let Some(p) = ps.iter_mut().find(|p| p.name == name) else { return };
     p.lane = lane.unwrap_or(p.lane.take());
     p.id = id.or(p.id);
+    if !at.is_empty() {
+        p.at = at;
+    }
     p.seen = Some(now());
     let _ = save(dir, &ps);
 }
@@ -368,12 +404,20 @@ async fn wake(dir: &Path, except: &str) {
     while all.join_next().await.is_some() {}
 }
 
+/// The peer's direct addresses this connection went by.
+fn direct(c: &Connection) -> Vec<SocketAddr> {
+    let paths = c.paths();
+    let at = paths.iter().map(|p| p.remote_addr().clone());
+    let at = EndpointAddr::from_parts(c.remote_id(), at);
+    at.ip_addrs().copied().collect()
+}
+
 /// All peers at once: an unreachable one costs its 15 s once, not per peer.
 pub async fn sync(
     dir: &Path,
     news: bool,
 ) -> Result<Vec<(String, Result<usize>)>> {
-    let (ep, relay) = (ep()?.alpns(vec![ALPN.into()]).bind().await?, relay()?);
+    let (ep, relay) = (ep()?.alpns(alpns()).bind().await?, relay()?);
     let mut all = tokio::task::JoinSet::new();
     let mut out = vec![];
     for p in peers(dir) {
@@ -387,10 +431,13 @@ pub async fn sync(
         let (ep, relay, dir) = (ep.clone(), relay.clone(), dir.to_path_buf());
         all.spawn(async move {
             let go = async {
-                let at =
-                    EndpointAddr::from_parts(id, [TransportAddr::Relay(relay)]);
+                // Direct where it was last met, and by the relay.
+                let ip = p.at.iter().map(|a| TransportAddr::Ip(*a));
+                let at = EndpointAddr::from_parts(id, ip).with_relay_url(relay);
                 let meet = async {
-                    let c = ep.connect(at, ALPN).await?;
+                    let o = ConnectOptions::new()
+                        .with_additional_alpns(vec![ALPN6.into()]);
+                    let c = ep.connect_with_opts(at, ALPN, o).await?.await?;
                     let (tx, rx) = irnet::psk::dial(&c, &p.psk).await?;
                     anyhow::Ok((c, tx, rx))
                 };
@@ -398,9 +445,12 @@ pub async fn sync(
                     timeout(Duration::from_secs(15), meet).await.map_err(
                         |_| anyhow!("not reached: is pasa open there?"),
                     )??;
-                let r = timeout(SWAP, swap(&dir, tx, rx)).await;
+                let v7 = c.alpn() == ALPN;
+                let r = timeout(SWAP, swap(&dir, v7, tx, rx)).await;
+                let at = direct(&c);
                 c.close(0u32.into(), b"");
-                r.unwrap_or_else(|_| Err(anyhow!("timed out")))
+                let r = r.unwrap_or_else(|_| Err(anyhow!("timed out")));
+                r.map(|s| (s, at))
             };
             let r = go.await;
             (p.name, r)
@@ -411,8 +461,8 @@ pub async fn sync(
         let (name, r) = r?;
         out.push((
             name.clone(),
-            r.map(|(_, id, n)| {
-                learnt(dir, &name, None, id);
+            r.map(|((_, id, n), at)| {
+                learnt(dir, &name, None, id, at);
                 n
             }),
         ));
@@ -445,7 +495,7 @@ pub async fn serve(
         }
         _ => {}
     }
-    let ep = ep()?.secret_key(node).alpns(vec![ALPN.into()]).bind().await?;
+    let ep = ep()?.secret_key(node).alpns(alpns()).bind().await?;
     // Bounded work: handshakes before a proof (each 10 s at most), and
     // swaps after one, far above what a person's devices ask.
     use tokio::sync::Semaphore;
@@ -462,18 +512,18 @@ pub async fn serve(
             let ps = peers(&dir);
             let psks: Vec<&[u8; 32]> = ps.iter().map(|p| &p.psk).collect();
             let go = async {
-                let (i, tx, rx) =
-                    irnet::psk::accept(&inc.await?, &psks).await?;
+                let c = inc.await?;
+                let (i, tx, rx) = irnet::psk::accept(&c, &psks).await?;
                 drop(first);
                 let _busy = active
                     .try_acquire_owned()
                     .ok()
                     .context("busy: sync later")?;
-                anyhow::Ok((i, swap(&dir, tx, rx).await?))
+                anyhow::Ok((i, swap(&dir, c.alpn() == ALPN, tx, rx).await?))
             };
             match timeout(SWAP, go).await {
                 Ok(Ok((i, (mailbox, id, n)))) => {
-                    learnt(&dir, &ps[i].name, Some(mailbox), id);
+                    learnt(&dir, &ps[i].name, Some(mailbox), id, vec![]);
                     if n > 0 {
                         wake(&dir, &ps[i].name).await;
                     }
@@ -534,6 +584,7 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
             id: None,
             lane: None,
             seen: Some(now()),
+            at: vec![],
         },
     )?;
     set_on(dir, true)?;
@@ -597,6 +648,7 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
             id,
             lane: None,
             seen: Some(now()),
+            at: vec![],
         },
     )?;
     set_on(dir, true)
@@ -629,16 +681,17 @@ mod tests {
         take(b, an, &offer(a, bn).unwrap()).unwrap();
     }
 
-    /// `a` dials `b`: versions taken by (a, b).
+    /// `a` dials `b` on `alpn`: versions taken by (a, b).
     async fn swap_once(
         a: &Path,
         b: &Path,
         bn: &str,
         an: &str,
+        alpn: &[u8],
     ) -> (usize, usize) {
         let bind = || {
             irnet::endpoint()
-                .alpns(vec![ALPN.into()])
+                .alpns(alpns())
                 .relay_mode(RelayMode::Disabled)
                 .bind()
         };
@@ -648,16 +701,17 @@ mod tests {
         let srv = tokio::spawn(async move {
             let c = eb.accept().await.unwrap().await.unwrap();
             let (_, tx, rx) = irnet::psk::accept(&c, &[&psk]).await.unwrap();
-            let (m, id, n) = swap(&b2, tx, rx).await.unwrap();
-            learnt(&b2, &an, Some(m), id);
+            let v7 = c.alpn() == ALPN;
+            let (m, id, n) = swap(&b2, v7, tx, rx).await.unwrap();
+            learnt(&b2, &an, Some(m), id, vec![]);
             c.closed().await;
             eb.close().await;
             n
         });
-        let c = ea.connect(at, ALPN).await.unwrap();
+        let c = ea.connect(at, alpn).await.unwrap();
         let (tx, rx) = irnet::psk::dial(&c, &psk).await.unwrap();
-        let (_, id, n) = swap(a, tx, rx).await.unwrap();
-        learnt(a, bn, None, id);
+        let (_, id, n) = swap(a, alpn == ALPN, tx, rx).await.unwrap();
+        learnt(a, bn, None, id, direct(&c));
         c.close(0u32.into(), b"");
         ea.close().await;
         (n, srv.await.unwrap())
@@ -691,9 +745,9 @@ mod tests {
         for d in [&a, &b, &c] {
             open(d);
         }
-        swap_once(&b, &a, "a", "b").await;
-        swap_once(&c, &a, "a", "c").await;
-        swap_once(&b, &a, "a", "b").await;
+        swap_once(&b, &a, "a", "b", ALPN).await;
+        swap_once(&c, &a, "a", "c", ALPN).await;
+        swap_once(&b, &a, "a", "b", ALPN).await;
         open(&b);
         open(&c);
         let of = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
@@ -702,7 +756,7 @@ mod tests {
         assert_eq!(peers(&b).len(), 2, "a, paired directly, and c");
         assert_eq!(of(&b, "a").unwrap().psk, direct, "a direct pair stays");
         Store::open(&b, PW, None).unwrap().put("from b", b"1").unwrap();
-        assert_eq!(swap_once(&c, &b, "laptop", "phone").await, (1, 0));
+        assert_eq!(swap_once(&c, &b, "laptop", "phone", ALPN).await, (1, 0));
         // Opened again: nothing changes, nothing written.
         let at = fs::read(net(&b).join("peers")).unwrap();
         open(&b);
@@ -742,7 +796,10 @@ mod tests {
         // A file no version, held by a peer: passed over, the rest arrives.
         let junk = b"not a version".as_slice();
         fs::write(crate::versions(&phone).join(name_of(junk)), junk).unwrap();
-        assert_eq!(swap_once(&desk, &phone, "phone", "desk").await, (2, 0));
+        assert_eq!(
+            swap_once(&desk, &phone, "phone", "desk", ALPN).await,
+            (2, 0)
+        );
         assert!(!crate::versions(&desk).join(name_of(junk)).exists());
         fs::remove_file(crate::versions(&phone).join(name_of(junk))).unwrap();
         let at = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
@@ -832,9 +889,14 @@ mod tests {
         assert_eq!(unseen(&b), [("a".to_string(), 31)]);
         let line = fs::read_to_string(net(&b).join("peers")).unwrap();
         assert_eq!(line.trim_end().split(' ').next_back(), Some("a"));
+        ps[0].at =
+            vec!["10.0.0.2:7".parse().unwrap(), "[::1]:8".parse().unwrap()];
+        save(&b, &ps).unwrap();
+        assert_eq!(peers(&b)[0].at, ps[0].at);
+        assert_eq!(peers(&b)[0].seen, ps[0].seen);
         // Before `seen`: the file's own date.
         let old: Vec<&str> = line.split(' ').collect();
-        let old = [&old[..3], &old[4..]].concat().join(" ");
+        let old = [&old[..3], &old[5..]].concat().join(" ");
         fs::write(net(&b).join("peers"), old).unwrap();
         assert_eq!(peers(&b)[0].seen, None);
         assert!(unseen(&b).is_empty());
@@ -859,7 +921,7 @@ mod tests {
                 fs::File::create(crate::versions(side).join(n)).unwrap();
             }
         }
-        let go = swap_once(&a, &b, "b", "a");
+        let go = swap_once(&a, &b, "b", "a", ALPN);
         let took = timeout(Duration::from_secs(120), go).await;
         assert_eq!(took.expect("the lists never crossed"), (0, 0));
     }
@@ -876,11 +938,15 @@ mod tests {
         fs::write(crate::versions(&a).join("stray"), b"editor backup").unwrap();
         // a listens: whoever it dials learns its lane, to wake it there.
         set_mailbox(&a, SecretKey::from_bytes(&[3; 32]).public()).unwrap();
+        // An older peer, on pasa/6, still syncs; then nothing differs.
         // From b: y, and b said in the store as it opened (`DEVICES`).
-        assert_eq!(swap_once(&a, &b, "b", "a").await, (2, 1));
+        assert_eq!(swap_once(&a, &b, "b", "a", ALPN6).await, (2, 1));
+        assert_eq!(swap_once(&a, &b, "b", "a", ALPN).await, (0, 0));
         let at = peers(&b).into_iter().find(|p| p.name == "a").unwrap().lane;
         assert!(at.is_some_and(|l| l.secret == lane(&a).unwrap()));
-        swap_once(&a, &c, "c", "a").await;
+        let at = peers(&a).into_iter().find(|p| p.name == "b").unwrap().at;
+        assert!(!at.is_empty(), "a dials b direct next time");
+        swap_once(&a, &c, "c", "a", ALPN).await;
         let names = |d: &Path| {
             let s = Store::open(d, b"pw", None).unwrap();
             s.entries().unwrap().into_keys().collect::<Vec<_>>()
@@ -892,7 +958,7 @@ mod tests {
         let b_psk = peers(&b)[0].psk;
         assert!(peers(&a).iter().all(|p| p.psk != b_psk), "b is refused");
         sa.put("z", b"3").unwrap();
-        swap_once(&a, &c, "c", "a").await;
+        swap_once(&a, &c, "c", "a", ALPN).await;
         assert_eq!(names(&c), ["x", "y"], "z only once paired again");
         pair(&a, "a", &c, "c");
         assert!(c.join("key.old").exists(), "the key file it had");
