@@ -58,6 +58,8 @@ class MainActivity : ComponentActivity(), Host {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         if (android.os.Build.VERSION.SDK_INT >= 31) window.setHideOverlayWindows(true)
         stored = File(dir, "key").exists()
+        // What this phone calls itself to the store's other devices.
+        runCatching { File(dir, "net/name").takeIf { !it.exists() }?.run { parentFile?.mkdirs(); writeText(android.os.Build.MODEL) } }
         // Opened from Devices to join another device's store.
         getSharedPreferences("pasa", 0).run {
             nav.joining = !stored && getBoolean("join", false)

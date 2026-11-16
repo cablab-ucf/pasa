@@ -6,6 +6,7 @@ use data_encoding::HEXLOWER;
 use irnet::psk::{Rx, Tx};
 use iroh::{EndpointAddr, PublicKey, RelayUrl, SecretKey, TransportAddr};
 use pushir::Lane;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::{collections::HashSet, fs, sync::Arc, time::Duration};
 use tokio::time::timeout;
@@ -135,6 +136,108 @@ pub fn forget(dir: &Path, name: &str) -> Result<()> {
 pub fn revoke(s: &mut Store, name: &str) -> Result<()> {
     forget(&s.dir, name)?;
     s.rotate()
+}
+
+/// Each device of a store says itself there: `.pasa/devices/ENDPOINT`, its
+/// name. Versions, so they reach every device as any version does (an
+/// older pasa carries them unread).
+const DEVICES: &str = ".pasa/devices/";
+
+/// The secret two devices introduced through their store pair with: from
+/// [`Store::intro`]'s for a store key, and both endpoints.
+fn introduced(intro: &[u8; 32], a: &PublicKey, b: &PublicKey) -> [u8; 32] {
+    let (lo, hi) = if a.as_bytes() < b.as_bytes() { (a, b) } else { (b, a) };
+    let h = Sha256::new().chain_update(intro).chain_update(lo.as_bytes());
+    h.chain_update(hi.as_bytes()).finalize().into()
+}
+
+/// A name as `peers` holds it: no space or slash, 32 characters at most.
+fn clean(n: &str) -> String {
+    let dash = |c: char| if c.is_whitespace() || c == '/' { '-' } else { c };
+    n.trim().chars().map(dash).take(32).collect()
+}
+
+/// What this device calls itself to the others: `net/name` (an app's
+/// choice, such as a phone's model), else the host's name.
+fn own_name(dir: &Path, me: &PublicKey) -> String {
+    #[cfg(unix)]
+    let host = rustix::system::uname().nodename().to_str().ok().map(clean);
+    #[cfg(not(unix))]
+    let host = std::env::var("COMPUTERNAME").ok().map(|n| clean(&n));
+    let set = fs::read_to_string(net(dir).join("name")).ok().map(|n| clean(&n));
+    match set.filter(|n| !n.is_empty()).or(host).as_deref() {
+        None | Some("" | "localhost") => {
+            format!("device-{}", &me.to_string()[..8])
+        }
+        Some(n) => n.into(),
+    }
+}
+
+/// This device said in the store, and each device the store says paired
+/// with this one under its newest key: every device syncs with all, not
+/// only with the one it paired with. One the store no longer says (revoked,
+/// or on a retired key until paired again) goes; one paired directly stays
+/// as it was. Sync off: nothing.
+pub fn introduce(s: &Store) -> Result<()> {
+    if !on(&s.dir) {
+        return Ok(());
+    }
+    let me = key(&s.dir, "node")?.public();
+    let mine = format!("{DEVICES}{me}");
+    let said = s.hidden(DEVICES)?;
+    let name = own_name(&s.dir, &me);
+    if !said.iter().any(|(n, b)| *n == mine && b[..] == *name.as_bytes()) {
+        s.put(&mine, name.as_bytes())?;
+    }
+    let intro = s.intro();
+    let newest = intro.first().context("no store key")?;
+    let ours = |p: &Peer| {
+        let of = |id| intro.iter().any(|k| introduced(k, &me, id) == p.psk);
+        p.id.as_ref().is_some_and(of)
+    };
+    let told: Vec<(PublicKey, String)> = said
+        .iter()
+        .filter_map(|(n, b)| {
+            let id: PublicKey = n.strip_prefix(DEVICES)?.parse().ok()?;
+            let name = clean(std::str::from_utf8(b).ok()?);
+            (id != me && !name.is_empty()).then_some((id, name))
+        })
+        .collect();
+    let mut ps = peers(&s.dir);
+    let direct: HashSet<PublicKey> =
+        ps.iter().filter(|p| !ours(p)).filter_map(|p| p.id).collect();
+    let n = ps.len();
+    let says = |id: &PublicKey| told.iter().any(|t| t.0 == *id);
+    ps.retain(|p| {
+        let id = p.id.as_ref();
+        !ours(p) || id.is_some_and(|id| !direct.contains(id) && says(id))
+    });
+    let mut changed = ps.len() != n;
+    for (id, name) in told.iter().filter(|t| !direct.contains(&t.0)) {
+        let psk = introduced(newest, &me, id);
+        match ps.iter_mut().find(|p| p.id == Some(*id)) {
+            Some(p) if p.psk == psk => {}
+            // A new store key: the pairing it gives.
+            Some(p) => {
+                p.psk = psk;
+                changed = true;
+            }
+            None => {
+                let taken = |n: &str| ps.iter().any(|p| p.name == n);
+                let name = match taken(name) {
+                    false => name.clone(),
+                    true => format!("{name}-{}", &id.to_string()[..8]),
+                };
+                let id = Some(*id);
+                ps.push(Peer { name, psk, id, lane: None, seen: None });
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save(&s.dir, &ps)?;
+    }
+    Ok(())
 }
 
 fn key(dir: &Path, file: &str) -> Result<SecretKey> {
@@ -569,6 +672,51 @@ mod tests {
         })
     }
 
+    /// b and c, each paired with a alone, meet through the store: each
+    /// lists the other and they sync directly. Revoked, c drops out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn devices_paired_apart_sync_with_each_other() {
+        let d = crate::tests::dir("introduce");
+        let (a, b, c) = (d.join("a"), d.join("b"), d.join("c"));
+        const PW: &[u8] = b"pw";
+        drop(Store::create(&a, PW, None).unwrap());
+        pair(&a, "a", &b, "b");
+        pair(&a, "a", &c, "c");
+        for (d, n) in [(&a, "desk"), (&b, "laptop"), (&c, "phone")] {
+            write(&net(d).join("name"), n.as_bytes()).unwrap();
+        }
+        let direct = peers(&b)[0].psk;
+        // Each says itself as it opens; a carries what each said.
+        let open = |d: &Path| drop(Store::open(d, PW, None).unwrap());
+        for d in [&a, &b, &c] {
+            open(d);
+        }
+        swap_once(&b, &a, "a", "b").await;
+        swap_once(&c, &a, "a", "c").await;
+        swap_once(&b, &a, "a", "b").await;
+        open(&b);
+        open(&c);
+        let of = |d: &Path, n: &str| peers(d).into_iter().find(|p| p.name == n);
+        let (bc, cb) = (of(&b, "phone").unwrap(), of(&c, "laptop").unwrap());
+        assert_eq!(bc.psk, cb.psk, "one pairing, from both sides");
+        assert_eq!(peers(&b).len(), 2, "a, paired directly, and c");
+        assert_eq!(of(&b, "a").unwrap().psk, direct, "a direct pair stays");
+        Store::open(&b, PW, None).unwrap().put("from b", b"1").unwrap();
+        assert_eq!(swap_once(&c, &b, "laptop", "phone").await, (1, 0));
+        // Opened again: nothing changes, nothing written.
+        let at = fs::read(net(&b).join("peers")).unwrap();
+        open(&b);
+        assert_eq!(fs::read(net(&b).join("peers")).unwrap(), at);
+        // a revokes c; b, paired again from a, has the new key: c is gone.
+        revoke(&mut Store::open(&a, PW, None).unwrap(), "c").unwrap();
+        pair(&a, "a", &b, "b");
+        open(&b);
+        assert!(
+            of(&b, "phone").is_none(),
+            "revoked: not said under the new key"
+        );
+    }
+
     /// Pairing and sync open nothing; afterwards the password opens what came.
     #[tokio::test(flavor = "multi_thread")]
     async fn pair_then_sync_then_unlock() {
@@ -728,7 +876,8 @@ mod tests {
         fs::write(crate::versions(&a).join("stray"), b"editor backup").unwrap();
         // a listens: whoever it dials learns its lane, to wake it there.
         set_mailbox(&a, SecretKey::from_bytes(&[3; 32]).public()).unwrap();
-        assert_eq!(swap_once(&a, &b, "b", "a").await, (1, 1));
+        // From b: y, and b said in the store as it opened (`DEVICES`).
+        assert_eq!(swap_once(&a, &b, "b", "a").await, (2, 1));
         let at = peers(&b).into_iter().find(|p| p.name == "a").unwrap().lane;
         assert!(at.is_some_and(|l| l.secret == lane(&a).unwrap()));
         swap_once(&a, &c, "c", "a").await;

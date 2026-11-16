@@ -133,7 +133,11 @@ replaces stays as `key.old`), syncing the versions; neither asks for or
 sees the password or a hardware key. A QR code's password is shown
 before the code, never beside it. A short code meets once at the
 [pairir](https://github.com/cablab-ucf/pairir) relay (CPace, then
-X-Wing; one try, one minute). A device that holds a store already joins
+X-Wing; one try, one minute). Each device says itself in the store as
+it opens (`.pasa/devices/`, its name: `net/name`, else the host's), so
+every device lists and syncs with every other, not only with the one it
+paired with; their pairing comes from the store's newest key, which a
+revoked device never gets. A device that holds a store already joins
 another beside it, its own untouched: Devices, *Join another device's
 store* (`pasa --dir DIR join`).
 
