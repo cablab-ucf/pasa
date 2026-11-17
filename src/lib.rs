@@ -237,9 +237,14 @@ pub fn challenge(key: &[u8]) -> Option<&[u8]> {
 fn kek(pw: &[u8], salt: &[u8], yk: Option<&[u8]>) -> Result<Secret> {
     let e = anyhow::Error::msg;
     let p = Params::new(KDF.0, KDF.1, 1, Some(32)).map_err(e)?;
+    let mut memory = Zeroizing::new(Vec::new());
+    memory.try_reserve_exact(p.block_count())?;
+    memory.resize(p.block_count(), argon2::Block::default());
     let a = Argon2::new_with_secret(yk.unwrap_or(&[]), Argon2id, V0x13, p);
     let mut k = Zeroizing::new(vec![0; 32]);
-    a.map_err(e)?.hash_password_into(pw, salt, &mut k).map_err(e)?;
+    a.map_err(e)?
+        .hash_password_into_with_memory(pw, salt, &mut k, &mut *memory)
+        .map_err(e)?;
     Ok(k)
 }
 
@@ -2506,6 +2511,27 @@ mod tests {
         let odd = |f: Form| f.problem().is_some();
         assert!(odd(Form { otp: "JBSWY3DP".into(), ..Form::default() }));
         assert!(odd(Form { expires: "soon".into(), ..Form::default() }));
+    }
+
+    #[test]
+    fn unlock_key_matches_argon2() {
+        let salt = [3; 32];
+        for device in [None, Some(&b"hardware"[..])] {
+            let params = Params::new(KDF.0, KDF.1, 1, Some(32)).unwrap();
+            let kdf = Argon2::new_with_secret(
+                device.unwrap_or_default(),
+                Argon2id,
+                V0x13,
+                params,
+            )
+            .unwrap();
+            let mut expected = [0; 32];
+            kdf.hash_password_into(b"phrase", &salt, &mut expected).unwrap();
+            assert_eq!(
+                kek(b"phrase", &salt, device).unwrap().as_slice(),
+                expected
+            );
+        }
     }
 
     #[test]
