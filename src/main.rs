@@ -123,6 +123,18 @@ fn yubikey(c: &[u8]) -> Result<Secret> {
     Ok(Zeroizing::new(HEXLOWER.decode(o.stdout.trim_ascii())?))
 }
 
+fn output_with_input(
+    command: &mut Command,
+    input: &[u8],
+) -> Result<std::process::Output> {
+    let mut child =
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let written = child.stdin.take().context("child stdin")?.write_all(input);
+    let output = child.wait_with_output()?;
+    written?;
+    Ok(output)
+}
+
 fn key_setup(secret: &[u8]) -> Result<()> {
     let info = Command::new("ykman").args(["otp", "info"]).output();
     let info = info.context("ykman (YubiKey Manager) is needed for this")?;
@@ -132,15 +144,13 @@ fn key_setup(secret: &[u8]) -> Result<()> {
          was written"
     );
     // By stdin: any process can read argv.
-    let mut c = Command::new("ykman")
-        .args(["otp", "chalresp", "--force", "2"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
     let hex = Zeroizing::new(HEXLOWER.encode(secret) + "\n");
-    c.stdin.take().context("ykman")?.write_all(hex.as_bytes())?;
-    let o = c.wait_with_output()?;
+    let o = output_with_input(
+        Command::new("ykman")
+            .args(["otp", "chalresp", "--force", "2"])
+            .stderr(Stdio::piped()),
+        hex.as_bytes(),
+    )?;
     ensure!(
         o.status.success(),
         "ykman: {}",
@@ -492,14 +502,11 @@ fn pick(s: &Store) -> Result<String> {
     let names = s.entries()?.into_keys();
     let names = names.filter(|n| !n.split('/').any(|c| c.starts_with('.')));
     let names: String = names.map(|n| n + "\n").collect();
-    let mut c = Command::new("fzf")
-        .args(["--no-multi", "--prompt", "pasa> "])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("fzf is needed for pick (or pasa tui)")?;
-    c.stdin.take().context("fzf")?.write_all(names.as_bytes())?;
-    let o = c.wait_with_output()?;
+    let o = output_with_input(
+        Command::new("fzf").args(["--no-multi", "--prompt", "pasa> "]),
+        names.as_bytes(),
+    )
+    .context("fzf is needed for pick (or pasa tui)")?;
     let n = String::from_utf8(o.stdout)?.trim_end_matches('\n').to_string();
     ensure!(o.status.success() && !n.is_empty(), "nothing chosen");
     Ok(n)
@@ -611,11 +618,15 @@ fn pwned(pw: &str) -> Result<u64> {
         return pasa::pwned_file(std::path::Path::new(&list), pw);
     }
     let (sent, kept) = pasa::pwned_key(pw);
-    let url = format!("https://api.pwnedpasswords.com/range/{sent}");
-    let o = Command::new("curl")
-        .args(["-sf", "--max-time", "15", "-H", "Add-Padding: true", &url])
-        .output()
-        .context("curl")?;
+    let url = format!("url = https://api.pwnedpasswords.com/range/{sent}\n");
+    let o = output_with_input(
+        Command::new("curl")
+            .args(["-sf", "--max-time", "15", "-H", "Add-Padding: true"])
+            .args(["--config", "-"])
+            .stderr(Stdio::piped()),
+        url.as_bytes(),
+    )
+    .context("curl")?;
     ensure!(o.status.success(), "haveibeenpwned.com did not answer");
     Ok(pasa::pwned_count(&kept, &String::from_utf8_lossy(&o.stdout)))
 }
@@ -629,13 +640,11 @@ fn git(dir: &Path, a: &[&str], input: Option<&[u8]>) -> Option<Vec<u8>> {
     c.arg("-C").arg(&s);
     c.args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]);
     c.args(a).env("GIT_TERMINAL_PROMPT", "0");
-    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
-    c.stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut ch = c.spawn().ok()?;
-    if let (Some(i), Some(mut w)) = (input, ch.stdin.take()) {
-        w.write_all(i).ok()?;
-    }
-    let o = ch.wait_with_output().ok()?;
+    c.stderr(Stdio::null());
+    let o = match input {
+        Some(bytes) => output_with_input(&mut c, bytes).ok()?,
+        None => c.stdin(Stdio::null()).output().ok()?,
+    };
     o.status.success().then_some(o.stdout)
 }
 
