@@ -1337,6 +1337,14 @@ async fn sync(a: &[&str]) -> Result<()> {
                     Zeroizing::new(B64.decode(l.as_bytes())?)
                 }
             };
+            // A store here: joined again from its own devices (after a
+            // revocation), never another over it.
+            ensure!(
+                !dir.join("key").exists() || sync::from_peer(&dir, &got),
+                "{} holds a store, and {name} is none of its devices: join \
+                 beside it (pasa --dir DIR join), its own untouched",
+                dir.display()
+            );
             sync::take(&dir, name, &got)?;
             net_run(&["sync"])?;
             eprintln!("The store is here: its password opens it (pasa ls)");

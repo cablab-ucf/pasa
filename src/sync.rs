@@ -135,11 +135,24 @@ fn add(dir: &Path, p: Peer) -> Result<()> {
     save(dir, &ps)
 }
 
+/// Endpoints forgotten here (`net/forgotten`, one a line): never
+/// introduced again, only paired directly.
+fn forgotten(dir: &Path) -> HashSet<PublicKey> {
+    let f = fs::read_to_string(net(dir).join("forgotten")).unwrap_or_default();
+    f.lines().filter_map(|l| l.parse().ok()).collect()
+}
+
 pub fn forget(dir: &Path, name: &str) -> Result<()> {
     let mut ps = peers(dir);
-    let n = ps.len();
+    let id = ps.iter().find(|p| p.name == name).map(|p| p.id);
+    ensure!(id.is_some(), "no peer {name}");
+    // First: the store still says it, and would introduce it again.
+    if let Some(id) = id.flatten().filter(|id| !forgotten(dir).contains(id)) {
+        let at = net(dir).join("forgotten");
+        let old = fs::read_to_string(&at).unwrap_or_default();
+        write(&at, format!("{old}{id}\n").as_bytes())?;
+    }
     ps.retain(|p| p.name != name);
-    ensure!(ps.len() < n, "no peer {name}");
     save(dir, &ps)?;
     // It knew our lane's secret: a new one, which the rest get at next sync.
     let at = fs::read_to_string(net(dir).join("mailbox")).ok();
@@ -202,6 +215,7 @@ pub fn introduce(s: &Store) -> Result<()> {
         return Ok(());
     }
     let me = key(&s.dir, "node")?.public();
+    let gone = forgotten(&s.dir);
     let mine = format!("{DEVICES}{me}");
     let said = s.hidden(DEVICES)?;
     let name = own_name(&s.dir, &me);
@@ -219,7 +233,8 @@ pub fn introduce(s: &Store) -> Result<()> {
         .filter_map(|(n, b)| {
             let id: PublicKey = n.strip_prefix(DEVICES)?.parse().ok()?;
             let name = clean(std::str::from_utf8(b).ok()?);
-            (id != me && !name.is_empty()).then_some((id, name))
+            let new = id != me && !gone.contains(&id) && !name.is_empty();
+            new.then_some((id, name))
         })
         .collect();
     let mut ps = peers(&s.dir);
@@ -385,12 +400,33 @@ fn learnt(
     let _ = save(dir, &ps);
 }
 
+fn origin(u: &RelayUrl) -> (&str, Option<&str>, Option<u16>) {
+    let host = u.host_str().map(|h| h.trim_end_matches('.'));
+    (u.scheme(), host, u.port_or_known_default())
+}
+
+/// Whether a peer's lane is on a relay of ours ([`irnet::relays`],
+/// `PASA_RELAY`, `PUSHIR_RELAY`): a paired device never has this one dial
+/// a host of its choosing.
+fn our_relay(r: &RelayUrl) -> bool {
+    let mut all = irnet::relays();
+    all.extend(relay().ok().into_iter().chain(pushir::relay().ok()));
+    all.iter().any(|a| origin(a) == origin(r))
+}
+
 async fn wake(dir: &Path, except: &str) {
     let mut by: std::collections::BTreeMap<String, Vec<Lane>> =
         Default::default();
     for p in peers(dir).into_iter().filter(|p| p.name != except) {
-        if let Some(l) = p.lane {
-            by.entry(l.relay.to_string()).or_default().push(l);
+        match p.lane {
+            Some(l) if our_relay(&l.relay) => {
+                by.entry(l.relay.to_string()).or_default().push(l)
+            }
+            Some(l) => eprintln!(
+                "{}: not woken: its lane is on {}, none of our relays",
+                p.name, l.relay
+            ),
+            None => {}
         }
     }
     let mut all = tokio::task::JoinSet::new();
@@ -608,6 +644,14 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
 
 const KEYS: &[u8] = b"pasakeys";
 
+/// Whether `got`, an [`offer`], comes from a device this store syncs with:
+/// a store joined again (after a revocation), not another over it.
+pub fn from_peer(dir: &Path, got: &[u8]) -> bool {
+    let id = got.get(..32).and_then(|b| b.try_into().ok());
+    let id = id.and_then(|b| PublicKey::from_bytes(b).ok());
+    id.is_some_and(|id| peers(dir).iter().any(|p| p.id == Some(id)))
+}
+
 pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     named(name)?;
     let bad = || anyhow!("not a pasa pairing");
@@ -774,6 +818,11 @@ mod tests {
         let at = fs::read(net(&b).join("peers")).unwrap();
         open(&b);
         assert_eq!(fs::read(net(&b).join("peers")).unwrap(), at);
+        // Forgotten, introduced or paired directly, a device stays so.
+        forget(&b, "phone").unwrap();
+        forget(&b, "a").unwrap();
+        open(&b);
+        assert!(peers(&b).is_empty(), "introduced again");
         // a revokes c; b, paired again from a, has the new key: c is gone.
         revoke(&mut Store::open(&a, PW, None).unwrap(), "c").unwrap();
         pair(&a, "a", &b, "b");
@@ -887,6 +936,23 @@ mod tests {
     }
 
     #[test]
+    fn lanes_are_woken_on_our_relays_alone() {
+        for r in irnet::relays() {
+            assert!(our_relay(&r));
+            let bare = r.to_string().replace("center./", "center/");
+            assert!(our_relay(&bare.parse().unwrap()), "{bare}");
+        }
+        for r in [
+            "https://evil.example./",
+            "http://irpush.cxn.center./",
+            "https://irpush.cxn.center:8443/",
+            "https://192.168.1.1/",
+        ] {
+            assert!(!our_relay(&r.parse().unwrap()), "{r}");
+        }
+    }
+
+    #[test]
     fn a_device_says_no_control_character() {
         assert_eq!(clean(" my phone/\x1b]0;x\x07\t1 "), "my-phone-]0;x-1");
     }
@@ -982,6 +1048,11 @@ mod tests {
         sa.put("z", b"3").unwrap();
         swap_once(&a, &c, "c", "a", ALPN).await;
         assert_eq!(names(&c), ["x", "y"], "z only once paired again");
+        // Joined again from a peer; never another store over this one.
+        let x = d.join("x");
+        Store::create(&x, b"pw", None).unwrap();
+        assert!(!from_peer(&c, &offer(&x, "c").unwrap()));
+        assert!(from_peer(&c, &offer(&a, "c").unwrap()));
         pair(&a, "a", &c, "c");
         assert!(c.join("key.old").exists(), "the key file it had");
         assert_eq!(names(&c), ["x", "y", "z"]);
