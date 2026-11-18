@@ -42,6 +42,7 @@ object Native {
     external fun forget(dir: String, name: String)
     external fun revoke(h: Long, name: String)
     external fun pair(h: Long, name: String, qrPw: String?): String
+    external fun qrPassword(): String
     external fun serve(dir: String, on: Boolean)
     external fun join(dir: String, name: String, code: String, pw: String): String
     external fun sync(dir: String, news: Boolean): String

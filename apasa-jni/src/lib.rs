@@ -633,6 +633,14 @@ pub extern "system" fn Java_com_apasa_Native_pair<'l>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_qrPassword<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| Ok(e.new_string(sync::password())?))
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_serve<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,

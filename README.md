@@ -98,16 +98,17 @@ weakest:
 
 - **Password**, by Argon2id (256 MiB, 4 passes); with `-y`, a YubiKey's
   slot 2 HMAC-SHA1 answer is Argon2id's secret and both are needed
-  (`ykman otp chalresp 2 SECRET` on two keys for a spare).
+  (`ykman otp chalresp --touch 2 SECRET` on two keys for a spare).
 - **Security key** (`pasa ctap`): any FIDO2 key's `hmac-secret`, salted
   in WebAuthn's PRF form as the phone asks it, over USB or an NFC reader
   (PC/SC). No server, account or network; on macOS no Input Monitoring.
   The key agreement on the wire (P-256, AWS-LC) is not post-quantum, and
   what it carries opens nothing without the device's files.
-- **Quick unlock** (`pasa quick`): a YubiKey's slot 2 and a PIN. With the
-  device's files a PIN falls in days, so the password must be long. On a
-  Mac without an NFC reader slot 2 needs `ykman` and Input Monitoring:
-  use `ctap` there.
+- **Quick unlock** (`pasa quick`): a YubiKey's slot 2 and a PIN. The PIN
+  only slows down someone who also holds the key: with it and the
+  device's files a PIN falls in days, so the password must be long.
+  Pairing leaves it on its device. On a Mac without an NFC reader slot
+  2 needs `ykman` and Input Monitoring: use `ctap` there.
 
 `passwd` changes this device's password and drops `quick` and `ctap`.
 The Android build fails if its key code could reach the network
@@ -128,7 +129,7 @@ Off, pasa opens no connection: no serving, listening, wakes or git
 push. Check in about monthly; each device names the peers it has not
 met for a month.
 
-Pairing hands over the sealed key files (`key`, `quick`, `ctap`; one it
+Pairing hands over the sealed key files (`key`, `ctap`; one it
 replaces stays as `key.old`), syncing the versions; neither asks for or
 sees the password or a hardware key. A QR code's password is shown
 before the code, never beside it. A short code meets once at the

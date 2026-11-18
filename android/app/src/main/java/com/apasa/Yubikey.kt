@@ -45,7 +45,8 @@ internal fun slot2(s: YubiOtpSession, challenge: ByteArray, enroll: Boolean): By
 suspend fun writeKey(a: Activity, secret: ByteArray): Unit = withKey(a) { s ->
     if (runCatching { s.configurationState.isConfigured(Slot.TWO) }.getOrDefault(true))
         throw InUse()
-    s.putConfiguration(Slot.TWO, HmacSha1SlotConfiguration(secret), null, null)
+    // Touch required: a key left plugged in answers no one unseen.
+    s.putConfiguration(Slot.TWO, HmacSha1SlotConfiguration(secret).requireTouch(true), null, null)
 }
 
 private suspend fun <T> withKey(a: Activity, use: (YubiOtpSession) -> T): T =

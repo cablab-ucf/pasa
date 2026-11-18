@@ -206,6 +206,8 @@ interface Host {
     suspend fun revoke(name: String)
     /** With [qrPw], an offline QR code's text under it; else a short code. */
     suspend fun pair(name: String, qrPw: String?): String
+    /** A QR code's password: 99 random bits. */
+    fun qrPassword(): String
     /** Bumped as syncs bring versions. */
     val news: Int
 }
@@ -586,7 +588,7 @@ private fun Create(host: Host, nav: Nav) {
                 "A new key is set up here when it is first tapped. A spare key gets the same secret right then, or never: have both at hand before you start. Without a spare, the password is the way in if the key is lost.",
                 style = MaterialTheme.typography.bodySmall, color = muted,
             )
-            Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
+            Choice("To unlock quickly", "A tap and a PIN open the store. The PIN only slows down someone who also holds the key; the password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
             if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true, done = create)
             Choice("As a second factor", "Needed together with the password, every time.", key == Key.Both) { key = Key.Both }
             NfcOff(host)
@@ -1223,7 +1225,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             go { pairing = n to host.pair(n, pw); qrPw = null; host.sync = true; on = true; "" }
         }
         // Its password first, never beside the code: a camera on the screen would read both.
-        OutlinedButton({ pairing = null; qrPw = host.generate(Gen(words = true, count = 2, seps = "-")) }, enabled = name.isNotBlank()) { Text("Show a QR code") }
+        OutlinedButton({ pairing = null; qrPw = host.qrPassword() }, enabled = name.isNotBlank()) { Text("Show a QR code") }
         OutlinedButton({ qrPw = null; show(null) }, enabled = name.isNotBlank()) { Text("Show a code to type") }
         qrPw?.let { pw ->
             Field(pw, { qrPw = it }, "QR code password: type one, or keep this")
@@ -1304,7 +1306,7 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     val (busy, _, go) = work
     Text("Quick unlock", style = MaterialTheme.typography.bodyLarge)
     Text(
-        "A tap of your YubiKey and a PIN open the store on this phone. The password still opens it alone: keep it long.",
+        "A tap of your YubiKey and a PIN open the store on this phone. The PIN only slows down someone who also holds the key, and the password still opens it alone: keep it long.",
         style = MaterialTheme.typography.bodySmall, color = muted,
     )
     when (val q = host.quick) {

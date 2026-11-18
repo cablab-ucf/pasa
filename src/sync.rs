@@ -569,10 +569,10 @@ pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
 pub const EVERY: Duration = Duration::from_secs(5);
 
 /// Wire: endpoint key (32), psk (32), then the key file bare, or with hardware
-/// keys KEYS and the key, quick and ctap files framed.
+/// keys KEYS and the key, quick and ctap files framed. Quick goes empty: with
+/// its YubiKey's answer its PIN falls offline, so it stays on its device.
 pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
     let f = fs::read(dir.join("key")).context("no store here")?;
-    let quick = fs::read(dir.join("quick")).unwrap_or_default();
     let ctap = fs::read_to_string(dir.join("ctap")).ok();
     let ctap = ctap.and_then(|t| crate::ctap_packed(&t)).unwrap_or_default();
     let (psk, id) = (rand::<32>(), key(dir, "node")?.public());
@@ -588,15 +588,15 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
         },
     )?;
     set_on(dir, true)?;
-    let n = 64 + KEYS.len() + 12 + f.len() + quick.len() + ctap.len();
+    let n = 64 + KEYS.len() + 12 + f.len() + ctap.len();
     let mut out = Zeroizing::new(Vec::with_capacity(n));
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&psk);
-    match quick.is_empty() && ctap.is_empty() {
+    match ctap.is_empty() {
         true => out.extend(&f),
         false => {
             out.extend(KEYS);
-            for b in [&f, &quick, &ctap] {
+            for b in [&f[..], &[], &ctap] {
                 crate::frame(&mut out, b);
             }
         }
@@ -661,6 +661,9 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     )?;
     set_on(dir, true)
 }
+
+/// A QR code's password: 99 random bits.
+pub use pairir::password;
 
 pub async fn qr(got: &[u8], pw: &str) -> Result<String> {
     pairir::seal_qr("pasa", got, pw).await
@@ -848,20 +851,24 @@ mod tests {
         other.quick_on(b"", &c, &yk).unwrap();
         let old = fs::read(desk.join("key")).unwrap();
         drop(other);
+        let quick = fs::read(phone.join("quick")).unwrap();
         let got = offer(&phone, "desk").unwrap();
+        assert!(!got.windows(quick.len()).any(|w| w == quick), "quick sent");
         let text = fs::read_to_string(phone.join("ctap")).unwrap();
         let packed = crate::ctap_packed(&text).unwrap();
         assert!(packed.len() < text.len() * 6 / 10, "ctap packed");
         let got = unqr(&qr(&got, "ab").await.unwrap(), "ab").await.unwrap();
         take(&desk, "phone", &got).unwrap();
-        for f in ["key", "quick", "ctap"] {
+        for f in ["key", "ctap"] {
             assert_eq!(
                 fs::read(desk.join(f)).unwrap(),
                 fs::read(phone.join(f)).unwrap()
             );
         }
         assert_eq!(fs::read(desk.join("key.old")).unwrap(), old);
-        Store::open_quick(&desk, b"2468", &yk).unwrap();
+        // Quick unlock stays on its device; desk's own held the old key.
+        assert!(!desk.join("quick").exists());
+        Store::open_quick(&phone, b"2468", &yk).unwrap();
         Store::open_fido(&desk, &[3; 64], &one).unwrap();
         Store::open_fido(&desk, &[4; 64], &two).unwrap();
         let lap = d.join("lap");

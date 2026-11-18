@@ -843,7 +843,8 @@ impl App {
                 ui.radio_value(&mut self.quick, true, "To unlock quickly");
                 small(
                     ui,
-                    "A tap and a PIN open the store. The password still opens \
+                    "A tap and a PIN open the store. The PIN only slows down \
+                     someone who also holds the key; the password still opens \
                      it alone if the key is lost.",
                     l.muted,
                 );
@@ -2258,7 +2259,7 @@ impl App {
         let (name, ok) =
             (self.device.trim().to_string(), !self.device.trim().is_empty());
         if let Some(qr) = self.shows(ui, ok) {
-            let pw = qr.then(|| Zeroizing::new(pasa::speakable(2, "-", false)));
+            let pw = qr.then(|| Zeroizing::new(sync::password()));
             let (code, img, end, state) = Default::default();
             self.pairing = Some(Pairing { name, pw, code, img, end, state });
             if !qr && let Err(e) = self.show_code(ui.ctx()) {
@@ -2596,8 +2597,9 @@ impl App {
         ui.separator();
         ui.label(RichText::new("Quick unlock").strong());
         let how = "A tap of your YubiKey and a PIN open the store on this \
-                   machine, by its slot 2 (ykman). The password still opens \
-                   it alone: keep it long.";
+                   machine, by its slot 2 (ykman). The PIN only slows down \
+                   someone who also holds the key, and the password still \
+                   opens it alone: keep it long.";
         #[cfg(target_os = "macos")]
         let how = format!(
             "{how} On a Mac ykman reads slot 2 through the key's keyboard \

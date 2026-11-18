@@ -420,5 +420,6 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
     override suspend fun revoke(name: String) = changed { Native.revoke(handle, name) }
     override suspend fun pair(name: String, qrPw: String?) = io { Native.pair(handle, name, qrPw) }
+    override fun qrPassword() = Native.qrPassword()
 
 }

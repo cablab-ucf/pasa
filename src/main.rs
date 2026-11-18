@@ -72,13 +72,14 @@ pasa ctap | ctap off         let the security key plugged in (or held to an NFC 
 pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
                              spare with the same secret, now or never: have both at hand
 pasa quick [-n] | quick off  open here by a YubiKey (touched, or held to an NFC reader)
-                             and a PIN (-n: no PIN); the password still opens it alone,
-                             so make it long. A key on a reader: held there first
+                             and a PIN (-n: no PIN). The PIN only slows down someone who
+                             also holds the key, and the password still opens it alone:
+                             make it long. A key on a reader: held there first
 pasa keys                    the store keys: age -d takes them as passphrases
-pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys' too), to
-                             a new device called NAME here: a code to type, or a QR code
-                             (offline) after its password; serve until it has synced. No
-                             store password asked
+pasa pair NAME [--qr]        hand the key files, as they are (security keys' too; quick
+                             unlock stays here), to a new device called NAME here: a code
+                             to type, or a QR code (offline) after its password; serve
+                             until it has synced. No store password asked
 pasa join NAME CODE|-|--scan take the code device NAME shows (a QR code: its password
                              too; -: the code on stdin, off argv; --scan: by the camera,
                              in this program), then sync. The
@@ -148,7 +149,7 @@ fn key_setup(secret: &[u8]) -> Result<()> {
     let hex = Zeroizing::new(HEXLOWER.encode(secret) + "\n");
     let o = output_with_input(
         Command::new("ykman")
-            .args(["otp", "chalresp", "--force", "2"])
+            .args(["otp", "chalresp", "--force", "--touch", "2"])
             .stderr(Stdio::piped()),
         hex.as_bytes(),
     )?;
@@ -847,6 +848,17 @@ fn main() -> Result<()> {
         ["link", d] => {
             let (mut s, d) = (open()?, pasa::path(d));
             let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+            // Linked, it opens with this store: never its YubiKey unasked.
+            if challenge(&k).is_some() {
+                eprint!(
+                    "{} asks for its YubiKey too; linked, it opens with this \
+                     store's unlock alone, without the key. Link it? [y/N] ",
+                    d.display()
+                );
+                let mut yes = String::new();
+                std::io::stdin().read_line(&mut yes)?;
+                ensure!(yes.trim().eq_ignore_ascii_case("y"), "not linked");
+            }
             let pw = ask(&format!("{}'s password: ", d.display()))?;
             let yk = challenge(&k).map(yubikey).transpose()?;
             let g = Store::open(&d, &pw, yk.as_deref().map(|v| &v[..]))?;
@@ -1205,7 +1217,7 @@ fn qr_password(name: &str) -> Result<Secret> {
     if !pw.is_empty() {
         return Ok(pw);
     }
-    let pw = pasa::speakable(2, "-", false);
+    let pw = pasa::sync::password();
     eprint!(
         "Its password: {pw}\nType it on {name} after scanning. Enter: the QR code "
     );
