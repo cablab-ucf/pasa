@@ -762,8 +762,12 @@ impl App {
                 let got = match code.starts_with("PAIRIR1:") {
                     true => self.rt()?.block_on(sync::unqr(&code, &pw))?,
                     false => {
-                        let mut c = crate::net(&["take", &code])?;
+                        let mut c = crate::net(&["take"])?;
+                        let mut i = c.stdin.take().context("stdin")?;
+                        let line = format!("{code}\n");
+                        std::io::Write::write_all(&mut i, line.as_bytes())?;
                         let l = crate::lines(&mut c).next();
+                        drop(i);
                         let l =
                             l.context("no answer: is the code still shown?")?;
                         Zeroizing::new(crate::B64.decode(l.as_bytes())?)

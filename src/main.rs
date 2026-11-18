@@ -79,8 +79,9 @@ pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys'
                              a new device called NAME here: a code to type, or a QR code
                              (offline) after its password; serve until it has synced. No
                              store password asked
-pasa join NAME CODE|--scan   take the code device NAME shows (a QR code: its password
-                             too; --scan: by the camera, in this program), then sync. The
+pasa join NAME CODE|-|--scan take the code device NAME shows (a QR code: its password
+                             too; -: the code on stdin, off argv; --scan: by the camera,
+                             in this program), then sync. The
                              store's password opens it afterwards
 pasa sync on | off           sync with the paired devices, or stay offline: off until turned
                              on (pairing does). A month apart, each device says so
@@ -1129,7 +1130,8 @@ fn net_side(a: &[&str]) -> Result<()> {
         Err(e) => eprintln!("pasa: the network side is not confined: {e:#}"),
     }
     let mut got = String::new();
-    if a == ["give"] {
+    // A secret or a code by stdin: any process can read argv.
+    if a == ["give"] || a == ["take"] {
         std::io::stdin().read_line(&mut got)?;
     }
     std::thread::spawn(|| {
@@ -1191,7 +1193,7 @@ async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
                 }
             );
         }
-        ["take", code] => println!("{}", B64.encode(&sync::fetch(code).await?)),
+        ["take"] => println!("{}", B64.encode(&sync::fetch(got).await?)),
         _ => bail!("{USAGE}"),
     }
     Ok(())
@@ -1260,6 +1262,12 @@ async fn sync(a: &[&str]) -> Result<()> {
                     eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
                     crate::scan::scan()?
                 }
+                // Off argv, which any process can read.
+                "-" => {
+                    let mut l = String::new();
+                    std::io::stdin().read_line(&mut l)?;
+                    l
+                }
                 c => c.to_string(),
             };
             let code = scanned.trim();
@@ -1269,8 +1277,11 @@ async fn sync(a: &[&str]) -> Result<()> {
                     sync::unqr(code, text(&pw)?).await?
                 }
                 false => {
-                    let mut c = net(&["take", code])?;
+                    let mut c = net(&["take"])?;
+                    let mut i = c.stdin.take().context("stdin")?;
+                    writeln!(i, "{code}")?;
                     let l = lines(&mut c).next().context("no answer")?;
+                    drop(i);
                     Zeroizing::new(B64.decode(l.as_bytes())?)
                 }
             };

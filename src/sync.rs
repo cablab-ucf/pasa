@@ -204,7 +204,7 @@ pub fn introduce(s: &Store) -> Result<()> {
     let said = s.hidden(DEVICES)?;
     let name = own_name(&s.dir, &me);
     if !said.iter().any(|(n, b)| *n == mine && b[..] == *name.as_bytes()) {
-        s.put(&mine, name.as_bytes())?;
+        s.put_on(&mine, name.as_bytes(), None)?;
     }
     let intro = s.intro();
     let newest = intro.first().context("no store key")?;
@@ -624,8 +624,16 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     let id = Some(PublicKey::from_bytes(id.try_into()?)?);
     let at = dir.join("key");
     let new = match fs::read(&at) {
+        // Every key file it had kept: a second join never loses the first's.
         Ok(old) if old != f => {
-            write(&dir.join("key.old"), &old).map(|_| true)?
+            let mut to = dir.join("key.old");
+            for n in 1.. {
+                if fs::read(&to).map_or(true, |b| b == old) {
+                    break;
+                }
+                to = dir.join(format!("key.old.{n}"));
+            }
+            write(&to, &old).map(|_| true)?
         }
         old => old.is_err(),
     };
