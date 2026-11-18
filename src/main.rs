@@ -993,6 +993,11 @@ fn main() -> Result<()> {
             }
             // Oldest first, so each version's parent is the one before.
             all.sort_by_key(|e| e.0);
+            // Each checked before any is written: all of it lands or none,
+            // and never in a linked store.
+            for (at, p, b) in &all {
+                pasa::importable(p, b.len(), at.saturating_mul(1000))?;
+            }
             for (at, p, b) in all {
                 match at {
                     0 => s.put(&p, &b)?,

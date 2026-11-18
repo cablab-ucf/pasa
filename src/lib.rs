@@ -1808,6 +1808,20 @@ pub fn totp(uri: &str, t: u64) -> Option<String> {
     })
 }
 
+/// What an import may write, each checked before any is written: never a
+/// linked store's name (`@LABEL/`) nor the store's own; `at` (ms, 0: now)
+/// not ahead.
+pub fn importable(name: &str, len: usize, at: u64) -> Result<()> {
+    ensure!(!name.starts_with('@'), "{name:?}: a linked store's name (@)");
+    own(name)?;
+    ensure!(
+        fits(name, len),
+        "{name:?}: empty, a line break, over 255 bytes, or over {MAX} bytes"
+    );
+    ensure!(at <= ahead(), "{name:?}: dated ahead of now");
+    Ok(())
+}
+
 /// A name `dump` can write as a relative path.
 pub fn path_safe(name: &str) -> Result<()> {
     let bad = name.starts_with('/')
@@ -2354,6 +2368,18 @@ mod tests {
         }
         assert!(t.conflicts().unwrap().is_empty());
         assert_eq!(t.times("mail").unwrap().unwrap().0, day);
+        importable("mail/work", 10, day).unwrap();
+        importable("mail@work", 10, 0).unwrap();
+        for (n, len, at) in [
+            ("@group/mail", 10, 0),
+            (".pasa/history", 10, 0),
+            ("a\nb", 10, 0),
+            ("", 10, 0),
+            ("mail", MAX, 0),
+            ("mail", 10, u64::MAX),
+        ] {
+            assert!(importable(n, len, at).is_err(), "{n:?}");
+        }
     }
 
     #[test]
