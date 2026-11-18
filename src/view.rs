@@ -3,9 +3,15 @@
 use crate::{aside_in, clip, record_in, text};
 use anyhow::{Context, Result, ensure};
 use pasa::{Secret, Store, field};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub const IDLE: Duration = Duration::from_secs(300);
+
+/// Left alone longer than `idle` since `used`, by the wall clock: a machine
+/// asleep counts, and so does a clock set back.
+pub fn idle_since(used: SystemTime, idle: Duration) -> bool {
+    used.elapsed().map_or(true, |e| e > idle)
+}
 
 pub struct View {
     pub s: Store,
@@ -119,5 +125,18 @@ fn news(s: &Store) {
     for d in s.dirs() {
         record_in(d);
         aside_in(d, true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_counts_sleep_and_a_clock_set_back() {
+        let now = SystemTime::now();
+        assert!(!idle_since(now, IDLE));
+        assert!(idle_since(now - IDLE - Duration::from_secs(1), IDLE));
+        assert!(idle_since(now + Duration::from_secs(60), IDLE), "set back");
     }
 }

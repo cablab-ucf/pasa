@@ -518,8 +518,34 @@ fn text(b: &[u8]) -> Result<&str> {
     std::str::from_utf8(b).context("not text")
 }
 
-/// Clipboard tools: (copy, paste).
-const CLIPS: [(&[&str], &[&str]); 3] = [
+/// `s` for a terminal: control characters escaped (none sets its title or
+/// redraws its screen), line breaks and tabs kept; piped, as it is.
+fn tame(s: &str, tty: bool) -> std::borrow::Cow<'_, str> {
+    let wild = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !tty || !s.contains(wild) {
+        return s.into();
+    }
+    let esc = |c: char| match wild(c) {
+        true => c.escape_default().to_string(),
+        false => c.to_string(),
+    };
+    s.chars().map(esc).collect::<String>().into()
+}
+
+/// [`tame`] for stdout.
+fn tty_out(s: &str) -> std::borrow::Cow<'_, str> {
+    tame(s, std::io::stdout().is_terminal())
+}
+
+/// [`tame`] for stderr.
+fn tty_err(s: &str) -> std::borrow::Cow<'_, str> {
+    tame(s, std::io::stderr().is_terminal())
+}
+
+/// Clipboard tools: (copy, paste). `--sensitive` first, which clipboard
+/// managers keep no history of; an older wl-copy refuses it.
+const CLIPS: [(&[&str], &[&str]); 4] = [
+    (&["wl-copy", "--sensitive"], &["wl-paste", "-n"]),
     (&["wl-copy"], &["wl-paste", "-n"]),
     (&["xclip", "-sel", "clip"], &["xclip", "-o", "-sel", "clip"]),
     (&["pbcopy"], &["pbpaste"]),
@@ -591,8 +617,12 @@ fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
             let s = String::from_utf8_lossy(&o.stdout);
             s.starts_with("VIM") || s.starts_with("NVIM")
         });
+        // -c: after the user's vimrc, which would undo what --cmd sets.
         let quiet = match vim {
-            true => " -n -i NONE --cmd 'set nobackup nowritebackup noundofile'",
+            true => {
+                " -n -i NONE -c 'setlocal noundofile nobackup nowritebackup \
+                 noswapfile | set clipboard='"
+            }
             false => "",
         };
         let ok = Command::new("sh")
@@ -712,8 +742,9 @@ fn main() -> Result<()> {
             let e = s.entries()?;
             e.keys()
                 .filter(|n| !n.split('/').any(|c| c.starts_with('.')))
-                .for_each(|n| println!("{n}"));
+                .for_each(|n| println!("{}", tty_out(n)));
             for n in s.conflicts()? {
+                let n = tty_err(&n);
                 eprintln!(
                     "{n}: changed on two devices apart; the other is in pasa log {n}"
                 );
@@ -873,22 +904,25 @@ fn main() -> Result<()> {
                     std::time::UNIX_EPOCH
                         + std::time::Duration::from_millis(v.ms),
                 );
-                println!("{}  {at}  {}", v.file, v.name);
+                println!("{}  {at}  {}", v.file, tty_out(&v.name));
             }
         }
         ["recover", f] => {
             let n = open()?.recover(f)?;
-            eprintln!("{n}: taken back, its newest version now");
+            eprintln!("{}: taken back, its newest version now", tty_err(&n));
         }
         ["health", ..] => {
             let s = open()?;
             let h = s.health()?;
-            h.weak
+            let t = |n: &str| tty_out(n).into_owned();
+            h.weak.iter().for_each(|(n, b)| {
+                println!("weak    {}: about {b} bits", t(n))
+            });
+            h.reused
                 .iter()
-                .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
-            h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
-            h.expired.iter().for_each(|n| println!("expired {n}"));
-            h.exposed.iter().for_each(|n| println!("exposed {n}"));
+                .for_each(|g| println!("reused  {}", t(&g.join(", "))));
+            h.expired.iter().for_each(|n| println!("expired {}", t(n)));
+            h.exposed.iter().for_each(|n| println!("exposed {}", t(n)));
             // Passwords alone: not what is attached, nor an empty one.
             let asked = |n: &String| {
                 flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
@@ -901,7 +935,9 @@ fn main() -> Result<()> {
                 }
                 match pwned(&pw)? {
                     0 => {}
-                    times => println!("pwned   {n}: in breaches {times} times"),
+                    times => {
+                        println!("pwned   {}: in breaches {times} times", t(&n))
+                    }
                 }
             }
             return Ok(());
@@ -921,7 +957,7 @@ fn main() -> Result<()> {
             s.put(&to, &Zeroizing::new(std::fs::read(file)?))?
         }
         ["files", n] => {
-            open()?.files(n)?.iter().for_each(|f| println!("{f}"));
+            open()?.files(n)?.iter().for_each(|f| println!("{}", tty_out(f)));
             return Ok(());
         }
         ["files", n, f] => {
@@ -935,7 +971,7 @@ fn main() -> Result<()> {
                     + std::time::Duration::from_millis(v.ms);
                 let b = s.body(&v)?;
                 let t = humantime::format_rfc3339_seconds(t);
-                println!("── {t}\n{}", String::from_utf8_lossy(&b));
+                println!("── {t}\n{}", tty_out(&String::from_utf8_lossy(&b)));
             }
             return Ok(());
         }
@@ -988,14 +1024,13 @@ fn main() -> Result<()> {
             ..,
         ] => return sync(&a),
         ["show", n] | [n] => {
-            print!("{}", String::from_utf8_lossy(&open()?.get(n)?));
+            print!("{}", tty_out(&String::from_utf8_lossy(&open()?.get(n)?)));
             return Ok(());
         }
         ["show", n, f] | [n, f] => {
-            println!(
-                "{}",
-                field(text(&open()?.get(n)?)?, f).context("no such field")?
-            );
+            let f =
+                field(text(&open()?.get(n)?)?, f).context("no such field")?;
+            println!("{}", tty_out(&f));
             return Ok(());
         }
         _ => bail!("{USAGE}"),
@@ -1339,7 +1374,7 @@ async fn sync(a: &[&str]) -> Result<()> {
                  {name} knew it still knows: change these passwords at \
                  their services (pasa health lists those left):"
             );
-            s.health()?.exposed.iter().for_each(|n| println!("{n}"));
+            s.health()?.exposed.iter().for_each(|n| println!("{}", tty_out(n)));
         }
         _ => bail!("{USAGE}"),
     }
@@ -1380,6 +1415,37 @@ mod tests {
         let at = fs::read_to_string(d.join("ed.sh.at")).unwrap();
         assert!(!std::path::Path::new(at.trim()).exists(), "left behind");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// vim is told after its vimrc: no undo file, backup, swap file or
+    /// system clipboard, and no viminfo.
+    #[test]
+    fn vim_keeps_nothing_of_an_edit() {
+        let d = std::env::temp_dir()
+            .join(format!("pasa-vim-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let vim = d.join("vim");
+        let script = "#!/bin/sh\n[ \"$1\" = --version ] && echo VIM && exit\n\
+                      printf '%s\\n' \"$@\" > \"$0.args\"\n";
+        fs::write(&vim, script).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&vim, mode).unwrap();
+        if super::edit_with(vim.to_str().unwrap(), b"old\n").is_ok() {
+            let a = fs::read_to_string(d.join("vim.args")).unwrap();
+            let a: Vec<&str> = a.lines().collect();
+            let after = "setlocal noundofile nobackup nowritebackup \
+                         noswapfile | set clipboard=";
+            assert_eq!(a[..5], ["-n", "-i", "NONE", "-c", after]);
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_is_shown_control_characters_never_given_them() {
+        let s = "a\x1b]0;owned\x07b\r\n\tc\u{9b}";
+        assert_eq!(super::tame(s, false), s);
+        let shown = "a\\u{1b}]0;owned\\u{7}b\\r\n\tc\\u{9b}";
+        assert_eq!(super::tame(s, true), shown);
     }
 
     #[test]

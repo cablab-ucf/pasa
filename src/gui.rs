@@ -1,4 +1,4 @@
-use crate::view::View;
+use crate::view::{View, idle_since};
 use anyhow::{Context as _, Result};
 use eframe::egui::{
     self, Align, Align2, Area, Button, CentralPanel, Color32, ColorImage,
@@ -437,6 +437,9 @@ pub fn run(join: bool) -> Result<()> {
             ..App::default()
         };
         c.egui_ctx.set_theme(a.prefs.theme);
+        // Left out of screenshots and shared screens (Windows, macOS).
+        c.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
         Ok(Box::new(a) as Box<dyn eframe::App>)
     };
     eframe::run_native("pasa", o, Box::new(app))
@@ -504,7 +507,16 @@ fn saved(file: &str, body: &[u8]) -> Result<String> {
     Ok(format!("{file}: saved as {}", to.display()))
 }
 
+/// An address that opens in a browser: never a file, or another scheme's
+/// handler.
+fn web(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
 fn open_url(url: &str) {
+    if !web(url) {
+        return;
+    }
     let with = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     let _ = std::process::Command::new(with).arg(url).spawn();
 }
@@ -613,16 +625,32 @@ fn entered(ui: &Ui, r: &Response) -> bool {
 }
 
 impl eframe::App for App {
+    /// Before each `ui`, and alone while the window is minimized or hidden.
+    fn logic(&mut self, ctx: &Context, _: &mut eframe::Frame) {
+        let idle = Duration::from_secs(self.prefs.lock * 60);
+        // Before this frame's input, so a key pressed on waking does not
+        // undo the time asleep.
+        if self.v.is_some() && self.used.is_some_and(|t| idle_since(t, idle)) {
+            self.lock();
+        }
+        // The clipboard crate's copy (no wl-copy, xclip or pbcopy) is
+        // cleared after 45 s too, by this window, locked or not.
+        if self.wipe.is_some_and(|t| t.elapsed().is_ok()) {
+            self.wipe = None;
+            ctx.copy_text(String::new());
+        }
+        // Again a second past the lock's time, or the wipe's if sooner.
+        let left = |t: SystemTime| t.duration_since(SystemTime::now()).ok();
+        let at = [self.used.map(|t| t + idle), self.wipe];
+        let next = at.into_iter().flatten().filter_map(left).min();
+        ctx.request_repaint_after(
+            next.unwrap_or(idle) + Duration::from_secs(1),
+        );
+    }
+
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
         if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Q)) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        let idle = Duration::from_secs(self.prefs.lock * 60);
-        // A clock set back counts as idle too. Before this frame's input,
-        // so a key pressed on waking does not undo the time asleep.
-        let left = |t: SystemTime| t.elapsed().map_or(true, |e| e > idle);
-        if self.v.is_some() && self.used.is_some_and(left) {
-            self.lock();
         }
         if ui.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
             self.used = Some(SystemTime::now());
@@ -630,7 +658,6 @@ impl eframe::App for App {
         if std::mem::take(&mut self.forget) {
             ui.ctx().data_mut(|d| d.clear());
         }
-        ui.ctx().request_repaint_after(idle);
         self.serve(&ui.ctx().clone(), self.dirs());
         if let Some(job) = self.job.take() {
             let was = (self.v.is_some(), self.joined);
@@ -658,12 +685,6 @@ impl eframe::App for App {
             None if home().join("key").exists() => self.unlock(ui),
             None if self.joining => self.join(ui),
             None => self.create(ui),
-        }
-        // The clipboard crate's copy (no wl-copy, xclip or pbcopy) is
-        // cleared after 45 s too, by this window, locked or not.
-        if self.wipe.is_some_and(|t| t.elapsed().is_ok()) {
-            self.wipe = None;
-            ui.ctx().copy_text(String::new());
         }
         // Ctrl+C/X leave by crate::clip, cleared after 45 s; the clipboard
         // crate only without wl-copy, xclip or pbcopy. Selections never
@@ -1459,7 +1480,7 @@ impl App {
                                 act = Some((at, "pass"));
                             }
                             r.context_menu(|ui| {
-                                let web = m.url.starts_with("http");
+                                let web = web(&m.url);
                                 for (what, text, on) in [
                                     (
                                         "user",
@@ -1661,9 +1682,8 @@ impl App {
                             if ui.small_button("Copy").clicked() {
                                 v.copy("url");
                             }
-                            let web = f.url.starts_with("https://")
-                                || f.url.starts_with("http://");
-                            if web && ui.small_button("Open").clicked() {
+                            if web(&f.url) && ui.small_button("Open").clicked()
+                            {
                                 open_url(&f.url);
                             }
                         });
@@ -2660,6 +2680,14 @@ mod tests {
             r.request_focus();
         });
         out.textures_delta.clear();
+    }
+
+    #[test]
+    fn only_web_addresses_open() {
+        assert!(super::web("https://a.example/") && super::web("http://a"));
+        for u in ["httpx://a", "http:/a", "file:///etc", "javascript:a"] {
+            assert!(!super::web(u), "{u}");
+        }
     }
 
     #[test]

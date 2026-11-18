@@ -7,6 +7,7 @@ use authenticator::errors::HIDError;
 use authenticator::{
     AuthenticatorInfo, FidoDevice, FidoDeviceIO, FidoProtocol,
 };
+use std::time::{Duration, Instant};
 
 pub const OTP: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x20, 0x01];
 pub const FIDO: &[u8] = &[0xA0, 0x00, 0x00, 0x06, 0x47, 0x2F, 0x00, 0x01];
@@ -32,10 +33,11 @@ pub fn card(aid: &[u8]) -> Option<pcsc::Card> {
     cards.find_map(|mut c| select(&mut c, aid).ok().map(|_| c))
 }
 
-/// The response's data and SW; on 61xx, GET RESPONSE fetches the rest.
+/// The response's data and SW; on 61xx, GET RESPONSE fetches the rest: 256
+/// parts at most (64 KiB, past any answer asked here).
 fn tx(c: &mut impl Apdu, apdu: &[u8]) -> Result<(Vec<u8>, u16)> {
     let (mut r, mut data) = (c.raw(apdu)?, vec![]);
-    loop {
+    for _ in 0..256 {
         let Some((d, sw)) = r.split_last_chunk::<2>() else {
             bail!("the card said nothing")
         };
@@ -45,7 +47,11 @@ fn tx(c: &mut impl Apdu, apdu: &[u8]) -> Result<(Vec<u8>, u16)> {
             _ => return Ok((data, u16::from_be_bytes(*sw))),
         }
     }
+    bail!("the card would not stop answering")
 }
+
+/// How long a key on a reader may keep us waiting (9100): a touch, a PIN.
+const WAIT: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
 
 /// ISO 7816-4 command chaining in 255-byte parts; the last part's response.
 fn send(
@@ -113,7 +119,9 @@ impl<C: Apdu> Fido<C> {
         let c = &mut self.card;
         let (mut d, mut sw) = send(c, [0x80, 0x10, 0x00, 0x00], msg)?;
         // 9100: still working (a touch, a PIN); NFCCTAP_GETRESPONSE polls.
+        let until = Instant::now() + WAIT;
         while sw == 0x9100 {
+            ensure!(Instant::now() < until, "the key kept us waiting");
             (d, sw) = send(c, [0x80, 0x11, 0x00, 0x00], &[])?;
         }
         ensure!(sw == 0x9000, "the key refused: {sw:04X}");
@@ -200,18 +208,33 @@ mod tests {
     struct Script {
         sent: Vec<Vec<u8>>,
         replies: std::collections::VecDeque<Vec<u8>>,
+        /// Once `replies` run out; else 6F00.
+        then: Option<Vec<u8>>,
     }
 
     impl Apdu for Script {
         fn raw(&mut self, apdu: &[u8]) -> Result<Vec<u8>> {
             self.sent.push(apdu.to_vec());
-            Ok(self.replies.pop_front().unwrap_or(vec![0x6F, 0x00]))
+            let then = || self.then.clone().unwrap_or(vec![0x6F, 0x00]);
+            Ok(self.replies.pop_front().unwrap_or_else(then))
         }
     }
 
     fn script(replies: &[&[u8]]) -> Script {
         let replies = replies.iter().map(|r| r.to_vec()).collect();
-        Script { sent: vec![], replies }
+        Script { replies, ..Script::default() }
+    }
+
+    /// A card that never stops (61xx, 9100) is left, not waited on forever.
+    #[test]
+    fn an_endless_card_ends() {
+        let mut c = script(&[]);
+        c.then = Some(vec![0xAA, 0x61, 0xFF]);
+        assert!(tx(&mut c, &[0]).is_err());
+        assert_eq!(c.sent.len(), 257);
+        let mut c = script(&[]);
+        c.then = Some(vec![0x91, 0x00]);
+        assert!(Fido::new(c).cbor(&[1]).is_err());
     }
 
     #[test]

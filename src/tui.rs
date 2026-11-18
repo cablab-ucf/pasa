@@ -1,4 +1,4 @@
-use crate::view::{IDLE, View};
+use crate::view::{IDLE, View, idle_since};
 use anyhow::Result;
 use crossterm::event::{
     Event, KeyCode::*, KeyEventKind, KeyModifiers, poll, read,
@@ -7,6 +7,7 @@ use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType::All};
 use crossterm::{cursor::MoveTo, execute, queue};
 use std::io::{Write, stdout};
+use std::time::{Duration, SystemTime};
 
 const HELP: &str = "Enter pass ^U user ^O otp Tab show ^E edit ^G regen ^N new \
                     ^D del ^S sync ^T store Esc";
@@ -146,9 +147,13 @@ fn browse(mut v: View) -> Result<()> {
     let (mut shown, mut armed) = (false, false);
     loop {
         draw(&v, shown)?;
-        // Idle: returning drops the store, which locks it.
-        if !poll(IDLE)? {
-            return Ok(());
+        // Idle, by the wall clock a second at a time (poll's stops while
+        // the machine sleeps): returning drops the store, which locks it.
+        let used = SystemTime::now();
+        while !poll(Duration::from_secs(1))? {
+            if idle_since(used, IDLE) {
+                return Ok(());
+            }
         }
         let Event::Key(k) = read()? else { continue };
         if k.kind != KeyEventKind::Press {

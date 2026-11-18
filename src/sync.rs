@@ -168,10 +168,12 @@ fn introduced(intro: &[u8; 32], a: &PublicKey, b: &PublicKey) -> [u8; 32] {
     h.chain_update(hi.as_bytes()).finalize().into()
 }
 
-/// A name as `peers` holds it: no space or slash, 32 characters at most.
+/// A name as `peers` holds it: no space, slash or control character (none
+/// for a terminal to obey), 32 characters at most.
 fn clean(n: &str) -> String {
     let dash = |c: char| if c.is_whitespace() || c == '/' { '-' } else { c };
-    n.trim().chars().map(dash).take(32).collect()
+    let n = n.trim().chars().map(dash).filter(|c| !c.is_control());
+    n.take(32).collect()
 }
 
 /// What this device calls itself to the others: `net/name` (an app's
@@ -882,6 +884,11 @@ mod tests {
             take(&desk, "x", &[got[..64].to_vec(), KEYS.to_vec()].concat())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_device_says_no_control_character() {
+        assert_eq!(clean(" my phone/\x1b]0;x\x07\t1 "), "my-phone-]0;x-1");
     }
 
     /// The name stays last on its line, where 0.4.12 reads it.
