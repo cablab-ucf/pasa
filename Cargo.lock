@@ -180,7 +180,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "apasa-jni"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "jni 0.22.4",
@@ -2837,8 +2837,8 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "irnet"
-version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/irnet?rev=7f8c000428461e8000657866620952d4dad247d5#7f8c000428461e8000657866620952d4dad247d5"
+version = "0.5.0"
+source = "git+https://github.com/cablab-ucf/irnet?rev=3b962fb55562589d5af801a4a8f29214c2b8e55e#3b962fb55562589d5af801a4a8f29214c2b8e55e"
 dependencies = [
  "anyhow",
  "chacha20poly1305 0.11.0",
@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "kdbx2pasa"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4555,8 +4555,8 @@ dependencies = [
 
 [[package]]
 name = "pairir"
-version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/pairir?rev=a991f1baf716c016bbc386132baa495536b50b78#a991f1baf716c016bbc386132baa495536b50b78"
+version = "0.5.0"
+source = "git+https://github.com/cablab-ucf/pairir?rev=2e13c7d899c0eb8c723c08fed39693d55ea1cd49#2e13c7d899c0eb8c723c08fed39693d55ea1cd49"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4569,6 +4569,7 @@ dependencies = [
  "iroh",
  "n0-future",
  "sha2 0.11.1",
+ "subtle",
  "tokio",
  "x-wing",
  "zeroize",
@@ -4615,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "pasa"
-version = "0.4.18"
+version = "0.5.0"
 dependencies = [
  "age",
  "age-core",
@@ -5017,8 +5018,8 @@ checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
 
 [[package]]
 name = "pushir"
-version = "0.4.0"
-source = "git+https://github.com/cablab-ucf/pushir?rev=3b3e6ae1211259990a479455fed95d47a92c6e92#3b3e6ae1211259990a479455fed95d47a92c6e92"
+version = "0.5.0"
+source = "git+https://github.com/cablab-ucf/pushir?rev=b59ae26154a8004a16a1269ad7475219d22587aa#b59ae26154a8004a16a1269ad7475219d22587aa"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -5029,6 +5030,7 @@ dependencies = [
  "iroh-dns",
  "iroh-relay",
  "jni 0.22.4",
+ "n0-error",
  "noq-proto",
  "tokio",
  "url",

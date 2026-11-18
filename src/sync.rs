@@ -852,9 +852,10 @@ mod tests {
         for s in [&store_key[..], b"hunter2", PW] {
             assert!(!got.windows(s.len()).any(|w| w == s), "in the clear");
         }
-        let qr = qr(&got, "ab").await.unwrap();
+        let pw = password();
+        let qr = qr(&got, &pw).await.unwrap();
         assert!(unqr(&qr, "ac").await.is_err());
-        take(&desk, "phone", &unqr(&qr, "ab").await.unwrap()).unwrap();
+        take(&desk, "phone", &unqr(&qr, &pw).await.unwrap()).unwrap();
         assert_eq!(fs::read(desk.join("key")).unwrap(), file);
         // A file no version, held by a peer: passed over, the rest arrives.
         let junk = b"not a version".as_slice();
@@ -909,7 +910,8 @@ mod tests {
         let text = fs::read_to_string(phone.join("ctap")).unwrap();
         let packed = crate::ctap_packed(&text).unwrap();
         assert!(packed.len() < text.len() * 6 / 10, "ctap packed");
-        let got = unqr(&qr(&got, "ab").await.unwrap(), "ab").await.unwrap();
+        let pw = password();
+        let got = unqr(&qr(&got, &pw).await.unwrap(), &pw).await.unwrap();
         take(&desk, "phone", &got).unwrap();
         for f in ["key", "ctap"] {
             assert_eq!(
