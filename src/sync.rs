@@ -405,13 +405,14 @@ fn origin(u: &RelayUrl) -> (&str, Option<&str>, Option<u16>) {
     (u.scheme(), host, u.port_or_known_default())
 }
 
-/// Whether a peer's lane is on a relay of ours ([`irnet::relays`],
-/// `PASA_RELAY`, `PUSHIR_RELAY`): a paired device never has this one dial
-/// a host of its choosing.
+/// Whether a peer's lane may be woken: on a relay by https (any: one a
+/// device's owner runs too, or hardening would cost its wakes), or on
+/// ours ([`irnet::relays`], `PASA_RELAY`, `PUSHIR_RELAY`), a test's plain
+/// http included. Never plain http to a host a paired device chose.
 fn our_relay(r: &RelayUrl) -> bool {
     let mut all = irnet::relays();
     all.extend(relay().ok().into_iter().chain(pushir::relay().ok()));
-    all.iter().any(|a| origin(a) == origin(r))
+    r.scheme() == "https" || all.iter().any(|a| origin(a) == origin(r))
 }
 
 async fn wake(dir: &Path, except: &str) {
@@ -936,18 +937,15 @@ mod tests {
     }
 
     #[test]
-    fn lanes_are_woken_on_our_relays_alone() {
+    fn lanes_are_woken_by_https_or_on_our_relays() {
         for r in irnet::relays() {
             assert!(our_relay(&r));
             let bare = r.to_string().replace("center./", "center/");
             assert!(our_relay(&bare.parse().unwrap()), "{bare}");
         }
-        for r in [
-            "https://evil.example./",
-            "http://irpush.cxn.center./",
-            "https://irpush.cxn.center:8443/",
-            "https://192.168.1.1/",
-        ] {
+        // A relay its owner runs: woken (else hardening costs its sync).
+        assert!(our_relay(&"https://push.example./".parse().unwrap()));
+        for r in ["http://irpush.cxn.center./", "http://192.168.1.1/"] {
             assert!(!our_relay(&r.parse().unwrap()), "{r}");
         }
     }
