@@ -136,6 +136,9 @@ fun changes(was: Form, now: Form): List<Pair<String, List<Pair<Char, String>>>> 
     }
 }
 
+/** An address that opens in a browser: never another scheme's handler. */
+fun web(url: String) = url.startsWith("https://") || url.startsWith("http://")
+
 interface Host {
     val hasStore: Boolean
     /** Folder names, "pasa" first; [storeName] is the open one. */
@@ -851,7 +854,7 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
                             item("Copy password") { copy("Password", f.pass) }
                             host.code(host.text(f)).let { c -> if (c.isNotEmpty()) item("Copy one-time code") { copy("Code", c) } }
                             if (f.url.isNotEmpty()) item("Copy URL") { copy("URL", f.url) }
-                            if (f.url.startsWith("http")) item("Open URL") { host.open(f.url) }
+                            if (web(f.url)) item("Open URL") { host.open(f.url) }
                             item("Edit") { nav.screen = Screen.Edit(n) }
                             item("History") { nav.screen = Screen.History(n) }
                         }
@@ -898,7 +901,7 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
         ) { copy("Code", code) }
         if (f.url.isNotEmpty()) Shown(
             "URL", f.url,
-            more = { if (f.url.startsWith("http")) Sign("Open") { host.open(f.url) } },
+            more = { if (web(f.url)) Sign("Open") { host.open(f.url) } },
         ) { copy("URL", f.url) }
         if (f.tags.isNotEmpty()) Shown("Tags", f.tags)
         if (f.expires.isNotEmpty()) Shown("Expires", f.expires)
