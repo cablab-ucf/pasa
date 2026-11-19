@@ -67,6 +67,12 @@ fn with<T>(h: jlong, f: impl FnOnce(&Store) -> anyhow::Result<T>) -> Result<T> {
     Ok(f(stores().get(&h).context("locked")?)?)
 }
 
+/// A value between U+001F and U+001E delimiters: those it holds become
+/// U+FFFD, so none splits it or shifts the values after it.
+fn one(v: &str) -> String {
+    v.replace(['\u{1f}', '\u{1e}'], "\u{fffd}")
+}
+
 fn report(r: Vec<(String, anyhow::Result<usize>)>) -> String {
     let line = |(w, r): (String, anyhow::Result<usize>)| match r {
         Ok(n) => format!("{w}: {n} new"),
@@ -457,10 +463,10 @@ pub extern "system" fn Java_com_apasa_Native_history<'l>(
 ) -> JString<'l> {
     run(&mut env, |e| {
         let all = with(h, |s| s.history(&name.to_string()))?;
-        let one = |(ms, b): &(u64, pasa::Secret)| {
-            format!("{ms}\u{1f}{}", String::from_utf8_lossy(b))
+        let version = |(ms, b): &(u64, pasa::Secret)| {
+            format!("{ms}\u{1f}{}", one(&String::from_utf8_lossy(b)))
         };
-        let all: Vec<String> = all.iter().map(one).collect();
+        let all: Vec<String> = all.iter().map(version).collect();
         Ok(e.new_string(all.join("\u{1e}"))?)
     })
 }
@@ -515,7 +521,7 @@ pub extern "system" fn Java_com_apasa_Native_form<'l>(
         let f = pasa::Form::parse(&body.to_string());
         let all =
             [f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes];
-        Ok(e.new_string(all.join("\u{1f}"))?)
+        Ok(e.new_string(all.map(|v| one(&v)).join("\u{1f}"))?)
     })
 }
 
@@ -633,6 +639,14 @@ pub extern "system" fn Java_com_apasa_Native_pair<'l>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_apasa_Native_qrPassword<'l>(
+    mut env: EnvUnowned<'l>,
+    _: JClass<'l>,
+) -> JString<'l> {
+    run(&mut env, |e| Ok(e.new_string(sync::password())?))
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_apasa_Native_serve<'l>(
     mut env: EnvUnowned<'l>,
     _: JClass<'l>,
@@ -744,4 +758,14 @@ pub extern "system" fn Java_com_apasa_Native_wake<'l>(
         let r = RT.block_on(sync::sync(Path::new(&dir.to_string()), false))?;
         Ok(e.new_string(report(r))?)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn no_value_carries_a_delimiter() {
+        let v = super::one("a\u{1f}b\u{1e}c");
+        assert_eq!(v, "a\u{fffd}b\u{fffd}c");
+        assert_eq!(super::one("plain"), "plain");
+    }
 }

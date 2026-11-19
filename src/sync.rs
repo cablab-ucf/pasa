@@ -135,11 +135,24 @@ fn add(dir: &Path, p: Peer) -> Result<()> {
     save(dir, &ps)
 }
 
+/// Endpoints forgotten here (`net/forgotten`, one a line): never
+/// introduced again, only paired directly.
+fn forgotten(dir: &Path) -> HashSet<PublicKey> {
+    let f = fs::read_to_string(net(dir).join("forgotten")).unwrap_or_default();
+    f.lines().filter_map(|l| l.parse().ok()).collect()
+}
+
 pub fn forget(dir: &Path, name: &str) -> Result<()> {
     let mut ps = peers(dir);
-    let n = ps.len();
+    let id = ps.iter().find(|p| p.name == name).map(|p| p.id);
+    ensure!(id.is_some(), "no peer {name}");
+    // First: the store still says it, and would introduce it again.
+    if let Some(id) = id.flatten().filter(|id| !forgotten(dir).contains(id)) {
+        let at = net(dir).join("forgotten");
+        let old = fs::read_to_string(&at).unwrap_or_default();
+        write(&at, format!("{old}{id}\n").as_bytes())?;
+    }
     ps.retain(|p| p.name != name);
-    ensure!(ps.len() < n, "no peer {name}");
     save(dir, &ps)?;
     // It knew our lane's secret: a new one, which the rest get at next sync.
     let at = fs::read_to_string(net(dir).join("mailbox")).ok();
@@ -168,10 +181,12 @@ fn introduced(intro: &[u8; 32], a: &PublicKey, b: &PublicKey) -> [u8; 32] {
     h.chain_update(hi.as_bytes()).finalize().into()
 }
 
-/// A name as `peers` holds it: no space or slash, 32 characters at most.
+/// A name as `peers` holds it: no space, slash or control character (none
+/// for a terminal to obey), 32 characters at most.
 fn clean(n: &str) -> String {
     let dash = |c: char| if c.is_whitespace() || c == '/' { '-' } else { c };
-    n.trim().chars().map(dash).take(32).collect()
+    let n = n.trim().chars().map(dash).filter(|c| !c.is_control());
+    n.take(32).collect()
 }
 
 /// What this device calls itself to the others: `net/name` (an app's
@@ -200,11 +215,12 @@ pub fn introduce(s: &Store) -> Result<()> {
         return Ok(());
     }
     let me = key(&s.dir, "node")?.public();
+    let gone = forgotten(&s.dir);
     let mine = format!("{DEVICES}{me}");
     let said = s.hidden(DEVICES)?;
     let name = own_name(&s.dir, &me);
     if !said.iter().any(|(n, b)| *n == mine && b[..] == *name.as_bytes()) {
-        s.put(&mine, name.as_bytes())?;
+        s.put_on(&mine, name.as_bytes(), None)?;
     }
     let intro = s.intro();
     let newest = intro.first().context("no store key")?;
@@ -217,7 +233,8 @@ pub fn introduce(s: &Store) -> Result<()> {
         .filter_map(|(n, b)| {
             let id: PublicKey = n.strip_prefix(DEVICES)?.parse().ok()?;
             let name = clean(std::str::from_utf8(b).ok()?);
-            (id != me && !name.is_empty()).then_some((id, name))
+            let new = id != me && !gone.contains(&id) && !name.is_empty();
+            new.then_some((id, name))
         })
         .collect();
     let mut ps = peers(&s.dir);
@@ -383,12 +400,34 @@ fn learnt(
     let _ = save(dir, &ps);
 }
 
+fn origin(u: &RelayUrl) -> (&str, Option<&str>, Option<u16>) {
+    let host = u.host_str().map(|h| h.trim_end_matches('.'));
+    (u.scheme(), host, u.port_or_known_default())
+}
+
+/// Whether a peer's lane may be woken: on a relay by https (any: one a
+/// device's owner runs too, or hardening would cost its wakes), or on
+/// ours ([`irnet::relays`], `PASA_RELAY`, `PUSHIR_RELAY`), a test's plain
+/// http included. Never plain http to a host a paired device chose.
+fn our_relay(r: &RelayUrl) -> bool {
+    let mut all = irnet::relays();
+    all.extend(relay().ok().into_iter().chain(pushir::relay().ok()));
+    r.scheme() == "https" || all.iter().any(|a| origin(a) == origin(r))
+}
+
 async fn wake(dir: &Path, except: &str) {
     let mut by: std::collections::BTreeMap<String, Vec<Lane>> =
         Default::default();
     for p in peers(dir).into_iter().filter(|p| p.name != except) {
-        if let Some(l) = p.lane {
-            by.entry(l.relay.to_string()).or_default().push(l);
+        match p.lane {
+            Some(l) if our_relay(&l.relay) => {
+                by.entry(l.relay.to_string()).or_default().push(l)
+            }
+            Some(l) => eprintln!(
+                "{}: not woken: its lane is on {}, none of our relays",
+                p.name, l.relay
+            ),
+            None => {}
         }
     }
     let mut all = tokio::task::JoinSet::new();
@@ -569,10 +608,10 @@ pub async fn listen(dir: &Path, log: fn(&str, Result<usize>)) -> Result<()> {
 pub const EVERY: Duration = Duration::from_secs(5);
 
 /// Wire: endpoint key (32), psk (32), then the key file bare, or with hardware
-/// keys KEYS and the key, quick and ctap files framed.
+/// keys KEYS and the key, quick and ctap files framed. Quick goes empty: with
+/// its YubiKey's answer its PIN falls offline, so it stays on its device.
 pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
     let f = fs::read(dir.join("key")).context("no store here")?;
-    let quick = fs::read(dir.join("quick")).unwrap_or_default();
     let ctap = fs::read_to_string(dir.join("ctap")).ok();
     let ctap = ctap.and_then(|t| crate::ctap_packed(&t)).unwrap_or_default();
     let (psk, id) = (rand::<32>(), key(dir, "node")?.public());
@@ -588,15 +627,15 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
         },
     )?;
     set_on(dir, true)?;
-    let n = 64 + KEYS.len() + 12 + f.len() + quick.len() + ctap.len();
+    let n = 64 + KEYS.len() + 12 + f.len() + ctap.len();
     let mut out = Zeroizing::new(Vec::with_capacity(n));
     out.extend_from_slice(id.as_bytes());
     out.extend_from_slice(&psk);
-    match quick.is_empty() && ctap.is_empty() {
+    match ctap.is_empty() {
         true => out.extend(&f),
         false => {
             out.extend(KEYS);
-            for b in [&f, &quick, &ctap] {
+            for b in [&f[..], &[], &ctap] {
                 crate::frame(&mut out, b);
             }
         }
@@ -605,6 +644,14 @@ pub fn offer(dir: &Path, name: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 const KEYS: &[u8] = b"pasakeys";
+
+/// Whether `got`, an [`offer`], comes from a device this store syncs with:
+/// a store joined again (after a revocation), not another over it.
+pub fn from_peer(dir: &Path, got: &[u8]) -> bool {
+    let id = got.get(..32).and_then(|b| b.try_into().ok());
+    let id = id.and_then(|b| PublicKey::from_bytes(b).ok());
+    id.is_some_and(|id| peers(dir).iter().any(|p| p.id == Some(id)))
+}
 
 pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     named(name)?;
@@ -624,8 +671,16 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     let id = Some(PublicKey::from_bytes(id.try_into()?)?);
     let at = dir.join("key");
     let new = match fs::read(&at) {
+        // Every key file it had kept: a second join never loses the first's.
         Ok(old) if old != f => {
-            write(&dir.join("key.old"), &old).map(|_| true)?
+            let mut to = dir.join("key.old");
+            for n in 1.. {
+                if fs::read(&to).map_or(true, |b| b == old) {
+                    break;
+                }
+                to = dir.join(format!("key.old.{n}"));
+            }
+            write(&to, &old).map(|_| true)?
         }
         old => old.is_err(),
     };
@@ -653,6 +708,9 @@ pub fn take(dir: &Path, name: &str, got: &[u8]) -> Result<()> {
     )?;
     set_on(dir, true)
 }
+
+/// A QR code's password: 99 random bits.
+pub use pairir::password;
 
 pub async fn qr(got: &[u8], pw: &str) -> Result<String> {
     pairir::seal_qr("pasa", got, pw).await
@@ -761,6 +819,11 @@ mod tests {
         let at = fs::read(net(&b).join("peers")).unwrap();
         open(&b);
         assert_eq!(fs::read(net(&b).join("peers")).unwrap(), at);
+        // Forgotten, introduced or paired directly, a device stays so.
+        forget(&b, "phone").unwrap();
+        forget(&b, "a").unwrap();
+        open(&b);
+        assert!(peers(&b).is_empty(), "introduced again");
         // a revokes c; b, paired again from a, has the new key: c is gone.
         revoke(&mut Store::open(&a, PW, None).unwrap(), "c").unwrap();
         pair(&a, "a", &b, "b");
@@ -789,9 +852,10 @@ mod tests {
         for s in [&store_key[..], b"hunter2", PW] {
             assert!(!got.windows(s.len()).any(|w| w == s), "in the clear");
         }
-        let qr = qr(&got, "ab").await.unwrap();
+        let pw = password();
+        let qr = qr(&got, &pw).await.unwrap();
         assert!(unqr(&qr, "ac").await.is_err());
-        take(&desk, "phone", &unqr(&qr, "ab").await.unwrap()).unwrap();
+        take(&desk, "phone", &unqr(&qr, &pw).await.unwrap()).unwrap();
         assert_eq!(fs::read(desk.join("key")).unwrap(), file);
         // A file no version, held by a peer: passed over, the rest arrives.
         let junk = b"not a version".as_slice();
@@ -840,20 +904,25 @@ mod tests {
         other.quick_on(b"", &c, &yk).unwrap();
         let old = fs::read(desk.join("key")).unwrap();
         drop(other);
+        let quick = fs::read(phone.join("quick")).unwrap();
         let got = offer(&phone, "desk").unwrap();
+        assert!(!got.windows(quick.len()).any(|w| w == quick), "quick sent");
         let text = fs::read_to_string(phone.join("ctap")).unwrap();
         let packed = crate::ctap_packed(&text).unwrap();
         assert!(packed.len() < text.len() * 6 / 10, "ctap packed");
-        let got = unqr(&qr(&got, "ab").await.unwrap(), "ab").await.unwrap();
+        let pw = password();
+        let got = unqr(&qr(&got, &pw).await.unwrap(), &pw).await.unwrap();
         take(&desk, "phone", &got).unwrap();
-        for f in ["key", "quick", "ctap"] {
+        for f in ["key", "ctap"] {
             assert_eq!(
                 fs::read(desk.join(f)).unwrap(),
                 fs::read(phone.join(f)).unwrap()
             );
         }
         assert_eq!(fs::read(desk.join("key.old")).unwrap(), old);
-        Store::open_quick(&desk, b"2468", &yk).unwrap();
+        // Quick unlock stays on its device; desk's own held the old key.
+        assert!(!desk.join("quick").exists());
+        Store::open_quick(&phone, b"2468", &yk).unwrap();
         Store::open_fido(&desk, &[3; 64], &one).unwrap();
         Store::open_fido(&desk, &[4; 64], &two).unwrap();
         let lap = d.join("lap");
@@ -867,6 +936,25 @@ mod tests {
             take(&desk, "x", &[got[..64].to_vec(), KEYS.to_vec()].concat())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn lanes_are_woken_by_https_or_on_our_relays() {
+        for r in irnet::relays() {
+            assert!(our_relay(&r));
+            let bare = r.to_string().replace("center./", "center/");
+            assert!(our_relay(&bare.parse().unwrap()), "{bare}");
+        }
+        // A relay its owner runs: woken (else hardening costs its sync).
+        assert!(our_relay(&"https://push.example./".parse().unwrap()));
+        for r in ["http://irpush.cxn.center./", "http://192.168.1.1/"] {
+            assert!(!our_relay(&r.parse().unwrap()), "{r}");
+        }
+    }
+
+    #[test]
+    fn a_device_says_no_control_character() {
+        assert_eq!(clean(" my phone/\x1b]0;x\x07\t1 "), "my-phone-]0;x-1");
     }
 
     /// The name stays last on its line, where 0.4.12 reads it.
@@ -960,6 +1048,11 @@ mod tests {
         sa.put("z", b"3").unwrap();
         swap_once(&a, &c, "c", "a", ALPN).await;
         assert_eq!(names(&c), ["x", "y"], "z only once paired again");
+        // Joined again from a peer; never another store over this one.
+        let x = d.join("x");
+        Store::create(&x, b"pw", None).unwrap();
+        assert!(!from_peer(&c, &offer(&x, "c").unwrap()));
+        assert!(from_peer(&c, &offer(&a, "c").unwrap()));
         pair(&a, "a", &c, "c");
         assert!(c.join("key.old").exists(), "the key file it had");
         assert_eq!(names(&c), ["x", "y", "z"]);

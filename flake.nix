@@ -64,11 +64,13 @@
           };
           update = lib.mkOption {
             type = lib.types.bool;
-            default = true;
+            default = false;
             description = ''
-              Daily, rebuild with pasa's newest main: system.autoUpgrade on the
-              flake system.autoUpgrade.flake names (default /etc/nixos), whose
-              input `pasa` alone is updated.
+              Daily, rebuild with the newest commit of the branch `inputs.pasa`
+              names: system.autoUpgrade on the flake system.autoUpgrade.flake
+              names (default /etc/nixos), whose input `pasa` alone is updated.
+              Off by default: it runs, as root, whatever that branch holds
+              then, past any release review. Pin a release tag instead.
             '';
           };
           serve = lib.mkEnableOption "`pasa serve` as each user's service, seeing only ~/.pasa/store and ~/.pasa/net";

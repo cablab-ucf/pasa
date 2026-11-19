@@ -199,12 +199,26 @@ jobs:
     environment: release
     permissions:
       contents: write
+    env:
+      MINISIGN: ${{ secrets.PASA_MINISIGN_KEY != '' }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { name: apasa-release-unsigned }
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: pasa-*, merge-multiple: true }
       - run: for f in pasa-*.tar.gz; do sha256sum "$f" > "$f.sha256"; done
+      # Signed too, once a minisign key is set (PASA_MINISIGN_KEY: the
+      # secret key file's text, made with `minisign -G -W`; its public key
+      # is in README.md): `minisign -Vm pasa-*.tar.gz -P <key>` checks it.
+      - name: Sign the tarballs
+        if: env.MINISIGN == 'true'
+        env:
+          KEY: ${{ secrets.PASA_MINISIGN_KEY }}
+        run: |
+          sudo apt-get install -y -q minisign
+          k="$RUNNER_TEMP/minisign.key"; trap 'rm -f "$k"' EXIT
+          printf '%s\n' "$KEY" > "$k"
+          for f in pasa-*.tar.gz; do minisign -S -s "$k" -m "$f" -t "pasa ${TAG#v} $f"; done
       - name: Sign
         env:
           KEYSTORE_B64: ${{ secrets.APASA_KEYSTORE_B64 }}
@@ -229,6 +243,7 @@ jobs:
             apasa-*.apk.sha256
             pasa-*.tar.gz
             pasa-*.tar.gz.sha256
+            pasa-*.tar.gz.minisig
           tag_name: ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true

@@ -66,6 +66,7 @@ class MainActivity : ComponentActivity(), Host {
             edit().remove("join").apply()
         }
         readQuick()
+        registerReceiver(woke, android.content.IntentFilter(Intent.ACTION_SCREEN_ON))
         setContent {
             BackHandler(enabled = !nav.atTop) { nav.back() }
             Pasa(this, nav)
@@ -119,20 +120,32 @@ class MainActivity : ComponentActivity(), Host {
         keySecret = null
         answer?.fill(0)
         answer = null
-        if (isChangingConfigurations || picking) return
-        if (setting("lock") == 0) lock() else {
+        if (isChangingConfigurations) return
+        if (setting("lock") == 0 && !picking) lock() else {
             left = android.os.SystemClock.elapsedRealtime()
-            main.postDelayed(locker, setting("lock") * 1000L)
+            main.postDelayed(locker, away())
         }
     }
 
-    /** elapsedRealtime: the Handler's clock stops while the phone sleeps, so onStart checks too. */
+    /** elapsedRealtime: the Handler's clock stops while the phone sleeps, so onStart and a screen
+     *  turned on check too. */
     private var left = 0L
+    /** How long the store stays open off the screen: under the picker, which stops this activity, 5 min at least. */
+    private fun away() = (if (picking) maxOf(setting("lock"), 300) else setting("lock")) * 1000L
+    private fun gone() = left != 0L && android.os.SystemClock.elapsedRealtime() - left >= away()
+    private val woke = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) { if (gone()) lock() }
+    }
+
+    override fun onDestroy() {
+        runCatching { unregisterReceiver(woke) }
+        super.onDestroy()
+    }
 
     override fun onStart() {
         super.onStart()
         main.removeCallbacks(locker)
-        if (left != 0L && android.os.SystemClock.elapsedRealtime() - left >= setting("lock") * 1000L) lock()
+        if (gone()) lock()
         left = 0
         here(sync)
     }
@@ -330,7 +343,9 @@ class MainActivity : ComponentActivity(), Host {
         Form(at(0), at(1), at(2), at(3), at(7), at(4), at(5), at(6))
     }
 
-    private fun joined(f: Form) = listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f")
+    // A value's own U+001F would shift the fields after it.
+    private fun joined(f: Form) =
+        listOf(f.pass, f.user, f.url, f.otp, f.tags, f.expires, f.more, f.notes).joinToString("\u001f") { it.replace('\u001f', '\ufffd') }
     override fun text(f: Form) = Native.text(joined(f))
     override fun problem(f: Form) = Native.problem(joined(f))
     override fun strength(pw: String) = Native.strength(pw)
@@ -361,7 +376,7 @@ class MainActivity : ComponentActivity(), Host {
     }
 
     override fun open(url: String) {
-        runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+        if (web(url)) runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
     }
     override fun code(body: String) = Native.field(body, "otp")
     override fun generate(g: Gen) =
@@ -406,9 +421,18 @@ class MainActivity : ComponentActivity(), Host {
     override fun copy(text: String) {
         val cm = getSystemService(ClipboardManager::class.java)
         val clip = ClipData.newPlainText("pasa", text)
-        clip.description.extras = PersistableBundle().apply { putBoolean("android.content.extra.IS_SENSITIVE", true) }
+        val mark = SecureRandom().nextLong()
+        clip.description.extras = PersistableBundle().apply {
+            putBoolean("android.content.extra.IS_SENSITIVE", true)
+            putLong("pasa", mark)
+        }
         cm.setPrimaryClip(clip)
-        main.postDelayed({ cm.clearPrimaryClip() }, setting("clip") * 1000L)
+        // Cleared if still ours; off the screen Android 10 on hides the clipboard, which is then
+        // cleared as it may be.
+        main.postDelayed({
+            val now = runCatching { cm.primaryClipDescription }.getOrNull()
+            if (now == null || now.extras?.getLong("pasa") == mark) cm.clearPrimaryClip()
+        }, setting("clip") * 1000L)
     }
 
     override suspend fun syncNow() = io { Native.sync(dir, false) }
@@ -420,5 +444,6 @@ class MainActivity : ComponentActivity(), Host {
     override suspend fun forget(name: String) = io { Native.forget(dir, name) }
     override suspend fun revoke(name: String) = changed { Native.revoke(handle, name) }
     override suspend fun pair(name: String, qrPw: String?) = io { Native.pair(handle, name, qrPw) }
+    override fun qrPassword() = Native.qrPassword()
 
 }

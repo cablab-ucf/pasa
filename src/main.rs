@@ -72,15 +72,17 @@ pasa ctap | ctap off         let the security key plugged in (or held to an NFC 
 pasa key [-s]                set up a new YubiKey (its slot 2 must be empty); -s: and a
                              spare with the same secret, now or never: have both at hand
 pasa quick [-n] | quick off  open here by a YubiKey (touched, or held to an NFC reader)
-                             and a PIN (-n: no PIN); the password still opens it alone,
-                             so make it long. A key on a reader: held there first
+                             and a PIN (-n: no PIN). The PIN only slows down someone who
+                             also holds the key, and the password still opens it alone:
+                             make it long. A key on a reader: held there first
 pasa keys                    the store keys: age -d takes them as passphrases
-pasa pair NAME [--qr]        hand the key files, as they are (the hardware keys' too), to
-                             a new device called NAME here: a code to type, or a QR code
-                             (offline) after its password; serve until it has synced. No
-                             store password asked
-pasa join NAME CODE|--scan   take the code device NAME shows (a QR code: its password
-                             too; --scan: by the camera, in this program), then sync. The
+pasa pair NAME [--qr]        hand the key files, as they are (security keys' too; quick
+                             unlock stays here), to a new device called NAME here: a code
+                             to type, or a QR code (offline) after its password; serve
+                             until it has synced. No store password asked
+pasa join NAME CODE|-|--scan take the code device NAME shows (a QR code: its password
+                             too; -: the code on stdin, off argv; --scan: by the camera,
+                             in this program), then sync. The
                              store's password opens it afterwards
 pasa sync on | off           sync with the paired devices, or stay offline: off until turned
                              on (pairing does). A month apart, each device says so
@@ -147,7 +149,7 @@ fn key_setup(secret: &[u8]) -> Result<()> {
     let hex = Zeroizing::new(HEXLOWER.encode(secret) + "\n");
     let o = output_with_input(
         Command::new("ykman")
-            .args(["otp", "chalresp", "--force", "2"])
+            .args(["otp", "chalresp", "--force", "--touch", "2"])
             .stderr(Stdio::piped()),
         hex.as_bytes(),
     )?;
@@ -516,8 +518,34 @@ fn text(b: &[u8]) -> Result<&str> {
     std::str::from_utf8(b).context("not text")
 }
 
-/// Clipboard tools: (copy, paste).
-const CLIPS: [(&[&str], &[&str]); 3] = [
+/// `s` for a terminal: control characters escaped (none sets its title or
+/// redraws its screen), line breaks and tabs kept; piped, as it is.
+fn tame(s: &str, tty: bool) -> std::borrow::Cow<'_, str> {
+    let wild = |c: char| c.is_control() && c != '\n' && c != '\t';
+    if !tty || !s.contains(wild) {
+        return s.into();
+    }
+    let esc = |c: char| match wild(c) {
+        true => c.escape_default().to_string(),
+        false => c.to_string(),
+    };
+    s.chars().map(esc).collect::<String>().into()
+}
+
+/// [`tame`] for stdout.
+fn tty_out(s: &str) -> std::borrow::Cow<'_, str> {
+    tame(s, std::io::stdout().is_terminal())
+}
+
+/// [`tame`] for stderr.
+fn tty_err(s: &str) -> std::borrow::Cow<'_, str> {
+    tame(s, std::io::stderr().is_terminal())
+}
+
+/// Clipboard tools: (copy, paste). `--sensitive` first, which clipboard
+/// managers keep no history of; an older wl-copy refuses it.
+const CLIPS: [(&[&str], &[&str]); 4] = [
+    (&["wl-copy", "--sensitive"], &["wl-paste", "-n"]),
     (&["wl-copy"], &["wl-paste", "-n"]),
     (&["xclip", "-sel", "clip"], &["xclip", "-o", "-sel", "clip"]),
     (&["pbcopy"], &["pbpaste"]),
@@ -589,8 +617,12 @@ fn edit_with(ed: &str, old: &[u8]) -> Result<Secret> {
             let s = String::from_utf8_lossy(&o.stdout);
             s.starts_with("VIM") || s.starts_with("NVIM")
         });
+        // -c: after the user's vimrc, which would undo what --cmd sets.
         let quiet = match vim {
-            true => " -n -i NONE --cmd 'set nobackup nowritebackup noundofile'",
+            true => {
+                " -n -i NONE -c 'setlocal noundofile nobackup nowritebackup \
+                 noswapfile | set clipboard='"
+            }
             false => "",
         };
         let ok = Command::new("sh")
@@ -710,8 +742,9 @@ fn main() -> Result<()> {
             let e = s.entries()?;
             e.keys()
                 .filter(|n| !n.split('/').any(|c| c.starts_with('.')))
-                .for_each(|n| println!("{n}"));
+                .for_each(|n| println!("{}", tty_out(n)));
             for n in s.conflicts()? {
+                let n = tty_err(&n);
                 eprintln!(
                     "{n}: changed on two devices apart; the other is in pasa log {n}"
                 );
@@ -846,6 +879,17 @@ fn main() -> Result<()> {
         ["link", d] => {
             let (mut s, d) = (open()?, pasa::path(d));
             let k = std::fs::read(d.join("key")).context(pasa::NO_STORE)?;
+            // Linked, it opens with this store: never its YubiKey unasked.
+            if challenge(&k).is_some() {
+                eprint!(
+                    "{} asks for its YubiKey too; linked, it opens with this \
+                     store's unlock alone, without the key. Link it? [y/N] ",
+                    d.display()
+                );
+                let mut yes = String::new();
+                std::io::stdin().read_line(&mut yes)?;
+                ensure!(yes.trim().eq_ignore_ascii_case("y"), "not linked");
+            }
             let pw = ask(&format!("{}'s password: ", d.display()))?;
             let yk = challenge(&k).map(yubikey).transpose()?;
             let g = Store::open(&d, &pw, yk.as_deref().map(|v| &v[..]))?;
@@ -860,22 +904,25 @@ fn main() -> Result<()> {
                     std::time::UNIX_EPOCH
                         + std::time::Duration::from_millis(v.ms),
                 );
-                println!("{}  {at}  {}", v.file, v.name);
+                println!("{}  {at}  {}", v.file, tty_out(&v.name));
             }
         }
         ["recover", f] => {
             let n = open()?.recover(f)?;
-            eprintln!("{n}: taken back, its newest version now");
+            eprintln!("{}: taken back, its newest version now", tty_err(&n));
         }
         ["health", ..] => {
             let s = open()?;
             let h = s.health()?;
-            h.weak
+            let t = |n: &str| tty_out(n).into_owned();
+            h.weak.iter().for_each(|(n, b)| {
+                println!("weak    {}: about {b} bits", t(n))
+            });
+            h.reused
                 .iter()
-                .for_each(|(n, b)| println!("weak    {n}: about {b} bits"));
-            h.reused.iter().for_each(|g| println!("reused  {}", g.join(", ")));
-            h.expired.iter().for_each(|n| println!("expired {n}"));
-            h.exposed.iter().for_each(|n| println!("exposed {n}"));
+                .for_each(|g| println!("reused  {}", t(&g.join(", "))));
+            h.expired.iter().for_each(|n| println!("expired {}", t(n)));
+            h.exposed.iter().for_each(|n| println!("exposed {}", t(n)));
             // Passwords alone: not what is attached, nor an empty one.
             let asked = |n: &String| {
                 flag("--pwned") && !n.split('/').any(|c| c.starts_with('.'))
@@ -888,7 +935,9 @@ fn main() -> Result<()> {
                 }
                 match pwned(&pw)? {
                     0 => {}
-                    times => println!("pwned   {n}: in breaches {times} times"),
+                    times => {
+                        println!("pwned   {}: in breaches {times} times", t(&n))
+                    }
                 }
             }
             return Ok(());
@@ -908,7 +957,7 @@ fn main() -> Result<()> {
             s.put(&to, &Zeroizing::new(std::fs::read(file)?))?
         }
         ["files", n] => {
-            open()?.files(n)?.iter().for_each(|f| println!("{f}"));
+            open()?.files(n)?.iter().for_each(|f| println!("{}", tty_out(f)));
             return Ok(());
         }
         ["files", n, f] => {
@@ -922,7 +971,7 @@ fn main() -> Result<()> {
                     + std::time::Duration::from_millis(v.ms);
                 let b = s.body(&v)?;
                 let t = humantime::format_rfc3339_seconds(t);
-                println!("── {t}\n{}", String::from_utf8_lossy(&b));
+                println!("── {t}\n{}", tty_out(&String::from_utf8_lossy(&b)));
             }
             return Ok(());
         }
@@ -944,6 +993,11 @@ fn main() -> Result<()> {
             }
             // Oldest first, so each version's parent is the one before.
             all.sort_by_key(|e| e.0);
+            // Each checked before any is written: all of it lands or none,
+            // and never in a linked store.
+            for (at, p, b) in &all {
+                pasa::importable(p, b.len(), at.saturating_mul(1000))?;
+            }
             for (at, p, b) in all {
                 match at {
                     0 => s.put(&p, &b)?,
@@ -975,14 +1029,13 @@ fn main() -> Result<()> {
             ..,
         ] => return sync(&a),
         ["show", n] | [n] => {
-            print!("{}", String::from_utf8_lossy(&open()?.get(n)?));
+            print!("{}", tty_out(&String::from_utf8_lossy(&open()?.get(n)?)));
             return Ok(());
         }
         ["show", n, f] | [n, f] => {
-            println!(
-                "{}",
-                field(text(&open()?.get(n)?)?, f).context("no such field")?
-            );
+            let f =
+                field(text(&open()?.get(n)?)?, f).context("no such field")?;
+            println!("{}", tty_out(&f));
             return Ok(());
         }
         _ => bail!("{USAGE}"),
@@ -1129,7 +1182,8 @@ fn net_side(a: &[&str]) -> Result<()> {
         Err(e) => eprintln!("pasa: the network side is not confined: {e:#}"),
     }
     let mut got = String::new();
-    if a == ["give"] {
+    // A secret or a code by stdin: any process can read argv.
+    if a == ["give"] || a == ["take"] {
         std::io::stdin().read_line(&mut got)?;
     }
     std::thread::spawn(|| {
@@ -1191,7 +1245,7 @@ async fn net_go(dir: &std::path::Path, a: &[&str], got: &str) -> Result<()> {
                 }
             );
         }
-        ["take", code] => println!("{}", B64.encode(&sync::fetch(code).await?)),
+        ["take"] => println!("{}", B64.encode(&sync::fetch(got).await?)),
         _ => bail!("{USAGE}"),
     }
     Ok(())
@@ -1203,7 +1257,7 @@ fn qr_password(name: &str) -> Result<Secret> {
     if !pw.is_empty() {
         return Ok(pw);
     }
-    let pw = pasa::speakable(2, "-", false);
+    let pw = pasa::sync::password();
     eprint!(
         "Its password: {pw}\nType it on {name} after scanning. Enter: the QR code "
     );
@@ -1260,6 +1314,12 @@ async fn sync(a: &[&str]) -> Result<()> {
                     eprintln!("Hold the QR code to the camera (Ctrl-C: stop)");
                     crate::scan::scan()?
                 }
+                // Off argv, which any process can read.
+                "-" => {
+                    let mut l = String::new();
+                    std::io::stdin().read_line(&mut l)?;
+                    l
+                }
                 c => c.to_string(),
             };
             let code = scanned.trim();
@@ -1269,11 +1329,22 @@ async fn sync(a: &[&str]) -> Result<()> {
                     sync::unqr(code, text(&pw)?).await?
                 }
                 false => {
-                    let mut c = net(&["take", code])?;
+                    let mut c = net(&["take"])?;
+                    let mut i = c.stdin.take().context("stdin")?;
+                    writeln!(i, "{code}")?;
                     let l = lines(&mut c).next().context("no answer")?;
+                    drop(i);
                     Zeroizing::new(B64.decode(l.as_bytes())?)
                 }
             };
+            // A store here: joined again from its own devices (after a
+            // revocation), never another over it.
+            ensure!(
+                !dir.join("key").exists() || sync::from_peer(&dir, &got),
+                "{} holds a store, and {name} is none of its devices: join \
+                 beside it (pasa --dir DIR join), its own untouched",
+                dir.display()
+            );
             sync::take(&dir, name, &got)?;
             net_run(&["sync"])?;
             eprintln!("The store is here: its password opens it (pasa ls)");
@@ -1316,7 +1387,7 @@ async fn sync(a: &[&str]) -> Result<()> {
                  {name} knew it still knows: change these passwords at \
                  their services (pasa health lists those left):"
             );
-            s.health()?.exposed.iter().for_each(|n| println!("{n}"));
+            s.health()?.exposed.iter().for_each(|n| println!("{}", tty_out(n)));
         }
         _ => bail!("{USAGE}"),
     }
@@ -1357,6 +1428,37 @@ mod tests {
         let at = fs::read_to_string(d.join("ed.sh.at")).unwrap();
         assert!(!std::path::Path::new(at.trim()).exists(), "left behind");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// vim is told after its vimrc: no undo file, backup, swap file or
+    /// system clipboard, and no viminfo.
+    #[test]
+    fn vim_keeps_nothing_of_an_edit() {
+        let d = std::env::temp_dir()
+            .join(format!("pasa-vim-{}", std::process::id()));
+        fs::create_dir_all(&d).unwrap();
+        let vim = d.join("vim");
+        let script = "#!/bin/sh\n[ \"$1\" = --version ] && echo VIM && exit\n\
+                      printf '%s\\n' \"$@\" > \"$0.args\"\n";
+        fs::write(&vim, script).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        fs::set_permissions(&vim, mode).unwrap();
+        if super::edit_with(vim.to_str().unwrap(), b"old\n").is_ok() {
+            let a = fs::read_to_string(d.join("vim.args")).unwrap();
+            let a: Vec<&str> = a.lines().collect();
+            let after = "setlocal noundofile nobackup nowritebackup \
+                         noswapfile | set clipboard=";
+            assert_eq!(a[..5], ["-n", "-i", "NONE", "-c", after]);
+        }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_is_shown_control_characters_never_given_them() {
+        let s = "a\x1b]0;owned\x07b\r\n\tc\u{9b}";
+        assert_eq!(super::tame(s, false), s);
+        let shown = "a\\u{1b}]0;owned\\u{7}b\\r\n\tc\\u{9b}";
+        assert_eq!(super::tame(s, true), shown);
     }
 
     #[test]

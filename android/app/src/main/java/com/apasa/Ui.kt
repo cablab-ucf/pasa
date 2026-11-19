@@ -136,6 +136,9 @@ fun changes(was: Form, now: Form): List<Pair<String, List<Pair<Char, String>>>> 
     }
 }
 
+/** An address that opens in a browser: never another scheme's handler. */
+fun web(url: String) = url.startsWith("https://") || url.startsWith("http://")
+
 interface Host {
     val hasStore: Boolean
     /** Folder names, "pasa" first; [storeName] is the open one. */
@@ -206,6 +209,8 @@ interface Host {
     suspend fun revoke(name: String)
     /** With [qrPw], an offline QR code's text under it; else a short code. */
     suspend fun pair(name: String, qrPw: String?): String
+    /** A QR code's password: 99 random bits. */
+    fun qrPassword(): String
     /** Bumped as syncs bring versions. */
     val news: Int
 }
@@ -586,7 +591,7 @@ private fun Create(host: Host, nav: Nav) {
                 "A new key is set up here when it is first tapped. A spare key gets the same secret right then, or never: have both at hand before you start. Without a spare, the password is the way in if the key is lost.",
                 style = MaterialTheme.typography.bodySmall, color = muted,
             )
-            Choice("To unlock quickly", "A tap and a PIN open the store. The password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
+            Choice("To unlock quickly", "A tap and a PIN open the store. The PIN only slows down someone who also holds the key; the password still opens it alone if the key is lost.", key == Key.Quick) { key = Key.Quick }
             if (key == Key.Quick) Field(pin, { pin = it }, "PIN (empty: none)", secret = true, done = create)
             Choice("As a second factor", "Needed together with the password, every time.", key == Key.Both) { key = Key.Both }
             NfcOff(host)
@@ -849,7 +854,7 @@ private fun Entries(host: Host, nav: Nav, tick: Int, copy: (String, String) -> U
                             item("Copy password") { copy("Password", f.pass) }
                             host.code(host.text(f)).let { c -> if (c.isNotEmpty()) item("Copy one-time code") { copy("Code", c) } }
                             if (f.url.isNotEmpty()) item("Copy URL") { copy("URL", f.url) }
-                            if (f.url.startsWith("http")) item("Open URL") { host.open(f.url) }
+                            if (web(f.url)) item("Open URL") { host.open(f.url) }
                             item("Edit") { nav.screen = Screen.Edit(n) }
                             item("History") { nav.screen = Screen.History(n) }
                         }
@@ -896,7 +901,7 @@ private fun Entry(host: Host, nav: Nav, name: String, tick: Int, copy: (String, 
         ) { copy("Code", code) }
         if (f.url.isNotEmpty()) Shown(
             "URL", f.url,
-            more = { if (f.url.startsWith("http")) Sign("Open") { host.open(f.url) } },
+            more = { if (web(f.url)) Sign("Open") { host.open(f.url) } },
         ) { copy("URL", f.url) }
         if (f.tags.isNotEmpty()) Shown("Tags", f.tags)
         if (f.expires.isNotEmpty()) Shown("Expires", f.expires)
@@ -1223,7 +1228,7 @@ private fun Devices(host: Host, nav: Nav, tick: Int, go: (suspend () -> String) 
             go { pairing = n to host.pair(n, pw); qrPw = null; host.sync = true; on = true; "" }
         }
         // Its password first, never beside the code: a camera on the screen would read both.
-        OutlinedButton({ pairing = null; qrPw = host.generate(Gen(words = true, count = 2, seps = "-")) }, enabled = name.isNotBlank()) { Text("Show a QR code") }
+        OutlinedButton({ pairing = null; qrPw = host.qrPassword() }, enabled = name.isNotBlank()) { Text("Show a QR code") }
         OutlinedButton({ qrPw = null; show(null) }, enabled = name.isNotBlank()) { Text("Show a code to type") }
         qrPw?.let { pw ->
             Field(pw, { qrPw = it }, "QR code password: type one, or keep this")
@@ -1304,7 +1309,7 @@ private fun Settings(host: Host, nav: Nav) = Page("Settings", nav) {
     val (busy, _, go) = work
     Text("Quick unlock", style = MaterialTheme.typography.bodyLarge)
     Text(
-        "A tap of your YubiKey and a PIN open the store on this phone. The password still opens it alone: keep it long.",
+        "A tap of your YubiKey and a PIN open the store on this phone. The PIN only slows down someone who also holds the key, and the password still opens it alone: keep it long.",
         style = MaterialTheme.typography.bodySmall, color = muted,
     )
     when (val q = host.quick) {

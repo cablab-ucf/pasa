@@ -96,7 +96,12 @@ fn merge(dbs: &[Database]) -> Result<Vec<Item>> {
         let dots = |c: &str| {
             if c == "." || c == ".." { format!("_{c}") } else { c.into() }
         };
-        let name: Vec<String> = last.1.split('/').map(dots).collect();
+        // As pasa takes it: no line break, no `@` first (a linked store's).
+        let last = last.1.replace(['\n', '\r'], " ");
+        let mut name: Vec<String> = last.split('/').map(dots).collect();
+        if let Some(n) = name.first_mut().filter(|n| n.starts_with('@')) {
+            n.insert(0, '_');
+        }
         // Same-titled entries in one group stay apart.
         let free = |i: &u32| match i {
             0 => name.join("/"),
@@ -109,6 +114,7 @@ fn merge(dbs: &[Database]) -> Result<Vec<Item>> {
             out.push((name.clone(), *at, text.clone().into_bytes()));
         }
         for (f, data) in e.files.1 {
+            let f = f.replace(['\n', '\r'], " ");
             out.push((format!("{name}/.files/{f}"), e.files.0, data));
         }
     }
@@ -158,6 +164,21 @@ mod tests {
         e.set("Password", Value::unprotected(pw));
         let t = DateTime::from_timestamp(day * 86_400, 0).unwrap().naive_utc();
         e.times.last_modification = Some(t);
+    }
+
+    #[test]
+    fn names_are_ones_pasa_takes() {
+        let mut db = Database::new();
+        {
+            let mut root = db.root_mut();
+            for t in ["@work/x", "two\nlines", "a@b"] {
+                root.add_entry().set("Title", Value::unprotected(t));
+            }
+        }
+        let mut names: Vec<String> =
+            merge(&[db]).unwrap().into_iter().map(|i| i.0).collect();
+        names.sort();
+        assert_eq!(names, ["_@work/x", "a@b", "two lines"]);
     }
 
     #[test]

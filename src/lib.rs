@@ -218,6 +218,13 @@ const RETIRED: &str = ".pasa/retired/";
 /// Older keys' versions count only if listed.
 const HISTORY: &str = ".pasa/history";
 
+/// The store's own names are written by pasa alone: an import naming
+/// `.pasa/history` would choose which old versions count as trusted.
+fn own(name: &str) -> Result<()> {
+    ensure!(!name.starts_with(OWN), "{name}: the store's own name");
+    Ok(())
+}
+
 pub const RETIRED_SAY: &str = "this device's store key was retired: if you \
     revoked a device, pair this one again from where you did; if not, \
     revoke here the device you suspect and pair the others from here";
@@ -858,7 +865,7 @@ impl Store {
             return Ok(());
         }
         let now = std::mem::replace(&mut self.newest, recipient(&old));
-        let r = self.put(&at, b"retired");
+        let r = self.put_on(&at, b"retired", None).map(drop);
         self.newest = now;
         *self.index.get_mut().unwrap_or_else(|p| p.into_inner()) =
             Index::default();
@@ -1224,6 +1231,7 @@ impl Store {
             return s.put(n, body);
         }
         self.not_linked(name)?;
+        own(name)?;
         self.put_on(name, body, None).map(drop)
     }
 
@@ -1250,6 +1258,7 @@ impl Store {
         }
         ensure!(at <= ahead(), "{name}: dated ahead of now");
         self.not_linked(name)?;
+        own(name)?;
         let mut x = self.index()?;
         let named = |v: &&Version| v.name == name;
         let mut of: Vec<Version> =
@@ -1799,6 +1808,20 @@ pub fn totp(uri: &str, t: u64) -> Option<String> {
     })
 }
 
+/// What an import may write, each checked before any is written: never a
+/// linked store's name (`@LABEL/`) nor the store's own; `at` (ms, 0: now)
+/// not ahead.
+pub fn importable(name: &str, len: usize, at: u64) -> Result<()> {
+    ensure!(!name.starts_with('@'), "{name:?}: a linked store's name (@)");
+    own(name)?;
+    ensure!(
+        fits(name, len),
+        "{name:?}: empty, a line break, over 255 bytes, or over {MAX} bytes"
+    );
+    ensure!(at <= ahead(), "{name:?}: dated ahead of now");
+    Ok(())
+}
+
 /// A name `dump` can write as a relative path.
 pub fn path_safe(name: &str) -> Result<()> {
     let bad = name.starts_with('/')
@@ -2120,6 +2143,9 @@ mod tests {
         let d = dir("ahead");
         let s = Store::create(&d, b"pw", None).unwrap();
         assert!(s.put_at("k", b"x", u64::MAX).is_err());
+        // The store's own names, never from outside (an import).
+        assert!(s.put(".pasa/history", b"x").is_err());
+        assert!(s.put_at(".pasa/devices/x", b"x", 1).is_err());
         let mut x = s.index().unwrap();
         s.keep(&mut x, "k", b"evil", u64::MAX, "-".into()).unwrap();
         drop(x);
@@ -2342,6 +2368,18 @@ mod tests {
         }
         assert!(t.conflicts().unwrap().is_empty());
         assert_eq!(t.times("mail").unwrap().unwrap().0, day);
+        importable("mail/work", 10, day).unwrap();
+        importable("mail@work", 10, 0).unwrap();
+        for (n, len, at) in [
+            ("@group/mail", 10, 0),
+            (".pasa/history", 10, 0),
+            ("a\nb", 10, 0),
+            ("", 10, 0),
+            ("mail", MAX, 0),
+            ("mail", 10, u64::MAX),
+        ] {
+            assert!(importable(n, len, at).is_err(), "{n:?}");
+        }
     }
 
     #[test]

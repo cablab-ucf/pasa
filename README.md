@@ -20,7 +20,9 @@ An entry is text as in `pass`: the password, then `key: value` lines
 `pasa help` lists every command.
 
 Releases: Linux x86-64 (glibc), macOS Apple silicon (`pasa.app`, signed
-ad hoc: `xattr -dr com.apple.quarantine pasa.app`). Building on Linux
+ad hoc: `xattr -dr com.apple.quarantine pasa.app`). Each tarball has its
+SHA-256 beside it and, once the release key is set, a minisign signature
+(`minisign -Vm pasa-*.tar.gz -P <the key in SECURITY.md>`). Building on Linux
 needs libudev, libclang, pcsc-lite and CMake (Debian: `libudev-dev
 libclang-dev libpcsclite-dev cmake`); the flake brings them.
 
@@ -36,14 +38,14 @@ pasa.nixosModules.default
 { programs.pasa.enable = true; }   # serve = true: `pasa serve` per user
 ```
 
-It installs the window, turns on `pcscd` (NFC readers), and daily runs
-`nixos-rebuild switch --update-input pasa` on `/etc/nixos` (Nix's
-`system.autoUpgrade`; `update = false` leaves it off). Only `pasa`
-moves; the rest stays as `flake.lock` pins it. Updating from a branch
-trusts whoever can push to it with root on this machine (the module runs
-as part of the system) and with the store's password (the program): pin
-`inputs.pasa.url` to a release tag and set `update = false` to update by
-hand instead. While the repository is
+It installs the window and turns on `pcscd` (NFC readers). Pin
+`inputs.pasa.url` to a release tag (`github:cablab-ucf/pasa/v0.5.0`) and
+update by moving the tag. `update = true` instead runs
+`nixos-rebuild switch --update-input pasa` on `/etc/nixos` daily (Nix's
+`system.autoUpgrade`): only `pasa` moves, the rest stays as `flake.lock`
+pins it, but it trusts whoever can push to that branch with root on this
+machine (the module runs as part of the system) and with the store's
+password (the program), so it is off unless you turn it on. While the repository is
 private, Nix needs a token that reads it, outside the store: in
 `/etc/nix/nix.conf` (`nix.extraOptions`), `!include /etc/nix/github.conf`,
 a root-only file holding `access-tokens = github.com=TOKEN`.
@@ -98,16 +100,17 @@ weakest:
 
 - **Password**, by Argon2id (256 MiB, 4 passes); with `-y`, a YubiKey's
   slot 2 HMAC-SHA1 answer is Argon2id's secret and both are needed
-  (`ykman otp chalresp 2 SECRET` on two keys for a spare).
+  (`ykman otp chalresp --touch 2 SECRET` on two keys for a spare).
 - **Security key** (`pasa ctap`): any FIDO2 key's `hmac-secret`, salted
   in WebAuthn's PRF form as the phone asks it, over USB or an NFC reader
   (PC/SC). No server, account or network; on macOS no Input Monitoring.
   The key agreement on the wire (P-256, AWS-LC) is not post-quantum, and
   what it carries opens nothing without the device's files.
-- **Quick unlock** (`pasa quick`): a YubiKey's slot 2 and a PIN. With the
-  device's files a PIN falls in days, so the password must be long. On a
-  Mac without an NFC reader slot 2 needs `ykman` and Input Monitoring:
-  use `ctap` there.
+- **Quick unlock** (`pasa quick`): a YubiKey's slot 2 and a PIN. The PIN
+  only slows down someone who also holds the key: with it and the
+  device's files a PIN falls in days, so the password must be long.
+  Pairing leaves it on its device. On a Mac without an NFC reader slot
+  2 needs `ykman` and Input Monitoring: use `ctap` there.
 
 `passwd` changes this device's password and drops `quick` and `ctap`.
 The Android build fails if its key code could reach the network
@@ -128,7 +131,7 @@ Off, pasa opens no connection: no serving, listening, wakes or git
 push. Check in about monthly; each device names the peers it has not
 met for a month.
 
-Pairing hands over the sealed key files (`key`, `quick`, `ctap`; one it
+Pairing hands over the sealed key files (`key`, `ctap`; one it
 replaces stays as `key.old`), syncing the versions; neither asks for or
 sees the password or a hardware key. A QR code's password is shown
 before the code, never beside it. A short code meets once at the

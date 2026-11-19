@@ -7,7 +7,8 @@ import android.content.pm.PackageManager
 import kotlin.concurrent.thread
 import org.pushir.Pushir
 
-/** No network until the user turns this on. */
+/** No sync, and no push connection, until the user turns this on (the
+ *  daily update check is its own setting, said in Settings). */
 fun syncOn(c: Context) = c.getSharedPreferences("pasa", 0).getBoolean("sync", false)
 
 fun push(c: Context) {
