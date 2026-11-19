@@ -59,7 +59,15 @@ output escapes control characters.
   cleared then regardless; Java strings are not zeroized.
 - Landlock has no network rules on older kernels; macOS confines files only.
 - Copies of plaintext in memory (forms, health checks) are not all wiped.
-- Desktop tarballs are checked by SHA-256 only (no signature yet).
+- Desktop tarballs carry a minisign signature once the release key is set
+  (PASA_MINISIGN_KEY); until then, a SHA-256 beside them. NixOS builds from
+  source, pinned to a tag (`update` is off by default: it would rebuild as
+  root from a branch, past any review); Android checks Android's signer.
+- The Android app checks GitHub for a release daily (its address and the
+  time; nothing of the store), on by default because updates carry fixes,
+  said and switched off in Settings.
+- chatir and pasa share one Android signing key: kept, because a new key
+  would stop every installed app from updating.
 - Old peers (0.4.11-0.4.18) still send their quick file when they pair.
 
 ## Wire compatibility
