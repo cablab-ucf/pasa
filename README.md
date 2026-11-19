@@ -20,7 +20,9 @@ An entry is text as in `pass`: the password, then `key: value` lines
 `pasa help` lists every command.
 
 Releases: Linux x86-64 (glibc), macOS Apple silicon (`pasa.app`, signed
-ad hoc: `xattr -dr com.apple.quarantine pasa.app`). Building on Linux
+ad hoc: `xattr -dr com.apple.quarantine pasa.app`). Each tarball has its
+SHA-256 beside it and, once the release key is set, a minisign signature
+(`minisign -Vm pasa-*.tar.gz -P <the key in SECURITY.md>`). Building on Linux
 needs libudev, libclang, pcsc-lite and CMake (Debian: `libudev-dev
 libclang-dev libpcsclite-dev cmake`); the flake brings them.
 
@@ -36,14 +38,14 @@ pasa.nixosModules.default
 { programs.pasa.enable = true; }   # serve = true: `pasa serve` per user
 ```
 
-It installs the window, turns on `pcscd` (NFC readers), and daily runs
-`nixos-rebuild switch --update-input pasa` on `/etc/nixos` (Nix's
-`system.autoUpgrade`; `update = false` leaves it off). Only `pasa`
-moves; the rest stays as `flake.lock` pins it. Updating from a branch
-trusts whoever can push to it with root on this machine (the module runs
-as part of the system) and with the store's password (the program): pin
-`inputs.pasa.url` to a release tag and set `update = false` to update by
-hand instead. While the repository is
+It installs the window and turns on `pcscd` (NFC readers). Pin
+`inputs.pasa.url` to a release tag (`github:cablab-ucf/pasa/v0.5.0`) and
+update by moving the tag. `update = true` instead runs
+`nixos-rebuild switch --update-input pasa` on `/etc/nixos` daily (Nix's
+`system.autoUpgrade`): only `pasa` moves, the rest stays as `flake.lock`
+pins it, but it trusts whoever can push to that branch with root on this
+machine (the module runs as part of the system) and with the store's
+password (the program), so it is off unless you turn it on. While the repository is
 private, Nix needs a token that reads it, outside the store: in
 `/etc/nix/nix.conf` (`nix.extraOptions`), `!include /etc/nix/github.conf`,
 a root-only file holding `access-tokens = github.com=TOKEN`.
